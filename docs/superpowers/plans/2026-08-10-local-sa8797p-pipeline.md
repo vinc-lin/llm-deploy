@@ -1,5 +1,12 @@
 # Local (Device-Free) SA8797P Build & Validation Environment — Implementation Plan
 
+> **EXECUTION STATUS (2026-08-10):** Tasks 0–7 and 10 COMPLETE (envs, SDK,
+> baseline, export, parity PASSED, W8A16 quant, full build chain, bundles).
+> Task 8 (QKV surgery) COMPLETE — 28/28 layers, converter+ctx-bin accepted at
+> vtcm16. Task 9 partial (no x86 HTP simulator in Community SDK; Genie qnn-cpu
+> engine identified as follow-up). Task 11 (1.7B) + fixed-clip rebuilds running
+> via `scripts/build/rebuild_all.sh`. Results: `docs/LOCAL_ENV.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Rebuild the entire SA8797P W8A16 build-side pipeline (export → AIMET quant → qairt-converter → ctx-bin) locally on this WSL2 machine, with numerical validation at every stage, plus develop the QKV-fusion ONNX surgery — so deployable artifacts are ready the moment device access returns.

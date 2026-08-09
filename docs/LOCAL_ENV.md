@@ -91,6 +91,12 @@ confirm. The QKV quantizer conflict (remote error 5005 / garbage) is resolved
 at the ENCODINGS level — surgered encodings accepted by converter + generator
 at vtcm 16; runtime/quality proof still requires hardware.
 
+## Quantization quality (local proxy, CL=128, fixed clip active)
+
+Quantsim-vs-FP32 last-token argmax agreement on the 4 reference prompts: **3/4**
+(miss = "1+2+3+...+100 =", a near-tie; max|Δlogits| ≈ 1.3–1.6 across prompts).
+Consistent with the remote's on-device "coherent output" finding for W8A16.
+
 ## Progress log
 
 - 2026-08-10: full environment stood up and ENTIRE pipeline validated at smoke
