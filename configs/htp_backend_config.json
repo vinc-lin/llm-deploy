@@ -27,7 +27,7 @@
     }
   ],
   "context": {
-    "weight_sharing_enabled": false
+    "weight_sharing_enabled": true
   },
   "memory": {
     "extended_udma": true
