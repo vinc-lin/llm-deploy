@@ -30,7 +30,7 @@ fetch_seg() {
         local from=$((start + have))
         local px=()
         [ $((attempt % 2)) -eq 0 ] && px=(-x "$PROXY")
-        curl -s --max-time 600 --speed-limit 10240 --speed-time 30 \
+        curl -sL --max-time 600 --speed-limit 10240 --speed-time 30 \
              "${px[@]}" -r "${from}-${end}" "$URL" >> "$f" 2>/dev/null
         sleep 2
     done
