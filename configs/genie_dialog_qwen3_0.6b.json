@@ -1,5 +1,4 @@
 {
-  "_comment": "Genie T2T dialog config for Qwen3-0.6B W8A16. Schema verified against SDK 2.48.40 examples (llama3-3b-htp-long-context.json) + summary §2.1 values. cpu-mask/eos values remain device/model-specific.",
   "dialog": {
     "version": 1,
     "type": "basic",
@@ -8,7 +7,10 @@
       "size": 1024,
       "n-vocab": 151936,
       "bos-token": -1,
-      "eos-token": [151645, 151643]
+      "eos-token": [
+        151645,
+        151643
+      ]
     },
     "sampler": {
       "version": 1,
@@ -45,7 +47,9 @@
         "type": "binary",
         "binary": {
           "version": 1,
-          "ctx-bins": ["qwen3_06b_w8a16_ctx.bin"]
+          "ctx-bins": [
+            "qwen3_06b_w8a16_ctx.bin"
+          ]
         },
         "positional-encoding": {
           "type": "rope",

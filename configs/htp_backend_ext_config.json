@@ -1,8 +1,10 @@
 {
-  "_comment": "DRAFT runtime backend-extensions for Genie on-device (perf voting). Summary §2.3: perf-profile via Genie backend.extensions JSON works (4 tiers, 1.95x swing); use llm_decode_burst.",
   "graphs": [
     {
-      "graph_names": ["prefill", "decode"],
+      "graph_names": [
+        "prefill",
+        "decode"
+      ],
       "O": 3,
       "vtcm_mb": 16,
       "hvx_threads": 4

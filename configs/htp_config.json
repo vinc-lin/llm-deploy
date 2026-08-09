@@ -1,5 +1,4 @@
 {
-  "_comment": "DRAFT ctx-bin build config from summary §2.1. VERIFY schema against QAIRT 2.48 SDK docs/examples (Task 2 Step 4) before use. vtcm_mb MUST stay 16 (24 is rejected on unsigned PD, err 0x138d).",
   "backend_extensions": {
     "shared_library_path": "libQnnHtpNetRunExtensions.so",
     "config_file_path": "htp_backend_config.json"

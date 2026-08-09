@@ -1,8 +1,10 @@
 {
-  "_comment": "DRAFT backend-extension config from summary §2.1 build-time values. VERIFY key names against SDK htp_backend_extensions doc before first build.",
   "graphs": [
     {
-      "graph_names": ["prefill", "decode"],
+      "graph_names": [
+        "prefill",
+        "decode"
+      ],
       "O": 3,
       "vtcm_mb": 16,
       "hvx_threads": 4,
