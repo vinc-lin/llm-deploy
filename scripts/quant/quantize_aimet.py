@@ -120,6 +120,27 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from aimet_common.defs import QuantScheme
     from aimet_torch.quantsim import QuantizationSimModel
+    from aimet_torch.v2.nn import QuantizationMixin
+    from modeling_export import ExportRMSNorm
+
+    # Register quantized variant of our custom RMSNorm so AIMET v2 can wrap it
+    # (summary §2.2: RMSNorm quantized, forced 16-bit via default_output_bw=16)
+    if ExportRMSNorm not in QuantizationMixin.cls_to_qcls:
+        @QuantizationMixin.implements(ExportRMSNorm)
+        class QuantizedExportRMSNorm(QuantizationMixin, ExportRMSNorm):
+            def __quant_init__(self):
+                super().__quant_init__()
+                self.input_quantizers = torch.nn.ModuleList([None])
+                self.output_quantizers = torch.nn.ModuleList([None])
+
+            def forward(self, x):
+                if self.input_quantizers[0]:
+                    x = self.input_quantizers[0](x)
+                with self._patch_quantized_parameters():
+                    ret = super().forward(x)
+                if self.output_quantizers[0]:
+                    ret = self.output_quantizers[0](ret)
+                return ret
 
     tok = AutoTokenizer.from_pretrained(args.model)
     hf = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32)
@@ -163,6 +184,11 @@ def main():
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    # aimet-torch 2.36.0 bug: quantsim.export references nn.lora.QuantizedLora,
+    # which this build doesn't define. Provide an inert shim class.
+    import aimet_torch.nn.lora as _lora
+    if not hasattr(_lora, "QuantizedLora"):
+        _lora.QuantizedLora = type("QuantizedLoraShim", (), {})
     sim.export(str(out), "model", dummy_input=tuple(t.cpu() for t in dummy))
     print(f"exported quantsim to {out} (model.onnx + model.encodings)")
 
