@@ -47,8 +47,33 @@ Genie on-HTP execution. Local success = artifact correctness + numerical parity.
 - numpy < 2 in qwen3-deploy
 - torch / aimet-torch / transformers: TBD (see pip log)
 
+## Version pins (final)
+
+- torch 2.13.0+cu130 (CUDA works in WSL2), aimet-torch 2.36.0, transformers 5.14.1,
+  onnx 1.19.0 (BOTH envs — converter needs `onnx.version`, gone in ≥1.20),
+  onnxruntime 1.23.2, numpy 1.26.4, setuptools (py312 distutils shim)
+- aimet-torch 2.36.0 bugs worked around in `quantize_aimet.py`: missing
+  `nn.lora.QuantizedLora` attr; `ByteSize()` crash on >2GB proto; and
+  `load_encodings` unreliable across graph variants (only 48/308 scales carried) —
+  decode DLC therefore converts against the PREFILL encodings file directly
+  (280/280 + 308/308 tensor-name overlap verified — bit-identical cross-graph scales)
+
+## Validated pipeline results (2026-08-10, smoke scale CL=64)
+
+| Stage | Result |
+|---|---|
+| Export wrapper vs HF forward | max abs diff 1.79e-05 |
+| ONNX prefill parity (ORT) | 3.48e-05, argmax match |
+| ONNX decode chain, 8 greedy steps | token-identical vs HF generate |
+| AIMET W8A16 | 196 PER_CHANNEL INT8 weights, A16, embed/lm_head/kv-proj FP16 ✓ |
+| Quantized DLC | 1.1 GB (matches remote §2.3: 1.1 vs 1.5 GB FP16) |
+| Two-graph quantized ctx-bin | 2.0 GB, prefill(4in/57out) + decode(60in/57out), vtcm16/v81 |
+
+AIMET-export I/O names are mangled → `scripts/quant/rename_aimet_io.py`
+restores canonical Genie names (positional + consumer-pattern checks).
+
 ## Progress log
 
-- 2026-08-10: dirs + venvs created; Qwen3-0.6B downloaded (1.5 GB, ext4);
-  QAIRT 2.48.40.260702 confirmed publicly downloadable, segmented download in
-  progress; export/quant/parity/surgery/build scripts written (commits in git log).
+- 2026-08-10: full environment stood up and ENTIRE pipeline validated at smoke
+  scale (see table above). One-shot pipeline: `scripts/build/full_build.sh`;
+  bundling: `scripts/build/bundle.sh`. Full-size (CL=128/CTX=1024) build launched.
