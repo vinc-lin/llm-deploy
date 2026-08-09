@@ -115,6 +115,12 @@ def main():
     ap.add_argument("--config", default=str(
         Path(torch.__file__).parent.parent / "aimet_torch/common/quantsim_config/htp_quantsim_config_v81_per_channel_linear.json"))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--export-decode", metavar="PREFILL_OUT_DIR",
+                    help="skip calibration: build the use_past=True decode wrapper, load "
+                         "encodings from a previous prefill run (guarantees identical "
+                         "cross-graph KV scales — the remote error-5005 constraint), export")
+    ap.add_argument("--ctx", type=int, default=1024,
+                    help="context size for --export-decode (past = ctx + cl_prefill - 1)")
     args = ap.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -145,16 +151,28 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.model)
     hf = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32)
     cfg = hf.config
-    model = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
-                                use_past=False, logits_last_only=True).to(args.device)
-    del hf
-
     S = args.cl_prefill
-    mask = causal_mask(S, S).to(args.device)
-    cos, sin = rope_tables(torch.arange(S), cfg.head_dim, rope_theta_of(cfg))
-    cos, sin = cos.to(args.device), sin.to(args.device)
-    dummy_ids = torch.zeros(1, S, dtype=torch.int32, device=args.device)
-    dummy = (dummy_ids, mask, cos, sin)
+    if args.export_decode:
+        past = args.ctx + S - 1
+        model = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
+                                    use_past=True, logits_last_only=False).to(args.device)
+        n_kv, hd = cfg.num_key_value_heads, cfg.head_dim
+        mask = torch.zeros(1, 1, past + 1, device=args.device)
+        cos, sin = rope_tables(torch.tensor([past]), cfg.head_dim, rope_theta_of(cfg))
+        dummy = [torch.zeros(1, 1, dtype=torch.int32, device=args.device),
+                 mask, cos.to(args.device), sin.to(args.device)]
+        for _ in range(cfg.num_hidden_layers):
+            dummy += [torch.zeros(1, n_kv, hd, past, device=args.device),
+                      torch.zeros(1, n_kv, past, hd, device=args.device)]
+        dummy = tuple(dummy)
+    else:
+        model = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
+                                    use_past=False, logits_last_only=True).to(args.device)
+        mask = causal_mask(S, S).to(args.device)
+        cos, sin = rope_tables(torch.arange(S), cfg.head_dim, rope_theta_of(cfg))
+        dummy_ids = torch.zeros(1, S, dtype=torch.int32, device=args.device)
+        dummy = (dummy_ids, mask, cos.to(args.device), sin.to(args.device))
+    del hf
 
     sim = QuantizationSimModel(
         model,
@@ -179,8 +197,15 @@ def main():
                 c, s_ = rope_tables(pos, cfg.head_dim, rope_theta_of(cfg))
                 m(padded, cmask, c.to(args.device), s_.to(args.device))
 
-    sim.compute_encodings(calibrate, None)
-    clip_weights_to_7f7f(sim)
+    if args.export_decode:
+        # No calibration: adopt the prefill run's encodings so every shared
+        # tensor (weights, activations, KV path) has IDENTICAL scales across
+        # the prefill/decode graph boundary (remote error-5005 constraint).
+        sim.load_encodings(str(Path(args.export_decode) / "model_torch.encodings"),
+                           strict=False)
+    else:
+        sim.compute_encodings(calibrate, None)
+        clip_weights_to_7f7f(sim)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
