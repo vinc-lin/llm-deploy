@@ -29,7 +29,10 @@ def main():
         if section not in data:
             continue
         before = len(data[section])
-        data[section] = {k: v for k, v in data[section].items() if keep(k)}
+        if isinstance(data[section], dict):  # AIMET 0.x dict schema
+            data[section] = {k: v for k, v in data[section].items() if keep(k)}
+        else:  # AIMET 2.x "1.0.0" list schema: entries carry a "name" field
+            data[section] = [e for e in data[section] if keep(e.get("name", ""))]
         report[section] = (before, len(data[section]))
 
     out = p.with_name(p.stem + "_filtered" + p.suffix)

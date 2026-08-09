@@ -76,8 +76,15 @@ def main():
     donor = onnx.load(args.donor_onnx, load_external_data=False)
     enc = json.loads(Path(args.fused_encodings).read_text())
     donor_enc = json.loads(Path(args.donor_encodings).read_text())
-    acts = enc.setdefault("activation_encodings", {})
-    donor_acts = donor_enc.get("activation_encodings", {})
+
+    # Normalize both AIMET schemas to a name-keyed dict; remember list order
+    def as_dict(sec):
+        if isinstance(sec, dict):
+            return dict(sec), "dict"
+        return {e["name"]: e for e in sec}, "list"
+
+    acts, acts_fmt = as_dict(enc.get("activation_encodings", []))
+    donor_acts, _ = as_dict(donor_enc.get("activation_encodings", []))
 
     fused_map = weight_consumers(fused)
     donor_map = weight_consumers(donor)
@@ -98,9 +105,16 @@ def main():
         if d is None or d not in donor_acts:
             print(f"layer {layer}: donor q_proj encoding missing (donor tensor {d}) — SKIP")
             continue
-        acts[q_out] = donor_acts[d]
+        grafted = dict(donor_acts[d])
+        if "name" in grafted:
+            grafted["name"] = q_out
+        acts[q_out] = grafted
         n_ok += 1
 
+    if acts_fmt == "list":
+        enc["activation_encodings"] = list(acts.values())
+    else:
+        enc["activation_encodings"] = acts
     Path(args.out).write_text(json.dumps(enc, indent=2))
     total = len(fused_map.get("qkv_proj", []))
     print(f"surgery applied on {n_ok}/{total} layers -> {args.out}")

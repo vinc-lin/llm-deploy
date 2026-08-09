@@ -55,8 +55,8 @@ def clip_weights_to_7f7f(sim):
     aimet-torch 2.x (v2) API: quantizers are affine QuantizeDequantize modules."""
     n = 0
     for name, m in _quantized_modules(sim):
-        pq = getattr(m, "param_quantizers", None)
-        q = pq.get("weight") if pq is not None and hasattr(pq, "get") else None
+        pq = getattr(m, "param_quantizers", None)  # torch ModuleDict — no .get()
+        q = pq["weight"] if (pq is not None and "weight" in pq) else None
         if q is None or not hasattr(m, "weight"):
             continue
         try:
@@ -189,6 +189,11 @@ def main():
     import aimet_torch.nn.lora as _lora
     if not hasattr(_lora, "QuantizedLora"):
         _lora.QuantizedLora = type("QuantizedLoraShim", (), {})
+    # aimet-torch 2.36.0 bug #2: _onnx_model_size_larger_than_max_protobuf calls
+    # proto.ByteSize(), which itself raises EncodeError for >2GB models (our FP32
+    # 0.6B is ~2.4GB). Force the external-data path unconditionally.
+    import aimet_torch.onnx_utils as _onnx_utils
+    _onnx_utils._onnx_model_size_larger_than_max_protobuf = lambda _m: True
     sim.export(str(out), "model", dummy_input=tuple(t.cpu() for t in dummy))
     print(f"exported quantsim to {out} (model.onnx + model.encodings)")
 
