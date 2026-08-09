@@ -20,7 +20,7 @@ import onnxruntime as ort
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "export"))
-from modeling_export import MASK_VALUE, causal_mask, rope_tables  # noqa: E402
+from modeling_export import MASK_VALUE, causal_mask, rope_tables, rope_theta_of  # noqa: E402
 
 DATA = Path(os.environ.get("LLMDEPLOY_DATA", "/home/vinc/llm-local"))
 
@@ -77,7 +77,7 @@ def main():
     # ---- Test 1: prefill parity ----
     ids_padded = torch.zeros(1, args.cl_prefill, dtype=torch.int32)
     ids_padded[0, -n:] = ids[0]
-    outs = run_prefill(sess_p, ids_padded, n, args.cl_prefill, hd, cfg.rope_theta)
+    outs = run_prefill(sess_p, ids_padded, n, args.cl_prefill, hd, rope_theta_of(cfg))
     onnx_logits = torch.from_numpy(outs[0][0, -1])
     diff = (onnx_logits - ref_logits).abs().max().item()
     am_ref, am_onnx = ref_logits.argmax().item(), onnx_logits.argmax().item()
@@ -107,7 +107,7 @@ def main():
         mask = torch.full((1, 1, total), MASK_VALUE, dtype=torch.float32)
         mask[:, :, -(valid + 1):] = 0.0
         pos = torch.tensor([n + step - 1])
-        cos, sin = rope_tables(pos, hd, cfg.rope_theta)
+        cos, sin = rope_tables(pos, hd, rope_theta_of(cfg))
         feeds = {
             "input_ids": cur.numpy(),
             "attention_mask": mask.numpy(),

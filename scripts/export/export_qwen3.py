@@ -20,7 +20,7 @@ import onnx
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from modeling_export import ExportQwen3, causal_mask, rope_tables  # noqa: E402
+from modeling_export import ExportQwen3, causal_mask, rope_tables, rope_theta_of  # noqa: E402
 
 OPSET = 17
 
@@ -30,7 +30,7 @@ def export_graph(model, cfg, out_path, seq, past_len):
     total = past_len + seq
     input_ids = torch.zeros(1, seq, dtype=torch.int32)
     mask = causal_mask(seq, total)
-    cos, sin = rope_tables(torch.arange(past_len, past_len + seq), head_dim, cfg.rope_theta)
+    cos, sin = rope_tables(torch.arange(past_len, past_len + seq), head_dim, rope_theta_of(cfg))
 
     names_in = ["input_ids", "attention_mask", "position_ids_cos", "position_ids_sin"]
     args = [input_ids, mask, cos, sin]
@@ -82,7 +82,7 @@ def main():
         m = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv, use_past=False)
         ids = torch.randint(0, cfg.vocab_size, (1, 16), dtype=torch.int32)
         mask = causal_mask(16, 16)
-        cos, sin = rope_tables(torch.arange(16), cfg.head_dim, cfg.rope_theta)
+        cos, sin = rope_tables(torch.arange(16), cfg.head_dim, rope_theta_of(cfg))
         with torch.no_grad():
             ours = m(ids, mask, cos, sin)[0]
             ref = hf(ids.to(torch.long)).logits

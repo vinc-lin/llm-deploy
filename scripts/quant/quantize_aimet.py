@@ -23,7 +23,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "export"))
-from modeling_export import ExportQwen3, causal_mask, rope_tables  # noqa: E402
+from modeling_export import ExportQwen3, causal_mask, rope_tables, rope_theta_of  # noqa: E402
 
 DATA = Path(os.environ.get("LLMDEPLOY_DATA", "/home/vinc/llm-local"))
 
@@ -41,53 +41,66 @@ CALIB_PROMPTS = [
 ]
 
 
+def _quantized_modules(sim):
+    from aimet_torch.v2.nn import BaseQuantizationMixin
+    for name, m in sim.model.named_modules():
+        if isinstance(m, BaseQuantizationMixin):
+            yield name, m
+
+
 def clip_weights_to_7f7f(sim):
     """Clamp each quantized weight so no value maps to the asymmetric extreme
     (-128 for INT8): restrict to symmetric ±127 steps.  Reconstructed from the
-    function name in the summary doc — semantics flagged for review."""
-    from aimet_torch.qc_quantize_op import QcQuantizeWrapper  # v1 API
+    function name in the summary doc — semantics flagged for review.
+    aimet-torch 2.x (v2) API: quantizers are affine QuantizeDequantize modules."""
     n = 0
-    for m in sim.model.modules():
-        if isinstance(m, QcQuantizeWrapper) and "weight" in m.param_quantizers:
-            q = m.param_quantizers["weight"]
-            if not q.enabled or q.encoding is None:
-                continue
-            encs = q.encoding if isinstance(q.encoding, list) else [q.encoding]
-            w = m._module_to_wrap.weight
-            with torch.no_grad():
-                if len(encs) > 1:  # per-channel
-                    lo = w.new_tensor([-(127.0 * e.delta) for e in encs])[:, None]
-                    hi = w.new_tensor([127.0 * e.delta for e in encs])[:, None]
-                    w.clamp_(min=lo.min(), max=hi.max())
-                    w.copy_(torch.maximum(torch.minimum(w, hi), lo))
-                else:
-                    e = encs[0]
-                    w.clamp_(-(127.0 * e.delta), 127.0 * e.delta)
-            n += 1
+    for name, m in _quantized_modules(sim):
+        pq = getattr(m, "param_quantizers", None)
+        q = pq.get("weight") if pq is not None and hasattr(pq, "get") else None
+        if q is None or not hasattr(m, "weight"):
+            continue
+        try:
+            scale = q.get_scale()
+        except Exception:
+            continue
+        if scale is None:
+            continue
+        w = m.weight
+        with torch.no_grad():
+            s = scale.detach().to(dtype=w.dtype, device=w.device)
+            while s.dim() < w.dim():
+                s = s.unsqueeze(-1)
+            hi = 127.0 * s
+            w.copy_(torch.minimum(torch.maximum(w, -hi), hi))
+        n += 1
     print(f"clip_weights_to_7f7f: clamped {n} weight tensors")
 
 
 def disable_quantizers(sim, fuse_gate_up):
     """Disable per summary §2.2. Wrapper names: embed_tokens, norm, lm_head,
-    layers.i.self_attn.{k,v}_proj (outputs), layers.i.mlp.gate_up_proj."""
+    layers.i.self_attn.{k,v}_proj (outputs), layers.i.mlp.gate_up_proj.
+    v2 semantics: a quantizer slot is disabled by setting it to None."""
     disabled = []
-    for name, m in sim.model.named_modules():
+    for name, m in _quantized_modules(sim):
         leaf = name.split(".")[-1]
         kill_all = leaf in ("embed_tokens", "norm", "lm_head")
         kill_out = kill_all or leaf in ("k_proj", "v_proj") or (fuse_gate_up and leaf == "gate_up_proj")
         if not (kill_all or kill_out):
             continue
-        if hasattr(m, "output_quantizers"):
-            for q in m.output_quantizers:
-                q.enabled = False
+        if getattr(m, "output_quantizers", None) is not None:
+            for i in range(len(m.output_quantizers)):
+                m.output_quantizers[i] = None
             disabled.append(name + ".out")
-        if kill_all and hasattr(m, "param_quantizers"):
-            for q in m.param_quantizers.values():
-                q.enabled = False
-            disabled.append(name + ".params")
-        if kill_all and hasattr(m, "input_quantizers"):
-            for q in m.input_quantizers:
-                q.enabled = False
+        if kill_all:
+            pq = getattr(m, "param_quantizers", None)
+            if pq is not None:
+                for k in list(pq.keys()):
+                    pq[k] = None
+                disabled.append(name + ".params")
+            iq = getattr(m, "input_quantizers", None)
+            if iq is not None:
+                for i in range(len(iq)):
+                    iq[i] = None
     print(f"disabled quantizers on: {disabled}")
 
 
@@ -98,8 +111,9 @@ def main():
     ap.add_argument("--cl-prefill", type=int, default=128)
     ap.add_argument("--fuse-gate-up", action="store_true")
     ap.add_argument("--fuse-qkv", action="store_true")
-    ap.add_argument("--config", default=str(Path(os.environ.get(
-        "LLMDEPLOY_ROOT", "/mnt/x/code/llm-deploy")) / "configs/htp_quantsim_config_v81_per_channel_linear.json"))
+    # aimet-torch 2.36 SHIPS the exact config the summary doc names — use it directly
+    ap.add_argument("--config", default=str(
+        Path(torch.__file__).parent.parent / "aimet_torch/common/quantsim_config/htp_quantsim_config_v81_per_channel_linear.json"))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -116,7 +130,7 @@ def main():
 
     S = args.cl_prefill
     mask = causal_mask(S, S).to(args.device)
-    cos, sin = rope_tables(torch.arange(S), cfg.head_dim, cfg.rope_theta)
+    cos, sin = rope_tables(torch.arange(S), cfg.head_dim, rope_theta_of(cfg))
     cos, sin = cos.to(args.device), sin.to(args.device)
     dummy_ids = torch.zeros(1, S, dtype=torch.int32, device=args.device)
     dummy = (dummy_ids, mask, cos, sin)
@@ -141,7 +155,7 @@ def main():
                 cmask = causal_mask(S, S).to(args.device)  # rank-3 [1, S, S]
                 cmask[:, :, : S - n] = -100.0
                 pos = torch.cat([torch.zeros(S - n, dtype=torch.long), torch.arange(n)])
-                c, s_ = rope_tables(pos, cfg.head_dim, cfg.rope_theta)
+                c, s_ = rope_tables(pos, cfg.head_dim, rope_theta_of(cfg))
                 m(padded, cmask, c.to(args.device), s_.to(args.device))
 
     sim.compute_encodings(calibrate, None)

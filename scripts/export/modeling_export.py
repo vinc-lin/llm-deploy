@@ -230,6 +230,13 @@ class ExportQwen3(nn.Module):
         return m.eval()
 
 
+def rope_theta_of(cfg):
+    """transformers 5.x moved rope_theta into cfg.rope_parameters."""
+    if hasattr(cfg, "rope_theta"):
+        return cfg.rope_theta
+    return cfg.rope_parameters["rope_theta"]
+
+
 def rope_tables(positions, head_dim, theta):
     """Host-side cos/sin half tables: positions [S] -> ([1, S, D/2], [1, S, D/2])."""
     half = head_dim // 2
