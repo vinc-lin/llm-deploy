@@ -11,6 +11,7 @@ export PY_QAIRT=$LLMDEPLOY_DATA/envs/qairt-py312/bin/python     # py3.12: qairt-
 
 if [ -d "$QAIRT_SDK" ]; then
     export PATH=$QAIRT_SDK/bin/x86_64-linux-clang:$PATH
-    export LD_LIBRARY_PATH=$QAIRT_SDK/lib/x86_64-linux-clang:$LD_LIBRARY_PATH
-    export PYTHONPATH=$QAIRT_SDK/lib/python:$PYTHONPATH
+    # syslibs: locally-extracted libc++/libc++abi (QNN tools need LLVM libc++; no sudo)
+    export LD_LIBRARY_PATH=$QAIRT_SDK/lib/x86_64-linux-clang:$LLMDEPLOY_DATA/syslibs/extracted/usr/lib/x86_64-linux-gnu:/home/vinc/.local/share/uv/python/cpython-3.12.12-linux-x86_64-gnu/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+    export PYTHONPATH=$QAIRT_SDK/lib/python${PYTHONPATH:+:$PYTHONPATH}
 fi
