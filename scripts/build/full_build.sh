@@ -14,7 +14,7 @@ CTX=${3:-1024}
 shift; shift || true; shift || true
 EXTRA_FLAGS=("$@")
 
-MODEL=$LLMDEPLOY_DATA/models/Qwen3-0.6B
+MODEL=${MODEL:-$LLMDEPLOY_DATA/models/Qwen3-0.6B}   # override: MODEL=.../Qwen3-1.7B full_build.sh ...
 QP=$LLMDEPLOY_DATA/work/quant/$NAME-prefill
 QD=$LLMDEPLOY_DATA/work/quant/$NAME-decode
 DLC=$LLMDEPLOY_DATA/work/dlc/$NAME

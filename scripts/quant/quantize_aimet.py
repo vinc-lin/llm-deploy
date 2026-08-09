@@ -115,6 +115,9 @@ def main():
     ap.add_argument("--config", default=str(
         Path(torch.__file__).parent.parent / "aimet_torch/common/quantsim_config/htp_quantsim_config_v81_per_channel_linear.json"))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--eval", action="store_true",
+                    help="after calibration, report quantsim-vs-FP32 last-token "
+                         "argmax agreement on the reference prompts")
     ap.add_argument("--export-decode", metavar="PREFILL_OUT_DIR",
                     help="skip calibration: build the use_past=True decode wrapper, load "
                          "encodings from a previous prefill run (guarantees identical "
@@ -206,6 +209,29 @@ def main():
     else:
         sim.compute_encodings(calibrate, None)
         clip_weights_to_7f7f(sim)
+
+    if args.eval and not args.export_decode:
+        eval_prompts = ["The capital of France is", "def fibonacci(n):",
+                        "解释一下什么是注意力机制。", "1+2+3+...+100 ="]
+        agree = 0
+        for p in eval_prompts:
+            ids = tok(p, return_tensors="pt").input_ids[:, :S]
+            n = ids.shape[1]
+            padded = torch.zeros(1, S, dtype=torch.int32, device=args.device)
+            padded[0, -n:] = ids[0]
+            cmask = causal_mask(S, S).to(args.device)
+            cmask[:, :, : S - n] = -100.0
+            pos = torch.cat([torch.zeros(S - n, dtype=torch.long), torch.arange(n)])
+            c, s_ = rope_tables(pos, cfg.head_dim, rope_theta_of(cfg))
+            c, s_ = c.to(args.device), s_.to(args.device)
+            with torch.no_grad():
+                q_logits = sim.model(padded, cmask, c, s_)[0][0, -1]
+                f_logits = model(padded, cmask, c, s_)[0][0, -1]
+            top1 = q_logits.argmax().item() == f_logits.argmax().item()
+            agree += int(top1)
+            print(f"[eval] {p!r}: quant argmax {'==' if top1 else '!='} fp32 argmax; "
+                  f"max|dlogits|={float((q_logits - f_logits).abs().max()):.3f}")
+        print(f"[eval] last-token argmax agreement: {agree}/{len(eval_prompts)}")
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
