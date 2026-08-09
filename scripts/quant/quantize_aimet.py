@@ -1,0 +1,157 @@
+#!/usr/bin/env python
+"""AIMET PTQ W8A16 for the export-friendly Qwen3 wrapper.
+
+Reconstructed from SA8797P_Deployment_Status_Summary.md §2.2:
+- default_param_bw=8 (per-channel symmetric via config json), default_output_bw=16
+- quant_scheme = post_training_tf_enhanced
+- calibration: ~10 mixed zh/en/code/math prompts
+- clip_weights_to_7f7f: avoid INT8 saturation (reconstructed: clamp weights so
+  no value quantizes to -128; i.e. symmetric ±127 range)  [FLAGGED for review]
+- quantizers DISABLED on: embed_tokens (HTP Gather-on-INT16 err 0xc26),
+  final norm, lm_head (quality), and K/V projection outputs (cross-graph FP16)
+- with --fuse-gate-up: gate_up_proj output quantizer disabled (FP16 internal,
+  requantized at down_proj)
+
+Written against the AIMET v1-style API (aimet_torch.quantsim). If the installed
+aimet-torch 2.x rejects these calls, see docs/LOCAL_ENV.md for the version pin.
+"""
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "export"))
+from modeling_export import ExportQwen3, causal_mask, rope_tables  # noqa: E402
+
+DATA = Path(os.environ.get("LLMDEPLOY_DATA", "/home/vinc/llm-local"))
+
+CALIB_PROMPTS = [
+    "The quick brown fox jumps over the lazy dog.",
+    "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr",
+    "解释一下什么是注意力机制,它在Transformer中起什么作用?",
+    "求解方程 x^2 - 5x + 6 = 0 的两个根。",
+    "The theory of relativity states that",
+    "import numpy as np\nA = np.random.randn(4, 4)",
+    "中国的首都是北京,美国的首都是华盛顿。",
+    "What is the integral of x * exp(x) dx?",
+    "SELECT name, COUNT(*) FROM users GROUP BY name;",
+    "深度学习模型的量化是指将浮点权重转换为低比特整数表示。",
+]
+
+
+def clip_weights_to_7f7f(sim):
+    """Clamp each quantized weight so no value maps to the asymmetric extreme
+    (-128 for INT8): restrict to symmetric ±127 steps.  Reconstructed from the
+    function name in the summary doc — semantics flagged for review."""
+    from aimet_torch.qc_quantize_op import QcQuantizeWrapper  # v1 API
+    n = 0
+    for m in sim.model.modules():
+        if isinstance(m, QcQuantizeWrapper) and "weight" in m.param_quantizers:
+            q = m.param_quantizers["weight"]
+            if not q.enabled or q.encoding is None:
+                continue
+            encs = q.encoding if isinstance(q.encoding, list) else [q.encoding]
+            w = m._module_to_wrap.weight
+            with torch.no_grad():
+                if len(encs) > 1:  # per-channel
+                    lo = w.new_tensor([-(127.0 * e.delta) for e in encs])[:, None]
+                    hi = w.new_tensor([127.0 * e.delta for e in encs])[:, None]
+                    w.clamp_(min=lo.min(), max=hi.max())
+                    w.copy_(torch.maximum(torch.minimum(w, hi), lo))
+                else:
+                    e = encs[0]
+                    w.clamp_(-(127.0 * e.delta), 127.0 * e.delta)
+            n += 1
+    print(f"clip_weights_to_7f7f: clamped {n} weight tensors")
+
+
+def disable_quantizers(sim, fuse_gate_up):
+    """Disable per summary §2.2. Wrapper names: embed_tokens, norm, lm_head,
+    layers.i.self_attn.{k,v}_proj (outputs), layers.i.mlp.gate_up_proj."""
+    disabled = []
+    for name, m in sim.model.named_modules():
+        leaf = name.split(".")[-1]
+        kill_all = leaf in ("embed_tokens", "norm", "lm_head")
+        kill_out = kill_all or leaf in ("k_proj", "v_proj") or (fuse_gate_up and leaf == "gate_up_proj")
+        if not (kill_all or kill_out):
+            continue
+        if hasattr(m, "output_quantizers"):
+            for q in m.output_quantizers:
+                q.enabled = False
+            disabled.append(name + ".out")
+        if kill_all and hasattr(m, "param_quantizers"):
+            for q in m.param_quantizers.values():
+                q.enabled = False
+            disabled.append(name + ".params")
+        if kill_all and hasattr(m, "input_quantizers"):
+            for q in m.input_quantizers:
+                q.enabled = False
+    print(f"disabled quantizers on: {disabled}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=str(DATA / "models/Qwen3-0.6B"))
+    ap.add_argument("--out", default=str(DATA / "work/quant/qwen3-0.6b"))
+    ap.add_argument("--cl-prefill", type=int, default=128)
+    ap.add_argument("--fuse-gate-up", action="store_true")
+    ap.add_argument("--fuse-qkv", action="store_true")
+    ap.add_argument("--config", default=str(Path(os.environ.get(
+        "LLMDEPLOY_ROOT", "/mnt/x/code/llm-deploy")) / "configs/htp_quantsim_config_v81_per_channel_linear.json"))
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = ap.parse_args()
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from aimet_common.defs import QuantScheme
+    from aimet_torch.quantsim import QuantizationSimModel
+
+    tok = AutoTokenizer.from_pretrained(args.model)
+    hf = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32)
+    cfg = hf.config
+    model = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
+                                use_past=False, logits_last_only=True).to(args.device)
+    del hf
+
+    S = args.cl_prefill
+    mask = causal_mask(S, S).to(args.device)
+    cos, sin = rope_tables(torch.arange(S), cfg.head_dim, cfg.rope_theta)
+    cos, sin = cos.to(args.device), sin.to(args.device)
+    dummy_ids = torch.zeros(1, S, dtype=torch.int32, device=args.device)
+    dummy = (dummy_ids, mask, cos, sin)
+
+    sim = QuantizationSimModel(
+        model,
+        dummy_input=dummy,
+        quant_scheme=QuantScheme.post_training_tf_enhanced,
+        default_param_bw=8,
+        default_output_bw=16,
+        config_file=args.config,
+    )
+    disable_quantizers(sim, args.fuse_gate_up)
+
+    def calibrate(m, _):
+        with torch.no_grad():
+            for p in CALIB_PROMPTS:
+                ids = tok(p, return_tensors="pt").input_ids[:, :S]
+                n = ids.shape[1]
+                padded = torch.zeros(1, S, dtype=torch.int32, device=args.device)
+                padded[0, -n:] = ids[0]
+                cmask = causal_mask(S, S).to(args.device)
+                cmask[:, :, :, : S - n] = -100.0
+                pos = torch.cat([torch.zeros(S - n, dtype=torch.long), torch.arange(n)])
+                c, s_ = rope_tables(pos, cfg.head_dim, cfg.rope_theta)
+                m(padded, cmask, c.to(args.device), s_.to(args.device))
+
+    sim.compute_encodings(calibrate, None)
+    clip_weights_to_7f7f(sim)
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    sim.export(str(out), "model", dummy_input=tuple(t.cpu() for t in dummy))
+    print(f"exported quantsim to {out} (model.onnx + model.encodings)")
+
+
+if __name__ == "__main__":
+    main()
