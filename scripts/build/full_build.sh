@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Full local W8A16 build: quantize -> rename -> convert -> two-graph ctx-bin.
+# Every stage validated individually on 2026-08-10 (see docs/LOCAL_ENV.md).
+#
+# Usage: full_build.sh <name> [cl_prefill] [ctx] [extra quantize flags...]
+#   e.g. full_build.sh qwen3-0.6b-w8a16 128 1024
+#        full_build.sh qwen3-0.6b-w8a16-fusegu 128 1024 --fuse-gate-up
+set -euo pipefail
+source "$(dirname "$0")/../env.sh"
+
+NAME=${1:?name}
+CL=${2:-128}
+CTX=${3:-1024}
+shift; shift || true; shift || true
+EXTRA_FLAGS=("$@")
+
+MODEL=$LLMDEPLOY_DATA/models/Qwen3-0.6B
+QP=$LLMDEPLOY_DATA/work/quant/$NAME-prefill
+QD=$LLMDEPLOY_DATA/work/quant/$NAME-decode
+DLC=$LLMDEPLOY_DATA/work/dlc/$NAME
+CTXBIN=$LLMDEPLOY_DATA/work/ctxbin/$NAME
+PY=$LLMDEPLOY_DATA/envs/qwen3-deploy/bin/python
+CONVERTER="$QAIRT_SDK/bin/x86_64-linux-clang/qairt-converter"
+PAST=$((CTX + CL - 1))
+TOTAL=$((PAST + 1))
+
+echo "== [1/7] AIMET W8A16 prefill quantization (CL=$CL) =="
+$PY "$LLMDEPLOY_ROOT/scripts/quant/quantize_aimet.py" --model "$MODEL" \
+    --cl-prefill "$CL" --out "$QP" "${EXTRA_FLAGS[@]}"
+
+echo "== [2/7] decode export with prefill encodings (CTX=$CTX) =="
+$PY "$LLMDEPLOY_ROOT/scripts/quant/quantize_aimet.py" --model "$MODEL" \
+    --cl-prefill "$CL" --ctx "$CTX" --export-decode "$QP" --out "$QD" "${EXTRA_FLAGS[@]}"
+
+echo "== [3/7] encodings filter =="
+$PY "$LLMDEPLOY_ROOT/scripts/quant/filter_aimet_w8a16.py" "$QP/model.encodings"
+
+echo "== [4/7] canonical I/O rename =="
+$PY "$LLMDEPLOY_ROOT/scripts/quant/rename_aimet_io.py" \
+    --model "$QP/model.onnx" --encodings "$QP/model_filtered.encodings" --layers 28
+$PY "$LLMDEPLOY_ROOT/scripts/quant/rename_aimet_io.py" \
+    --model "$QD/model.onnx" --encodings "$QP/model_filtered.encodings" --layers 28 --with-past
+ENC=$QP/model_filtered_renamed.encodings
+
+echo "== [5/7] convert prefill -> DLC =="
+mkdir -p "$DLC"
+$PY_QAIRT "$CONVERTER" --input_network "$QP/model_renamed.onnx" \
+    --output_path "$DLC/prefill.dlc" --quantization_overrides "$ENC" \
+    --float_bitwidth 16 --target_backend HTP \
+    -d input_ids "1,$CL" -d attention_mask "1,$CL,$CL" \
+    -d position_ids_cos "1,$CL,64" -d position_ids_sin "1,$CL,64"
+
+echo "== [6/7] convert decode -> DLC (single source of truth: prefill encodings) =="
+DIMS=(-d input_ids "1,1" -d attention_mask "1,1,$TOTAL"
+      -d position_ids_cos "1,1,64" -d position_ids_sin "1,1,64")
+for i in $(seq 0 27); do
+  DIMS+=(-d "past_key_${i}_in" "1,8,128,$PAST" -d "past_value_${i}_in" "1,8,$PAST,128")
+done
+$PY_QAIRT "$CONVERTER" --input_network "$QD/model_renamed.onnx" \
+    --output_path "$DLC/decode.dlc" --quantization_overrides "$ENC" \
+    --float_bitwidth 16 --target_backend HTP "${DIMS[@]}"
+
+echo "== [7/7] two-graph ctx-bin (vtcm 16, unsigned PD, v81) =="
+cd "$LLMDEPLOY_ROOT/configs"
+qnn-context-binary-generator \
+    --model "$QAIRT_SDK/lib/x86_64-linux-clang/libQnnModelDlc.so" \
+    --dlc_path "$DLC/prefill.dlc,$DLC/decode.dlc" \
+    --backend "$QAIRT_SDK/lib/x86_64-linux-clang/libQnnHtp.so" \
+    --output_dir "$CTXBIN" --binary_file "${NAME}_ctx" \
+    --config_file htp_config.json
+qnn-context-binary-utility --context_binary "$CTXBIN/${NAME}_ctx.bin" \
+    --json_file "$CTXBIN/info.json"
+$PY - <<PYEOF
+import json
+d = json.load(open("$CTXBIN/info.json"))
+print("GRAPHS:", [g["info"]["graphName"] for g in d["info"]["graphs"]])
+PYEOF
+ls -lh "$CTXBIN"
+echo "FULL BUILD COMPLETE: $CTXBIN/${NAME}_ctx.bin"
