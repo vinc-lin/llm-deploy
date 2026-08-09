@@ -11,6 +11,7 @@ source "$(dirname "$0")/../env.sh"
 NAME=${1:?bundle name}
 CTXBIN=${2:?path to ctx-bin .bin}
 DIALOG=${3:-$LLMDEPLOY_ROOT/configs/genie_dialog_qwen3_0.6b.json}
+TOKENIZER=${4:-$LLMDEPLOY_DATA/models/Qwen3-0.6B/tokenizer.json}
 
 OUT=$LLMDEPLOY_DATA/bundles/$NAME
 rm -rf "$OUT"   # stale binaries from a previous bundling must not leak in
@@ -26,7 +27,7 @@ cp "$A/libGenie.so" "$A/libQnnHtp.so" "$A/libQnnSystem.so" \
 
 cp "$QAIRT_SDK/bin/aarch64-android/genie-t2t-run" "$OUT/"
 cp "$CTXBIN" "$OUT/"
-cp "$LLMDEPLOY_DATA/models/Qwen3-0.6B/tokenizer.json" "$OUT/"
+cp "$TOKENIZER" "$OUT/tokenizer.json"
 cp "$DIALOG" "$OUT/genie_dialog.json"
 cp "$LLMDEPLOY_ROOT/configs/htp_backend_ext_config.json" "$OUT/"
 
