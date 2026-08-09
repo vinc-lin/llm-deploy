@@ -13,6 +13,7 @@ CTXBIN=${2:?path to ctx-bin .bin}
 DIALOG=${3:-$LLMDEPLOY_ROOT/configs/genie_dialog_qwen3_0.6b.json}
 
 OUT=$LLMDEPLOY_DATA/bundles/$NAME
+rm -rf "$OUT"   # stale binaries from a previous bundling must not leak in
 mkdir -p "$OUT"
 
 A=$QAIRT_SDK/lib/aarch64-android
