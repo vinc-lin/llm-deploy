@@ -40,7 +40,8 @@ def export_graph(model, cfg, out_path, seq, past_len):
     if past_len > 0:
         for i in range(cfg.num_hidden_layers):
             names_in += [f"past_key_{i}_in", f"past_value_{i}_in"]
-            args += [torch.zeros(1, n_kv, past_len, head_dim),
+            # Genie contract: keys transposed [1, n_kv, D, P], values [1, n_kv, P, D]
+            args += [torch.zeros(1, n_kv, head_dim, past_len),
                      torch.zeros(1, n_kv, past_len, head_dim)]
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

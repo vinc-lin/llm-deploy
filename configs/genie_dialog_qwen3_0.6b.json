@@ -1,5 +1,5 @@
 {
-  "_comment": "DRAFT Genie T2T dialog config from summary §2.1. VERIFY against SDK Genie docs/examples (libGenie 1.19 schema) — key spellings and nesting WILL need adjustment; values are the validated ones.",
+  "_comment": "Genie T2T dialog config for Qwen3-0.6B W8A16. Schema verified against SDK 2.48.40 examples (llama3-3b-htp-long-context.json) + summary §2.1 values. cpu-mask/eos values remain device/model-specific.",
   "dialog": {
     "version": 1,
     "type": "basic",
@@ -35,9 +35,8 @@
           "poll": true,
           "cpu-mask": "0xe0",
           "kv-dim": 128,
-          "pos-id-dim": 64,
-          "rope-theta": 1000000.0,
-          "allow-async-init": true
+          "allow-async-init": true,
+          "enable-graph-switching": true
         },
         "extensions": "htp_backend_ext_config.json"
       },
@@ -51,7 +50,7 @@
         "positional-encoding": {
           "type": "rope",
           "rope-dim": 64,
-          "rope-theta": 1000000.0
+          "rope-theta": 1000000
         }
       }
     }

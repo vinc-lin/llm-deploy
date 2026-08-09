@@ -8,12 +8,19 @@ scripts are unavailable). Encodes the validated export constraints:
 - RMSNorm decomposed into primitive ops (opset 17 has no RMSNorm; never use
   torch.nn.RMSNorm which exports a fused op).
 - Q/K per-head RMSNorm (Qwen3's q_norm/k_norm) preserved exactly.
-- Attention mask is an ADDITIVE float input of shape [1, 1, S, P+S]
-  (width = context + AR, per the summary doc). 0 = attend, -100 = masked
-  (-100 rather than -inf for FP16 safety).
-- KV cache: static shapes. past_(key|value)_i are [1, n_kv, P, D] inputs,
-  right-aligned (latest token last; front is masked garbage). The graph outputs
-  concat(past, new) of length P+S; the runtime keeps the trailing P entries.
+- Attention mask is an ADDITIVE float input of shape [1, S, P+S] (rank-3;
+  Genie checkShape expects [1, AR, CTX] — nsp-model.cpp Check 3). 0 = attend,
+  -100 = masked (-100 rather than -inf for FP16 safety).
+- KV cache contract (verified against Genie 1.19 qualla engine source,
+  examples/Genie/Genie/src/qualla/engines/qnn-htp/nsp-graph.cpp:117,156 and
+  nsp-model.cpp:804ff):
+    * KEYS are stored TRANSPOSED: past_key_{i}_in  [1, n_kv, D, P]
+      (kv_dim = second-to-last axis, sequence = LAST axis)
+    * VALUES natural:             past_value_{i}_in [1, n_kv, P, D]
+    * outputs carry ONLY the new tokens' slice (Genie scatters into its cache):
+      past_key_{i}_out [1, n_kv, D, S], past_value_{i}_out [1, n_kv, S, D]
+    * name pattern past_<kind>_<i>_in/_out (isKVTensor: contains key|value and
+      ends _in/_out; input name derived from output by replacing _out with _in)
 - Optional fusions (summary §2.3 / §4.1):
     fuse_gate_up: gate_proj+up_proj -> one gate_up_proj Linear, Split after.
     fuse_qkv:     q/k/v_proj -> one qkv_proj Linear, Split after.
@@ -71,7 +78,7 @@ class ExportAttention(nn.Module):
         self.k_norm = ExportRMSNorm(self.head_dim, cfg.rms_norm_eps)
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
-    def forward(self, x, cos_h, sin_h, mask, past_k, past_v):
+    def forward(self, x, cos_h, sin_h, mask, past_k_t, past_v):
         B, S, _ = x.shape
         if self.fuse_qkv:
             qkv = self.qkv_proj(x)
@@ -91,23 +98,27 @@ class ExportAttention(nn.Module):
         q = apply_rope(q, cos_h, sin_h)
         k = apply_rope(k, cos_h, sin_h)
 
-        if past_k is not None:
-            k = torch.cat([past_k, k], dim=2)
-            v = torch.cat([past_v, v], dim=2)
-        new_k, new_v = k, v
-        T = k.shape[2]
+        # Genie KV contract: keys transposed (seq last), outputs = new slice only
+        new_k_t = k.transpose(-1, -2)  # [B, n_kv, D, S]
+        new_v = v                      # [B, n_kv, S, D]
+        if past_k_t is not None:
+            k_t = torch.cat([past_k_t, new_k_t], dim=-1)  # [B, n_kv, D, T]
+            v_full = torch.cat([past_v, new_v], dim=2)    # [B, n_kv, T, D]
+        else:
+            k_t, v_full = new_k_t, new_v
+        T = k_t.shape[-1]
 
         # GQA: expand kv heads to q heads (no repeat_interleave: keep ops simple)
         rep = self.n_heads // self.n_kv
-        k = k.unsqueeze(2).expand(B, self.n_kv, rep, T, self.head_dim).reshape(B, self.n_heads, T, self.head_dim)
-        v = v.unsqueeze(2).expand(B, self.n_kv, rep, T, self.head_dim).reshape(B, self.n_heads, T, self.head_dim)
+        k_t = k_t.unsqueeze(2).expand(B, self.n_kv, rep, self.head_dim, T).reshape(B, self.n_heads, self.head_dim, T)
+        v_full = v_full.unsqueeze(2).expand(B, self.n_kv, rep, T, self.head_dim).reshape(B, self.n_heads, T, self.head_dim)
 
-        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        attn = attn + mask  # [1, 1, S, T] additive
+        attn = torch.matmul(q, k_t) * self.scale  # [B, H, S, T]
+        attn = attn + mask.unsqueeze(1)  # mask [1, S, T] additive -> broadcast heads
         attn = torch.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)  # [B, H, S, D]
+        out = torch.matmul(attn, v_full)  # [B, H, S, D]
         out = out.transpose(1, 2).reshape(B, S, self.n_heads * self.head_dim)
-        return self.o_proj(out), new_k, new_v
+        return self.o_proj(out), new_k_t, new_v
 
 
 class ExportMLP(nn.Module):
@@ -228,9 +239,9 @@ def rope_tables(positions, head_dim, theta):
 
 
 def causal_mask(seq, total):
-    """Additive [1, 1, seq, total] causal mask; current tokens right-aligned."""
+    """Additive rank-3 [1, seq, total] causal mask; current tokens right-aligned."""
     m = torch.full((seq, total), MASK_VALUE, dtype=torch.float32)
     past = total - seq
     for r in range(seq):
         m[r, : past + r + 1] = 0.0
-    return m[None, None]
+    return m[None]

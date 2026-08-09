@@ -28,8 +28,8 @@ DATA = Path(os.environ.get("LLMDEPLOY_DATA", "/home/vinc/llm-local"))
 def run_prefill(sess, ids_padded, n_valid, cl_prefill, cfg_head_dim, rope_theta):
     """ids_padded: [1, cl_prefill] int32, right-aligned (front zeros masked)."""
     pad = cl_prefill - n_valid
-    mask = causal_mask(cl_prefill, cl_prefill)
-    mask[:, :, :, :pad] = MASK_VALUE  # padded front never attended
+    mask = causal_mask(cl_prefill, cl_prefill)  # rank-3 [1, S, S]
+    mask[:, :, :pad] = MASK_VALUE  # padded front never attended
     # positions: padded slots get position 0 (masked anyway), valid tokens 0..n-1
     pos = torch.cat([torch.zeros(pad, dtype=torch.long), torch.arange(n_valid)])
     cos, sin = rope_tables(pos, cfg_head_dim, rope_theta)
@@ -86,14 +86,17 @@ def main():
     assert am_ref == am_onnx
 
     # ---- Test 2: decode chain with right-aligned sliding window ----
+    # Genie KV contract: K transposed [1, n_kv, D, P], V [1, n_kv, P, D];
+    # graph outputs only the new slice — the host (here: us; on-device: Genie)
+    # maintains the sliding cache.
     P = args.ctx + args.cl_prefill - 1  # decode graph past length
     # init caches: zeros front (masked), prefill kv (length cl_prefill) at the back
     caches = []
     for i in range(L):
-        k = np.zeros((1, n_kv, P, hd), dtype=np.float32)
+        k = np.zeros((1, n_kv, hd, P), dtype=np.float32)
         v = np.zeros((1, n_kv, P, hd), dtype=np.float32)
-        k[:, :, -args.cl_prefill:] = outs[1 + 2 * i]
-        v[:, :, -args.cl_prefill:] = outs[2 + 2 * i]
+        k[:, :, :, -args.cl_prefill:] = outs[1 + 2 * i]
+        v[:, :, -args.cl_prefill:, :] = outs[2 + 2 * i]
         caches.append((k, v))
 
     valid = n  # valid kv entries (right-aligned)
@@ -101,8 +104,8 @@ def main():
     produced = [am_onnx]
     for step in range(1, args.steps):
         total = P + 1
-        mask = torch.full((1, 1, 1, total), MASK_VALUE, dtype=torch.float32)
-        mask[:, :, :, -(valid + 1):] = 0.0
+        mask = torch.full((1, 1, total), MASK_VALUE, dtype=torch.float32)
+        mask[:, :, -(valid + 1):] = 0.0
         pos = torch.tensor([n + step - 1])
         cos, sin = rope_tables(pos, hd, cfg.rope_theta)
         feeds = {
@@ -118,8 +121,12 @@ def main():
         nxt = int(np.argmax(outs_d[0][0, -1]))
         produced.append(nxt)
         cur = torch.tensor([[nxt]], dtype=torch.int32)
-        # slide: keep trailing P entries of the [P+1] outputs
-        caches = [(outs_d[1 + 2 * i][:, :, 1:], outs_d[2 + 2 * i][:, :, 1:]) for i in range(L)]
+        # slide window: drop oldest column, append the new slice at the back
+        caches = [
+            (np.concatenate([caches[i][0][:, :, :, 1:], outs_d[1 + 2 * i]], axis=3),
+             np.concatenate([caches[i][1][:, :, 1:, :], outs_d[2 + 2 * i]], axis=2))
+            for i in range(L)
+        ]
         valid += 1
 
     ok = produced == ref_gen[: len(produced)]

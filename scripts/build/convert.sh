@@ -25,17 +25,18 @@ echo "== prefill =="
   --quantization_overrides "$ENCODINGS" \
   --float_bitwidth 16 --target_backend HTP \
   -d input_ids "1,$CL_PREFILL" \
-  -d attention_mask "1,1,$CL_PREFILL,$CL_PREFILL" \
+  -d attention_mask "1,$CL_PREFILL,$CL_PREFILL" \
   -d position_ids_cos "1,$CL_PREFILL,64" \
   -d position_ids_sin "1,$CL_PREFILL,64"
 
 echo "== decode =="
 DECODE_DIMS=(-d input_ids "1,1" \
-  -d attention_mask "1,1,1,$TOTAL" \
+  -d attention_mask "1,1,$TOTAL" \
   -d position_ids_cos "1,1,64" \
   -d position_ids_sin "1,1,64")
 for i in $(seq 0 $((NLAYERS - 1))); do
-  DECODE_DIMS+=(-d "past_key_${i}_in" "1,$NKV,$PAST,$HEADDIM")
+  # Genie contract: keys transposed [1, n_kv, D, P], values [1, n_kv, P, D]
+  DECODE_DIMS+=(-d "past_key_${i}_in" "1,$NKV,$HEADDIM,$PAST")
   DECODE_DIMS+=(-d "past_value_${i}_in" "1,$NKV,$PAST,$HEADDIM")
 done
 "$PY_QAIRT" "$QAIRT_SDK/bin/x86_64-linux-clang/qairt-converter" \

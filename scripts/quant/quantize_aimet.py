@@ -138,8 +138,8 @@ def main():
                 n = ids.shape[1]
                 padded = torch.zeros(1, S, dtype=torch.int32, device=args.device)
                 padded[0, -n:] = ids[0]
-                cmask = causal_mask(S, S).to(args.device)
-                cmask[:, :, :, : S - n] = -100.0
+                cmask = causal_mask(S, S).to(args.device)  # rank-3 [1, S, S]
+                cmask[:, :, : S - n] = -100.0
                 pos = torch.cat([torch.zeros(S - n, dtype=torch.long), torch.arange(n)])
                 c, s_ = rope_tables(pos, cfg.head_dim, cfg.rope_theta)
                 m(padded, cmask, c.to(args.device), s_.to(args.device))
