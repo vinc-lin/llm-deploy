@@ -72,6 +72,25 @@ Genie on-HTP execution. Local success = artifact correctness + numerical parity.
 AIMET-export I/O names are mangled → `scripts/quant/rename_aimet_io.py`
 restores canonical Genie names (positional + consumer-pattern checks).
 
+## Full-size build results (CL=128 / CTX=1024, weight-shared, vtcm 16, v81)
+
+| Variant | ctx-bin | Build-time DDR read (prefill / decode) | VTCM spill |
+|---|---|---|---|
+| baseline W8A16 | 1.5 GB (2.1 GB without weight sharing) | 759 MB / 957 MB | 0 |
+| + Gate-Up fusion | 1.5 GB | 769 MB / 961 MB | 0 |
+| + QKV fusion (surgery 28/28) | 1.5 GB | 763 MB / 961 MB | 0 |
+
+Weight sharing reproduces the remote's recorded 1.5 GB binary size exactly.
+
+**Key observation vs summary §3.3/§4.3-Q1:** at vtcm 16, fusion gives **no
+build-time DDR byte reduction** (remote's 3.4× reduction was measured at
+vtcm_mb=24, which is rejected on the device's unsigned PD). All variants show
+zero VTCM spill at 16 MB. Any real fusion gain must come from fewer/larger DMA
+transactions (access-pattern quality), which only on-device measurement can
+confirm. The QKV quantizer conflict (remote error 5005 / garbage) is resolved
+at the ENCODINGS level — surgered encodings accepted by converter + generator
+at vtcm 16; runtime/quality proof still requires hardware.
+
 ## Progress log
 
 - 2026-08-10: full environment stood up and ENTIRE pipeline validated at smoke
