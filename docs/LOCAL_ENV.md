@@ -97,8 +97,59 @@ Quantsim-vs-FP32 last-token argmax agreement on the 4 reference prompts: **3/4**
 (miss = "1+2+3+...+100 =", a near-tie; max|Δlogits| ≈ 1.3–1.6 across prompts).
 Consistent with the remote's on-device "coherent output" finding for W8A16.
 
+## Lookahead decoding build (2026-08-10, attacks the fragmentation root cause)
+
+The DDR collapse (49 → ~7 GB/s) comes from per-token weight streaming; the only
+lever that *divides* bytes/token is multi-token decoding. Genie 1.19 ships
+dialog types `lade` (lookahead, no draft model), `spd`, `eaglet`, `ssd-q1` —
+contract extracted in `docs/NOTES-genie-io.md`. Built: AR=32 verification
+graph (decode wrapper at S=32, past=1120, all-position logits) via
+`scripts/build/lade_build.sh`, converted against the SAME prefill encodings.
+
+| Artifact | Result |
+|---|---|
+| 3-graph ctx-bin (prefill128 + decode1 + verify32) | **1.5 GB** — weight sharing held across all 3 |
+| verify32 dims | ids [1,32], mask [1,32,1152], past 1120, logits [1,32,151936] ✓ |
+| AR=8 ONNX verify parity vs HF (CL=32/ctx=96) | all-position argmax match, max|Δ| 3.05e-05 |
+| Bundle | `qwen3_06b_w8a16_lade.tar.gz` (lade + basic dialog configs, same bin) |
+
+**Build-time DDR per verification pass (vtcm 16):** prefill 763 MB (0 spill),
+decode 961 MB (0 spill), **verify32 1,906 MB with 745/750 MB VTCM spill/fill**
+— AR=32 activations don't fit 16 MB VTCM. On raw bytes, lookahead breaks even
+at ~2.0 accepted tokens/pass (LADE typical: 1.3–1.8 chat, higher for code).
+BUT spill/fill is contiguous DMA (~49 GB/s class) while weight streaming is
+the fragmented ~7 GB/s kind, so the spill may be cheap in wall-clock. Device
+A/B (`genie_dialog.json` = lade vs `genie_dialog_basic.json` on the SAME
+ctx-bin; Genie reports `tps.tokenAcceptance`) settles it.
+
+Config guardrail (from qualla source): keep `(ngram-1)*(window+gcap) <= 32` —
+oversized lade configs silently route batches to the prefill graph, which has
+no past-KV inputs and cannot serve incremental verification.
+Shipped config: window 8 / ngram 3 / gcap 8 = exactly 32.
+Tuning option if spill hurts: an AR=16 graph (`lade_build.sh <name> 128 1024 16`)
+with window 4 / gcap 4.
+
 ## Progress log
 
 - 2026-08-10: full environment stood up and ENTIRE pipeline validated at smoke
   scale (see table above). One-shot pipeline: `scripts/build/full_build.sh`;
   bundling: `scripts/build/bundle.sh`. Full-size (CL=128/CTX=1024) build launched.
+- 2026-08-10 (later): lookahead-decoding support built — AR=32 verification
+  graph, 3-graph weight-shared ctx-bin, `lade` dialog config, ONNX parity
+  passed (see section above). C: recovered to 109 GB free (VHD compacted).
+- 2026-08-11: FIRST DEVICE RUN (remote tester, fuseqkvgu) → garbage from
+  token 1. Root-caused device-free to OUR prefill export, not fusion: the
+  last-token-only logits head `[1,1,V]` is incompatible with qualla's basic
+  dialog, which left-aligns input and samples logits row `n_process-1`
+  (out-of-bounds on a 1-row buffer → zero/noise logits → argmax = token 0
+  = `"!"`). All bundles were affected. Full mechanism + citations:
+  docs/NOTES-genie-io.md "Prefill logits contract". Encodings surgery
+  verified CLEAN at JSON + DLC level (not the cause). Fix: prefill now
+  exports all-position logits `[1,128,V]`; new regression guard
+  `scripts/validate/parity_qualla_read.py` (left-aligned, row n−1) passed
+  4/4 alongside existing parity. Rebuilds via
+  `scripts/build/prefill_fix_rebuild.sh` (adopt-encodings, prefill-DLC-only).
+  Device run also yielded first real KPIs: fused decode ~6.27 tok/s
+  (159.6 ms/step ≈ 6 GB/s — fusion NOT beating baseline at vtcm 16);
+  AR-128 prefill pass 50 ms vs AR-1 decode step 160 ms — first on-device
+  evidence for multi-token (lade) amortization.
