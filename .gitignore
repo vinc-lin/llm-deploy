@@ -5,3 +5,4 @@ envs/
 work/
 bundles/
 *.log
+__pycache__/
