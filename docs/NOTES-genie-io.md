@@ -115,6 +115,69 @@ with `logits_last_only=False`. Regression guard:
   (self-speculative with forecast tokens). Example target ctx-bins are named
   `base_tm_ar128_ar32_*` — i.e. prefill AR128 + verify AR32, matching our layout.
 
+## Graph selection, lade SIGSEGV root cause, past-KV prefill contract — extracted 2026-08-11
+
+*Sources: `qualla/engines/qnn-htp/KVCache/kvmanager.cpp`, `nsp-model.cpp`,
+`nsp-graph.cpp`, `attention-mask.cpp`, `dialogs/lhd-dec.cpp`, `context.cpp`.*
+
+**Graph selection is pure numeric best-fit on (AR, CL)** — names are cosmetic.
+CL: `m_supported_variants.lower_bound(n_valid_kv)` (kvmanager.cpp:408) —
+smallest CL ≥ current KV. AR: smallest `arN >= n_tokens`, else largest smaller
+(chunking fallback) (kvmanager.cpp:388-406). AR from `numElements(input_ids)`,
+CL from mask channel dim (nsp-graph.cpp:83-87, 154-155); name regex is a
+fallback only. Duplicate (AR, CL) pairs are a hard load error
+(nsp-graph.cpp:297-302). With AR-1/32/128 all at CL-1152: ≤32-token prompts
+and ALL lade batches run on AR-32; AR-128 serves 33–128-token prompts and
+chunking; basic decode runs AR-1.
+
+**lade SIGSEGV has TWO independent mechanisms** (both consistent with the
+2026-08-10/11 device crashes at libGenie pc 0x4c2d58, x0=0x6b8b4567):
+
+1. *Bertcache (AR==CL) graph present*: only `ctx_size == variant` inflates
+   `n_process` beyond the batch size (`n_remain += n_past`,
+   kvmanager.cpp:421-429). lhd-dec's RELATIONAL attention path then reads
+   `m_cached_attention_counts[i]` for i up to n_process with a vector sized
+   n_inputs (attention-mask.cpp:236-240) — heap OOB — and the garbage position
+   ids become byte offsets in a RoPE-table `memcpy` (nsp-model.cpp:2196-2204)
+   → host SIGSEGV. Removing the AR==CL graph provably removes this path.
+2. *1-token prompt*: `lhd_branch` warmup does
+   `rand() % (tokens.size()-1)` (lhd-dec.cpp:120) — modulo ZERO for a 1-token
+   prompt; aarch64 returns the dividend → index `1+0x6b8b4567` → ~7 GB OOB
+   read. 0x6b8b4567 is rand()'s first output — this exactly matches the device
+   crash register, and the crashing run used prompt "Hi". **Unconditional
+   qualla bug, independent of graph topology: lade prompts must tokenize to
+   ≥ 2 tokens.**
+
+**Past-KV prefill (AR=128 CL=1152 past=1024) feeding contract** (basis of
+`scripts/validate/parity_ladekv_read.py`):
+- Tokens LEFT-aligned, remainder filled with pad token; `pad-token` defaults
+  to the FIRST `eos-token` entry (context.cpp:51) — 151645 for our config.
+- Mask FP16 additive: allow=+0.0, masked=fp16(**-1000.0**) — not -inf
+  (nsp-model.cpp:1382-1386). Our encodings calibrate the mask input at -100,
+  so device -1000 clips to -100: still e^-100 ≈ 0, harmless (and already true
+  of all working device builds).
+- Concat layout: mask cols [0,1024) = past region, [1024,1152) = new tokens.
+  Chunk row i allows past cols [0,n_valid_kv) + new cols 1024..1024+i.
+- RoPE positions `iota(n_past+i)` for valid rows, 0 for pad rows.
+- Logits sampled at row `n_process-1` (all-position logits still mandatory).
+- Prompts chunk AR at a time with growing n_past (kvmanager.cpp:430-465);
+  ceiling: accumulated KV ≤ past_dim = CL−AR = **1024** (kvmanager.cpp:457-464),
+  and `context.size` config must be ≤ max CL (nsp-model.cpp:402-406).
+
+**Cross-graph invariants** (fatal load errors if violated):
+- KV quant params byte-identical across all graphs for same-named tensors
+  (`_in` normalized to `_out`) — nsp-model.cpp:922-961. Guaranteed by our
+  encodings-adoption pipeline; do NOT convert graphs from different encodings.
+- All graphs same KV style: concat requires `past_key_in.channel == CL − AR`
+  per graph (nsp-model.cpp:552-565).
+- A logits-less prefill classifies `DECODER_PREFILL` and is excluded whenever
+  all-position output is requested (kvmanager.cpp:392-394) — keep logits.
+
+**Perf note**: after every dialog-level KV update the cache is reshaped to the
+smallest registered AR (kvmanager.cpp:934). In lade this means AR-32↔AR-1
+reshapes every iteration; if device KPIs show this hurting, a lade-only
+ctx-bin without the AR-1 graph is the lever.
+
 ## Other findings
 
 - x86_64 tools INCLUDE `genie-t2t-run` + `libGenie.so` → local e2e Genie smoke

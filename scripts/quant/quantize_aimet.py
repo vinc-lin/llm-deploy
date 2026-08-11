@@ -59,6 +59,8 @@ def clip_weights_to_7f7f(sim):
         q = pq["weight"] if (pq is not None and "weight" in pq) else None
         if q is None or not hasattr(m, "weight"):
             continue
+        if "Block" in type(q).__name__:   # LPBQ/blockwise: per-block scale shape
+            continue                       # doesn't broadcast; clip is N/A
         try:
             scale = q.get_scale()
         except Exception:
@@ -70,20 +72,24 @@ def clip_weights_to_7f7f(sim):
             s = scale.detach().to(dtype=w.dtype, device=w.device)
             while s.dim() < w.dim():
                 s = s.unsqueeze(-1)
-            hi = 127.0 * s
+            hi = float(2 ** (q.bitwidth - 1) - 1) * s
             w.copy_(torch.minimum(torch.maximum(w, -hi), hi))
         n += 1
     print(f"clip_weights_to_7f7f: clamped {n} weight tensors")
 
 
-def disable_quantizers(sim, fuse_gate_up):
+def disable_quantizers(sim, fuse_gate_up, quant_head=False):
     """Disable per summary §2.2. Wrapper names: embed_tokens, norm, lm_head,
     layers.i.self_attn.{k,v}_proj (outputs), layers.i.mlp.gate_up_proj.
-    v2 semantics: a quantizer slot is disabled by setting it to None."""
+    v2 semantics: a quantizer slot is disabled by setting it to None.
+    quant_head=True keeps lm_head's WEIGHT quantizer (8-bit per-channel: its
+    FP16 weight is ~311MB of the ~960MB/token decode stream; W8 halves that)
+    while still disabling its activation quantizers (logits stay FP16)."""
     disabled = []
     for name, m in _quantized_modules(sim):
         leaf = name.split(".")[-1]
         kill_all = leaf in ("embed_tokens", "norm", "lm_head")
+        keep_params = quant_head and leaf == "lm_head"
         kill_out = kill_all or leaf in ("k_proj", "v_proj") or (fuse_gate_up and leaf == "gate_up_proj")
         if not (kill_all or kill_out):
             continue
@@ -93,7 +99,7 @@ def disable_quantizers(sim, fuse_gate_up):
             disabled.append(name + ".out")
         if kill_all:
             pq = getattr(m, "param_quantizers", None)
-            if pq is not None:
+            if pq is not None and not keep_params:
                 for k in list(pq.keys()):
                     pq[k] = None
                 disabled.append(name + ".params")
@@ -109,6 +115,19 @@ def main():
     ap.add_argument("--model", default=str(DATA / "models/Qwen3-0.6B"))
     ap.add_argument("--out", default=str(DATA / "work/quant/qwen3-0.6b"))
     ap.add_argument("--cl-prefill", type=int, default=128)
+    ap.add_argument("--weight-bw", type=int, default=8, choices=(4, 8),
+                    help="weight bitwidth (per-channel symmetric); 4 = W4A16 "
+                         "experiment, k/v/o_proj stay 8-bit")
+    ap.add_argument("--lpbq", action="store_true",
+                    help="with --weight-bw 4: grouped blockwise (LPBQ) weight "
+                         "quantizers instead of plain per-channel")
+    ap.add_argument("--lpbq-block", type=int, default=64)
+    ap.add_argument("--seq-mse", action="store_true",
+                    help="apply Sequential MSE weight-range optimization "
+                         "before compute_encodings (W4 recipes need this)")
+    ap.add_argument("--quant-head", action="store_true",
+                    help="quantize lm_head weight to 8-bit per-channel "
+                         "(saves ~155MB/token of decode DDR stream)")
     ap.add_argument("--fuse-gate-up", action="store_true")
     ap.add_argument("--fuse-qkv", action="store_true")
     # aimet-torch 2.36 SHIPS the exact config the summary doc names — use it directly
@@ -194,11 +213,39 @@ def main():
         model,
         dummy_input=dummy,
         quant_scheme=QuantScheme.post_training_tf_enhanced,
-        default_param_bw=8,
+        default_param_bw=args.weight_bw,
         default_output_bw=16,
         config_file=args.config,
     )
-    disable_quantizers(sim, args.fuse_gate_up)
+    disable_quantizers(sim, args.fuse_gate_up, args.quant_head)
+    if args.weight_bw < 8 and args.lpbq:
+        # LPBQ (grouped blockwise, Qualcomm's W4A16 LLM recipe): int4 blocks of
+        # 64 input channels, block scales grouped onto a per-channel int8 grid
+        # (decompressed_bw). HTP supports it as BLOCKWISE_EXPANSION, arch >= v69.
+        import torch.nn as nn
+        from aimet_torch.quantsim.config_utils import \
+            set_grouped_blockwise_quantization_for_weights
+
+        def eligible(m):
+            return (isinstance(m, nn.Linear)
+                    and m.in_features % args.lpbq_block == 0)
+        set_grouped_blockwise_quantization_for_weights(
+            sim, eligible, bitwidth=args.weight_bw, symmetric=True,
+            decompressed_bw=8, block_size=args.lpbq_block, block_grouping=-1)
+        print(f"weight_bw={args.weight_bw}: LPBQ block={args.lpbq_block} "
+              "applied to all divisible Linears")
+    elif args.weight_bw < 8:
+        # HTP W4A16: FullyConnected supports int4 per-channel symmetric weights,
+        # but 4-bit grids are coarse — keep the attention projections whose
+        # outputs feed the KV cache (and the output projection) at 8-bit.
+        kept = 0
+        for name, m in _quantized_modules(sim):
+            if any(k in name for k in ("k_proj", "v_proj", "o_proj")):
+                pq = getattr(m, "param_quantizers", None)
+                if pq is not None and "weight" in pq and pq["weight"] is not None:
+                    pq["weight"].bitwidth = 8
+                    kept += 1
+        print(f"weight_bw={args.weight_bw}: kept {kept} attention projections at 8-bit")
 
     def calibrate(m, _):
         with torch.no_grad():
@@ -226,6 +273,27 @@ def main():
         sim.load_encodings(str(Path(args.adopt_encodings) / "model_torch.encodings"),
                            strict=False)
     else:
+        if args.seq_mse:
+            # Sequential MSE picks per-layer optimal weight-encoding candidates
+            # by minimizing activation MSE — Qualcomm's documented make-or-break
+            # step for W4 LLM recipes. Must run BEFORE compute_encodings (it
+            # freezes the chosen param encodings).
+            from aimet_torch.seq_mse import apply_seq_mse
+            batches = []
+            with torch.no_grad():
+                for p in CALIB_PROMPTS:
+                    ids = tok(p, return_tensors="pt").input_ids[:, :S]
+                    n = ids.shape[1]
+                    padded = torch.zeros(1, S, dtype=torch.int32, device=args.device)
+                    padded[0, -n:] = ids[0]
+                    cmask = causal_mask(S, S).to(args.device)
+                    cmask[:, :, : S - n] = -100.0
+                    pos = torch.cat([torch.zeros(S - n, dtype=torch.long),
+                                     torch.arange(n)])
+                    c, s_ = rope_tables(pos, cfg.head_dim, rope_theta_of(cfg))
+                    batches.append((padded, cmask, c.to(args.device), s_.to(args.device)))
+            apply_seq_mse(sim=sim, data_loader=batches)
+            print(f"seq_mse applied over {len(batches)} calibration batches")
         sim.compute_encodings(calibrate, None)
         clip_weights_to_7f7f(sim)
 

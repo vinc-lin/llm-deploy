@@ -17,6 +17,10 @@ DIR=${2:?local dir}
 LOG=${3:-$HOME/llm-local/hf-upload-watchdog.log}
 STALL_SECS=${STALL_SECS:-180}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-30}
+# Consecutive 20s checks with ALL sockets CLOSE-WAIT before declaring a stall.
+# Through some proxy states this false-positives while data still flows —
+# set high (e.g. 999999) to rely on the progress-freeze detector alone.
+SOCKET_CHECKS=${SOCKET_CHECKS:-2}
 
 attempt=0
 while (( attempt < MAX_ATTEMPTS )); do
@@ -41,7 +45,7 @@ while (( attempt < MAX_ATTEMPTS )); do
     if [[ "$line" != "$last_line" ]]; then
       last_line=$line; last_change=$(date +%s)
     fi
-    if (( dead_socket_checks >= 2 )) || (( $(date +%s) - last_change > STALL_SECS )); then
+    if (( dead_socket_checks >= SOCKET_CHECKS )) || (( $(date +%s) - last_change > STALL_SECS )); then
       echo "[watchdog] stall detected (sockets=$dead_socket_checks, frozen=$(( $(date +%s) - last_change ))s) — restarting" >> "$LOG"
       kill "$UP" 2>/dev/null; sleep 2; kill -9 "$UP" 2>/dev/null
       break

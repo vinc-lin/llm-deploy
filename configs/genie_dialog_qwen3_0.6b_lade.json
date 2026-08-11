@@ -55,7 +55,7 @@
         "binary": {
           "version": 1,
           "ctx-bins": [
-            "qwen3_06b_w8a16_lade_ctx.bin"
+            "qwen3-0.6b-w8a16-lade_ctx.bin"
           ]
         },
         "positional-encoding": {

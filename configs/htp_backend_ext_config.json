@@ -3,7 +3,8 @@
     {
       "graph_names": [
         "prefill",
-        "decode"
+        "decode",
+        "verify32"
       ],
       "O": 3,
       "vtcm_mb": 16,
