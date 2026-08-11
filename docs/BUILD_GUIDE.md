@@ -26,13 +26,27 @@ qwen3_06b_w8a16_local/
 └── 7 × .so                       # libGenie, libQnnHtp*, libQnnSystem (flat, no lib/)
 ```
 
-The ctx-bin contains 2–3 **graphs sharing one weight set**:
+The ctx-bin contains 2–3 **graphs sharing one weight set**. Two topologies
+exist — pick by whether you need lookahead decoding:
+
+**A. Bertcache topology** (baseline + fused variants):
 
 | Graph | Shape | Role |
 |---|---|---|
-| `prefill` | AR=128, CL=128, no past-KV | prompt ingestion (+ first ~117 generated tokens, see §3.4) |
+| `prefill` | AR=128, CL=128, **no** past-KV | prompt ingestion (+ first ~117 generated tokens, see §3.4) |
 | `decode` | AR=1, CTX=1152, past-KV | steady-state generation |
-| `verify32` | AR=32, CTX=1152, past-KV | (lade builds only) lookahead-decoding verification |
+
+**B. All-past-KV topology** (`-ladekv`, §5.4 — the reference build for anything
+using `dialog.type: "lade"`):
+
+| Graph | Shape | Role |
+|---|---|---|
+| `prefill` | AR=128, CL=1152, past=1024, past-KV | prompts 33–128 tokens, and the chunking unit for >128 |
+| `decode` | AR=1, CTX=1152, past-KV | steady-state generation |
+| `verify32` | AR=32, CTX=1152, past-KV | lade verification batches; also serves prompts ≤32 tokens |
+
+Topology B is what makes lade work at all (§3.5) and additionally enables
+prompts >128 tokens. It gives up the bertcache early-token burst (§3.4).
 
 **Pipeline stages** (each has a script; §5 gives per-variant recipes):
 
@@ -155,6 +169,38 @@ remote team's "error 5005".)
   the AR-1 decode graph (~155 ms/tok). Quote tok/s numbers per phase.
 - Device-measured (v2, 2026-08-11): decode ~6.5 tok/s, prefill-phase
   ~23.8 tok/s, init ~0.8 s, RAM ~163 MB.
+- **Graph selection is numeric best-fit on (AR, CL) — names are cosmetic.**
+  Genie picks the smallest CL ≥ current KV, then the smallest AR ≥ the batch
+  size (largest smaller AR = chunking fallback). Consequences: two graphs may
+  never share an (AR, CL) pair (hard load error), and in topology B a 12-token
+  prompt runs on `verify32`, not on the graph named `prefill`.
+
+### 3.5 Past-KV prefill contract (topology B)
+
+Everything here is pinned to SDK source in `docs/NOTES-genie-io.md`; it is what
+`parity_ladekv_read.py` reproduces. If you build a past-KV prefill for another
+model, these are the rules:
+
+- Tokens are **left-aligned** in the AR window; the remainder is filled with the
+  pad token, which defaults to the **first `eos-token`** entry (151645 for us).
+- Attention mask is FP16 additive: allow `+0.0`, masked **`-1000.0`** (not
+  `-inf`). Our encodings calibrate the mask at −100, so the device clips
+  −1000 → −100 — still e^−100 ≈ 0, harmless.
+- Concat KV layout: mask columns `[0, past)` are the past region,
+  `[past, CL)` the new tokens. Chunk row *i* allows past `[0, n_valid_kv)`
+  plus new `past … past+i`.
+- RoPE positions `iota(n_past + i)` on valid rows, 0 on pad rows.
+- Logits sampled at row `n_process − 1`; all-position logits still mandatory.
+- Prompt chunking works AR tokens at a time with growing `n_past`, up to
+  accumulated KV = `past_dim = CL − AR` (1024 for us). Beyond that Genie
+  throws `ContextLimitException`.
+
+**Why topology B fixes the lade SIGSEGV:** only an AR==CL graph inflates
+`n_process` past the lade attention-map size, which drives an out-of-bounds
+position-id read whose garbage becomes a RoPE-table byte offset. Removing the
+AR==CL graph removes the code path. Independently, **lade prompts must
+tokenize to ≥ 2 tokens** — a 1-token prompt hits `rand() % 0` in `lhd-dec.cpp`
+regardless of topology.
 
 ## 4. Quantization recipe (what the scripts implement)
 
@@ -215,14 +261,49 @@ Requires §5.1 complete:
 ./scripts/build/lade_build.sh qwen3-0.6b-w8a16 128 1024 32   # AR=16 variant: last arg 16
 ```
 
-Bundle ships two dialog configs (lade + basic) for same-binary A/B. Config
-guardrail: `(ngram−1)×(window+gcap)` must stay ≤ the verify graph's AR, or
-Genie silently routes verification batches to the prefill graph. Shipped
+Config guardrail: `(ngram−1)×(window+gcap)` must stay ≤ the verify graph's AR,
+or Genie routes verification batches to a graph that cannot serve them. Shipped
 config window 8 / ngram 3 / gcap 8 = exactly 32.
-**Known open issue (2026-08-11): `type:"lade"` SIGSEGVs in libGenie on device
-when the prompt is short; basic mode on the same ctx-bin works. Suspected
-lhd-dec × bertcache-prefill interaction at `n_past < 128` — see
-`reports/qwen3-0.6b-w8a16-v2-lade-vs-baseline-report.md`.**
+
+⚠️ **This build alone is not shippable for lade** — its bertcache prefill makes
+`type:"lade"` SIGSEGV on device (§3.5). It is now only an intermediate step:
+`ladekv_build.sh` reuses its `verify32.dlc`. Continue to §5.4b.
+
+### 5.4b Lookahead decoding, fixed (`-ladekv`) — the reference lade build
+
+**This is the recipe to copy for any new lade-capable model.** It replaces the
+bertcache prefill with a past-KV prefill (§3.5) and packs the 3-graph ctx-bin.
+
+Prerequisites: §5.1 (`full_build.sh`) and §5.4 (`lade_build.sh`) complete for
+the same `<name>` — this build reuses their `decode.dlc`, `verify32.dlc`, and
+the prefill quant dir's encodings.
+
+```bash
+./scripts/build/ladekv_build.sh qwen3-0.6b-w8a16 128 1024 128
+#                               <name>            CL  CTX AR_prefill
+# VERIFY_AR=16 ./scripts/build/ladekv_build.sh …   if you built a 16-wide verify graph
+```
+
+What the five stages do, and what to check after each:
+
+| Stage | Action | Gate |
+|---|---|---|
+| 1 | AIMET export of a past-KV graph at AR=128 (`--decode-ar 128 --export-decode <prefill quant dir>`) — the decode wrapper *is* the past-KV prefill, just wider. Encodings are adopted, never recalibrated, so scales stay bit-identical to `decode.dlc`/`verify32.dlc`. | skipped automatically if `model_renamed.onnx` exists; `FORCE_EXPORT=1` to redo |
+| 2 | Canonical I/O rename (`--with-past`) | tensor names match §3.1 |
+| 3 | `parity_ladekv_read.py` — replays qualla's exact feed pattern incl. two-chunk prompts | all prompts OK (we see 6/6, `max\|Δ\|` ≈ 1.6–6.4 vs FP32 HF) |
+| 4 | `qairt-converter` → `prefill.dlc` in its own dir (graph names come from DLC filenames) | asserts `logits 1,128,151936` **and** that `past_key_0_in` exists |
+| 5 | 3-graph weight-shared ctx-bin | prints all 3 graphs, 60 inputs / 57 outputs each; ~1.1 GB |
+
+Then bundle with **both** dialog configs (§7) and A/B lade vs basic on one binary.
+
+Two things this build also fixes, worth carrying to any new variant:
+
+- `verify32` must be listed in `graph_names` in **both** `configs/htp_config.json`
+  (compile-time) and `configs/htp_backend_ext_config.json` (device). Omitted, it
+  silently compiles with defaults — device logs showed 4 MB VTCM + 24 MB spill
+  instead of 16 MB + 0.
+- Expect basic mode to lose the ~23 tok/s bertcache early phase; generation runs
+  at true decode speed from token 1. That is the intended trade.
 
 ### 5.5 Qwen3-1.7B baseline
 
@@ -252,6 +333,29 @@ Then regenerate the ctx-bin(s) (stage-7 command in `full_build.sh` /
 stage-4 in `lade_build.sh`) and re-bundle. ~30 min per variant instead of ~1 h,
 and scales stay bit-identical to the untouched DLCs.
 
+### 5.7 Weight-bitwidth variants (`--quant-head`, and the W4 dead end)
+
+Flags go to `quantize_aimet.py`, so they pass through `full_build.sh <name> <cl>
+<ctx> …`. A bitwidth change alters encodings, so it needs a **full** rebuild
+chain (not the §5.6 fast path):
+
+```bash
+./scripts/build/full_build.sh   qwen3-0.6b-w8a16qh 128 1024 --quant-head
+./scripts/build/lade_build.sh   qwen3-0.6b-w8a16qh 128 1024 32
+./scripts/build/ladekv_build.sh qwen3-0.6b-w8a16qh 128 1024 128
+```
+
+- `--quant-head`: quantizes the `lm_head` **weight** to INT8 per-channel while
+  leaving its activations FP16. The FP16 head is ~311 MB of the ~960 MB/token
+  decode stream; measured effect is **961 → 763 MB/token (−20.6%)** in the
+  converter's DDR summary, at unchanged quality (3/4 argmax = baseline).
+  Verify by grepping `read_total_bytes` in the build log.
+- `--weight-bw 4` (+ optional `--lpbq`, `--seq-mse`): **W4A16 is a dead end at
+  0.6B.** All three recipes — per-channel int4, LPBQ block-64, LPBQ+SeqMSE —
+  scored 0/4 on the `--eval` argmax gate that W8A16 passes 3/4
+  (`max|Δlogits|` 16–25 vs 1.3–1.7). The flags remain for larger models, where
+  4-bit PTQ has room; don't re-run this experiment on 0.6B.
+
 ## 6. Validation gates — run before shipping anything
 
 Device-free gates, in order; each has a known-good reference value:
@@ -260,7 +364,8 @@ Device-free gates, in order; each has a known-good reference value:
 |---|---|---|
 | Wrapper vs HF | `export_qwen3.py … --parity-check` | max\|Δlogits\| ~4e-05 |
 | Standard parity | `scripts/validate/parity_onnx.py --onnx <dir> --cl-prefill 128 --ctx 1024` | prefill argmax match + 8-step greedy chain token-identical |
-| **Device read pattern** | `scripts/validate/parity_qualla_read.py --onnx <dir> --cl-prefill 128` | 4/4 prompts OK (left-aligned, logits row n−1 — what the device actually samples) |
+| **Device read pattern** (topology A) | `scripts/validate/parity_qualla_read.py --onnx <dir> --cl-prefill 128` | 4/4 prompts OK (left-aligned, logits row n−1 — what the device actually samples) |
+| **Device read pattern** (topology B) | `scripts/validate/parity_ladekv_read.py --onnx <model_renamed.onnx> --ar 128 --ctx 1024` | 6/6 — 4 single-chunk + 2 chunked (129, 200 tokens); run automatically as stage 3 of `ladekv_build.sh` |
 | Verify graph (lade) | `scripts/validate/parity_verify.py` | batched rows match HF, ~3e-05 |
 | Quant quality | `quantize_aimet.py … --eval` | last-token argmax agreement ≥ 3/4 prompts |
 | DLC shape | `qairt-dlc-info -i prefill.dlc \| grep logits` | `1,128,151936` — never `1,1,…` |
@@ -269,11 +374,24 @@ Device-free gates, in order; each has a known-good reference value:
 ## 7. Bundle and ship
 
 ```bash
+# baseline / fused (topology A)
 ./scripts/build/bundle.sh qwen3_06b_w8a16_local \
     $LLMDEPLOY_DATA/work/ctxbin/qwen3-0.6b-w8a16/qwen3-0.6b-w8a16_ctx.bin
-# lade: pass configs/genie_dialog_qwen3_0.6b_lade.json as 3rd arg, then also
-# copy a ctx-bins-patched basic config in as genie_dialog_basic.json and re-tar
+
+# ladekv (topology B): lade config as 3rd arg, then add the basic config too
+./scripts/build/bundle.sh qwen3_06b_w8a16_ladekv \
+    $LLMDEPLOY_DATA/work/ctxbin/qwen3-0.6b-w8a16-ladekv/qwen3-0.6b-w8a16-ladekv_ctx.bin \
+    $LLMDEPLOY_ROOT/configs/genie_dialog_qwen3_0.6b_lade.json
+cd $LLMDEPLOY_DATA/bundles/qwen3_06b_w8a16_ladekv && python3 - <<'EOF'
+import json
+d = json.load(open("/mnt/x/code/llm-deploy/configs/genie_dialog_qwen3_0.6b.json"))
+d["dialog"]["engine"]["model"]["binary"]["ctx-bins"] = ["qwen3-0.6b-w8a16-ladekv_ctx.bin"]
+json.dump(d, open("genie_dialog_basic.json", "w"), indent=2)
+EOF
+cd $LLMDEPLOY_DATA/bundles && tar -czf qwen3_06b_w8a16_ladekv.tar.gz qwen3_06b_w8a16_ladekv
 ```
+
+Shipping both configs is what lets the tester A/B lade vs basic on one binary.
 
 `bundle.sh` assembles the flat layout, patches the dialog JSON's `ctx-bins` to
 the real filename, and tars. Expected: ~930 MB tarball for 0.6B.
@@ -287,11 +405,22 @@ scripts/util/hf_upload_watchdog.sh vinccniv/sa8797p-qwen3-w8a16-bundles \
 ```
 
 The watchdog exists because the local proxy drops long-lived uploads (client
-hangs on CLOSE-WAIT sockets looking alive). **Also beware the hub's 128
-commits/hour limit**: restart storms exhaust it and the commit phase then
-"hangs" with all bytes already uploaded. Diagnose with one foreground
-`HfApi().upload_file` (a 429 surfaces in seconds); recover by waiting ~1 h
-then committing one file at a time.
+hangs on CLOSE-WAIT sockets looking alive). Three hard-won rules:
+
+1. **Set `SOCKET_CHECKS=999999`.** The watchdog's CLOSE-WAIT detector
+   false-positives through this proxy and kills healthy transfers (a partial
+   blob restarts from byte 0, so it can never finish). The progress-freeze
+   detector alone (`STALL_SECS=240`) is the reliable signal.
+2. **The hub allows 128 commits/hour.** Restart storms exhaust it; the commit
+   phase then "hangs" with every byte already uploaded. Diagnose with one
+   foreground `HfApi().upload_file` (a 429 surfaces in seconds). Recovery:
+   stop all uploaders, wait ~1 h, then commit **one file at a time** with
+   `upload_file` — the blobs dedup, so each commit is data-free and instant.
+3. **`hf upload-large-folder` silently flips a private repo to PUBLIC** (it
+   applies its default `private=False`). After any bulk upload, check
+   `HfApi().repo_info(repo).private` and restore with
+   `HfApi().update_repo_settings(repo, private=True)`. Single `upload_file`
+   commits do not touch repo settings — prefer them once blobs are staged.
 
 Device smoke test:
 
@@ -318,8 +447,10 @@ environment.
 | `vtcm_mb: 24` rejected | Unsigned PD cap; use 16 (signed PD would lift it — device-side provisioning). |
 | Ctx-bin ≈ sum of DLC sizes (e.g. 2.1 GB) | Weight sharing off — check `configs/htp_config.json`. |
 | 1.7B quantize OOMs GPU | `QUANT_DEVICE=cpu`. |
-| lade mode SIGSEGV in libGenie, basic mode fine | Known open issue (§5.4). |
-| HF upload progress frozen, sockets CLOSE-WAIT | Proxy drop — the watchdog handles it. If blobs are uploaded but commits never land: 429 rate limit (§7). |
+| lade mode SIGSEGV in libGenie, basic mode fine | Bertcache prefill in the ctx-bin — rebuild with `ladekv_build.sh` (§3.5, §5.4b). If it still crashes, check the prompt is ≥ 2 tokens. |
+| Genie load error about duplicate graphs / KV quant params | Two graphs share an (AR, CL) pair, or DLCs came from different encodings runs (§3.3). |
+| HF upload progress frozen, sockets CLOSE-WAIT | Proxy drop — the watchdog handles it, but set `SOCKET_CHECKS=999999` (§7). If blobs are uploaded but commits never land: 429 rate limit (§7). |
+| HF repo unexpectedly public | `hf upload-large-folder` reset it — restore with `update_repo_settings(private=True)` (§7). |
 | WSL2 C: drive filling up | Build scripts call `disk_guard` (abort < 6 GB); compact the VHD from Windows if hit. |
 
 ## 9. Map of the repo
@@ -334,10 +465,11 @@ environment.
 | `scripts/quant/filter_aimet_w8a16.py`, `rename_aimet_io.py` | encodings filter; canonical I/O rename |
 | `scripts/build/full_build.sh` | baseline / gate-up end-to-end build |
 | `scripts/build/qkv_build.sh` | QKV-fused build (+ surgery) |
-| `scripts/build/lade_build.sh` | verify graph + 3-graph ctx-bin |
+| `scripts/build/lade_build.sh` | verify graph + 3-graph ctx-bin (bertcache prefill — intermediate step) |
+| `scripts/build/ladekv_build.sh` | **past-KV prefill + 3-graph ctx-bin — the lade-capable build (§5.4b)** |
 | `scripts/build/prefill_fix_rebuild.sh` | fast graph-shape-only rebuild |
 | `scripts/build/bundle.sh` | device bundle assembly |
-| `scripts/validate/parity_onnx.py`, `parity_qualla_read.py`, `parity_verify.py` | validation gates (§6) |
+| `scripts/validate/parity_onnx.py`, `parity_qualla_read.py`, `parity_ladekv_read.py`, `parity_verify.py` | validation gates (§6) |
 | `scripts/util/hf_upload_watchdog.sh` | supervised HF upload |
 | `docs/NOTES-genie-io.md` | the Genie contract with SDK source citations — read before touching graph I/O |
 | `docs/LOCAL_ENV.md` | environment provenance + progress log |
