@@ -123,7 +123,16 @@ def main():
                          "encodings from a previous prefill run (guarantees identical "
                          "cross-graph KV scales — the remote error-5005 constraint), export")
     ap.add_argument("--ctx", type=int, default=1024,
-                    help="context size for --export-decode (past = ctx + cl_prefill - 1)")
+                    help="context size for --export-decode (past = ctx + cl_prefill - ar)")
+    ap.add_argument("--decode-ar", type=int, default=1,
+                    help="tokens per decode step for --export-decode. 1 = normal decode; "
+                         "32 = lookahead/speculative verification graph (all-position "
+                         "logits, same total window ctx + cl_prefill)")
+    ap.add_argument("--adopt-encodings", metavar="PREV_OUT_DIR",
+                    help="skip calibration on the PREFILL path: load encodings from a "
+                         "previous prefill run of the same variant (graph-shape-only "
+                         "rebuilds — keeps every scale bit-identical to the existing "
+                         "decode/verify DLCs so they can be reused as-is)")
     args = ap.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -156,21 +165,25 @@ def main():
     cfg = hf.config
     S = args.cl_prefill
     if args.export_decode:
-        past = args.ctx + S - 1
+        ar = args.decode_ar
+        past = args.ctx + S - ar  # total window (past + ar) stays ctx + cl_prefill
         model = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
                                     use_past=True, logits_last_only=False).to(args.device)
         n_kv, hd = cfg.num_key_value_heads, cfg.head_dim
-        mask = torch.zeros(1, 1, past + 1, device=args.device)
-        cos, sin = rope_tables(torch.tensor([past]), cfg.head_dim, rope_theta_of(cfg))
-        dummy = [torch.zeros(1, 1, dtype=torch.int32, device=args.device),
+        mask = torch.zeros(1, ar, past + ar, device=args.device)
+        cos, sin = rope_tables(torch.arange(past, past + ar), cfg.head_dim, rope_theta_of(cfg))
+        dummy = [torch.zeros(1, ar, dtype=torch.int32, device=args.device),
                  mask, cos.to(args.device), sin.to(args.device)]
         for _ in range(cfg.num_hidden_layers):
             dummy += [torch.zeros(1, n_kv, hd, past, device=args.device),
                       torch.zeros(1, n_kv, past, hd, device=args.device)]
         dummy = tuple(dummy)
     else:
+        # logits_last_only MUST be False: Genie's basic dialog left-aligns input
+        # and samples logits row n_process-1 (qualla nsp-model.cpp:3295) — a
+        # last-only head reads out of bounds on device (2026-08-11 root cause).
         model = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
-                                    use_past=False, logits_last_only=True).to(args.device)
+                                    use_past=False, logits_last_only=False).to(args.device)
         mask = causal_mask(S, S).to(args.device)
         cos, sin = rope_tables(torch.arange(S), cfg.head_dim, rope_theta_of(cfg))
         dummy_ids = torch.zeros(1, S, dtype=torch.int32, device=args.device)
@@ -205,6 +218,12 @@ def main():
         # tensor (weights, activations, KV path) has IDENTICAL scales across
         # the prefill/decode graph boundary (remote error-5005 constraint).
         sim.load_encodings(str(Path(args.export_decode) / "model_torch.encodings"),
+                           strict=False)
+    elif args.adopt_encodings:
+        # Graph-shape-only prefill rebuild: adopt the previous run's encodings
+        # (already clipped) instead of recalibrating, so existing decode/verify
+        # DLCs stay scale-compatible and only prefill.dlc needs regeneration.
+        sim.load_encodings(str(Path(args.adopt_encodings) / "model_torch.encodings"),
                            strict=False)
     else:
         sim.compute_encodings(calibrate, None)

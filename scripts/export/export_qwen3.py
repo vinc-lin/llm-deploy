@@ -7,8 +7,14 @@ Usage:
       --out   $LLMDEPLOY_DATA/work/onnx/qwen3-0.6b \
       --cl-prefill 128 --ctx 1024 [--fuse-gate-up] [--fuse-qkv]
 
-Emits prefill.onnx (S=cl-prefill, no past, last-token logits) and
+Emits prefill.onnx (S=cl-prefill, no past, ALL-position logits [1,S,V]) and
 decode.onnx (S=1, past=ctx+cl_prefill-1, full logits [1,1,V]).
+
+The prefill graph MUST emit logits for every window slot: Genie's basic
+dialog feeds tokens left-aligned and samples logits row n_process-1
+(qualla nsp-model.cpp:3295, no last-only mode for count==1) — a
+last-token-only head makes it read past the end of a 1-row buffer,
+producing zero/noise logits (root cause of the 2026-08-11 device garbage).
 I/O names follow the position_ids_cos/sin convention (pos-id-dim 64);
 adjust via --io-names if SDK Genie docs dictate different names.
 """
@@ -69,6 +75,10 @@ def main():
     ap.add_argument("--ctx", type=int, default=1024)
     ap.add_argument("--fuse-gate-up", action="store_true")
     ap.add_argument("--fuse-qkv", action="store_true")
+    ap.add_argument("--ar-verify", type=int, default=0,
+                    help="also export verify.onnx: a multi-token decode graph with "
+                         "S=this (all-position logits) for lookahead/speculative "
+                         "verification; total window stays ctx + cl_prefill")
     ap.add_argument("--parity-check", action="store_true",
                     help="compare wrapper logits vs HF forward before export")
     args = ap.parse_args()
@@ -95,8 +105,10 @@ def main():
     past_len = args.ctx + args.cl_prefill - 1
 
     print("exporting prefill...")
+    # logits_last_only MUST be False: qualla samples row n_process-1 of an
+    # all-position logits tensor (see module docstring).
     prefill = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
-                                  use_past=False, logits_last_only=True)
+                                  use_past=False, logits_last_only=False)
     with torch.no_grad():
         export_graph(prefill, cfg, out / "prefill.onnx", args.cl_prefill, 0)
 
@@ -105,6 +117,13 @@ def main():
                                  use_past=True, logits_last_only=False)
     with torch.no_grad():
         export_graph(decode, cfg, out / "decode.onnx", 1, past_len)
+
+    if args.ar_verify:
+        ar = args.ar_verify
+        print(f"exporting verify (AR={ar})...")
+        with torch.no_grad():
+            export_graph(decode, cfg, out / "verify.onnx", ar,
+                         args.ctx + args.cl_prefill - ar)
 
 
 if __name__ == "__main__":
