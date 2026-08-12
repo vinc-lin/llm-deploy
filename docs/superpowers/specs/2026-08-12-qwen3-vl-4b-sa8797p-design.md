@@ -137,8 +137,14 @@ New `scripts/export/modeling_vit_export.py` and
 attention, no mask input.
 
 - Inputs: `pixel_values [1024, 1536]`
-- Outputs: `vision_embedding [256, 2560]`, `deepstack_visual_embed_{0,1,2}
+- Outputs: `image_features [256, 2560]`, `deepstack_visual_embed_{0,1,2}
   [256, 2560]`
+
+  `image_features` because Genie's image model initialises
+  `m_layerNames[LayerType::OUTPUT] = "image_features"` by default
+  (`nsp-image-model.hpp`) and only overrides it for outputs named
+  `vision_embedding` or `cross_attention_states`. Using the default name means
+  no override logic participates.
 - FP16 conversion (`--float_bitwidth 16`), no AIMET, no calibration
 - ctx-bin via the existing generator path with an image-encoder config
 - **Gate**: `scripts/validate/parity_vit.py` — cosine similarity and max-abs
