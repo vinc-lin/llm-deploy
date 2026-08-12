@@ -130,6 +130,15 @@ fallback only. Duplicate (AR, CL) pairs are a hard load error
 and ALL lade batches run on AR-32; AR-128 serves 33–128-token prompts and
 chunking; basic decode runs AR-1.
 
+**The KV cache advances by `n_process`, NOT by the AR window** —
+`n_valid_kv += n_process` (kvmanager.cpp:454). So with a left-aligned prompt of
+n tokens in an AR=128 window, only columns `0..n-1` enter the cache and the
+next step starts at cache offset `n`; the pad slots' KV is discarded. Any
+host-side emulation of the feed pattern must scatter the new-slice KV outputs
+at offset `n`, not `AR`. (Confirmed 2026-08-12 while validating the Qwen3-VL
+text tower — previously inferred from `parity_ladekv_read.py` rather than read
+off the source.)
+
 **lade SIGSEGV has TWO independent mechanisms** (both consistent with the
 2026-08-10/11 device crashes at libGenie pc 0x4c2d58, x0=0x6b8b4567):
 
