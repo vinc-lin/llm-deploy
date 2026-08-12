@@ -2,8 +2,10 @@
 # Local SA8797P pipeline environment. Source me.
 # Repo (scripts/configs/docs) lives on /mnt/x (drvfs, Windows-visible).
 # Heavy data (envs/sdk/models/work) lives on real ext4 for speed.
-export LLMDEPLOY_ROOT=/mnt/x/code/llm-deploy
-export LLMDEPLOY_DATA=/home/vinc/llm-local
+# Derived from this file's own location so a checkout elsewhere (tank, a
+# worktree) works unchanged; still overridable from the environment.
+export LLMDEPLOY_ROOT=${LLMDEPLOY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+export LLMDEPLOY_DATA=${LLMDEPLOY_DATA:-/home/vinc/llm-local}
 
 export QAIRT_SDK=$LLMDEPLOY_DATA/sdk/qairt/2.48.40.260702
 export PY_DEPLOY=$LLMDEPLOY_DATA/envs/qwen3-deploy/bin/python   # py3.10: torch+AIMET+onnx1.19
