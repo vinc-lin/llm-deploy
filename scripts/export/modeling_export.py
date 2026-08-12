@@ -164,28 +164,63 @@ class ExportQwen3(nn.Module):
       -> (logits, past_key_0_out, past_value_0_out, ...)
 
     With use_past=False the past_* arguments are omitted (prefill graph).
+
+    Two optional modes exist for the Qwen3-VL text tower (both OFF by default,
+    both only ever used together -- see from_hf_vl_text):
+
+    input_embeds: the first argument is already [B, S, H] hidden states, not
+      token ids, and the 389 M-param embedding table is NOT part of the graph.
+      The runtime owns the lookup because it must splice visual features into
+      the sequence before the text tower runs.
+
+    n_deepstack: N extra full-width [B, S, H] inputs added to the residual
+      stream after decoder layers 0..N-1. They precede the past-KV tensors in
+      the variadic tail so that ONNX input order matches the declared
+      input_names.
     """
 
-    def __init__(self, cfg, fuse_gate_up=False, fuse_qkv=False, use_past=True, logits_last_only=False):
+    def __init__(self, cfg, fuse_gate_up=False, fuse_qkv=False, use_past=True, logits_last_only=False,
+                 input_embeds=False, n_deepstack=0):
         super().__init__()
         self.cfg = cfg
         self.use_past = use_past
         self.logits_last_only = logits_last_only
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.input_embeds = input_embeds
+        self.n_deepstack = n_deepstack
+        # embeddings-in: the runtime owns the token LUT, keep it out of the graph
+        self.embed_tokens = None if input_embeds else nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.layers = nn.ModuleList(
             [ExportLayer(cfg, fuse_gate_up, fuse_qkv) for _ in range(cfg.num_hidden_layers)]
         )
         self.norm = ExportRMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
 
-    def forward(self, input_ids, attention_mask, position_ids_cos, position_ids_sin, *past):
-        x = self.embed_tokens(input_ids.to(torch.long))
+    def forward(self, input_ids, attention_mask, position_ids_cos, position_ids_sin, *rest):
+        # variadic tail: deepstack tensors first, then past-KV pairs. With the
+        # defaults (n_deepstack=0) this is exactly the old `*past`.
+        deep = rest[: self.n_deepstack]
+        past = rest[self.n_deepstack:]
+
+        x = input_ids if self.input_embeds else self.embed_tokens(input_ids.to(torch.long))
+        if self.input_embeds and x.dim() == 4:
+            x = x.squeeze(1)   # Genie's documented [1,1,AR,H] -> [B,S,H]
         new_kv = []
         for i, layer in enumerate(self.layers):
             pk = past[2 * i] if self.use_past else None
             pv = past[2 * i + 1] if self.use_past else None
             x, nk, nv = layer(x, position_ids_cos, position_ids_sin, attention_mask, pk, pv)
             new_kv.extend([nk, nv])
+            # Deepstack (Qwen3-VL): HF applies it AFTER layer `i` runs, for
+            # i < len(deepstack_visual_embeds), as a scatter-add onto the visual
+            # positions only (modeling_qwen3_vl.py:835 / _deepstack_process).
+            # A static graph cannot scatter, so the host zero-pads the tensor to
+            # full width and we add it unconditionally -- identical arithmetic,
+            # since adding 0 at non-visual positions is a no-op. All-zeros is
+            # therefore exactly HF-minus-deepstack: the graceful-degradation
+            # path for text-only prompts.
+            if i < self.n_deepstack:
+                d = deep[i]
+                x = x + (d.squeeze(1) if d.dim() == 4 else d)
         x = self.norm(x)
         if self.logits_last_only:
             x = x[:, -1:, :]
@@ -193,17 +228,12 @@ class ExportQwen3(nn.Module):
         return (logits, *new_kv)
 
     @staticmethod
-    def from_hf(hf_model, fuse_gate_up=False, fuse_qkv=False, use_past=True, logits_last_only=False):
-        cfg = hf_model.config
-        m = ExportQwen3(cfg, fuse_gate_up, fuse_qkv, use_past, logits_last_only)
-        src = hf_model.state_dict()
-        dst = {}
-        dst["embed_tokens.weight"] = src["model.embed_tokens.weight"]
-        dst["norm.weight"] = src["model.norm.weight"]
-        # 0.6B ties lm_head to embeddings; state dict may or may not carry lm_head
-        dst["lm_head.weight"] = src.get("lm_head.weight", src["model.embed_tokens.weight"])
-        for i in range(cfg.num_hidden_layers):
-            s = f"model.layers.{i}."
+    def _map_layers(dst, src, prefix, n_layers, fuse_gate_up, fuse_qkv):
+        """Copy the decoder-layer weights. `prefix` is the source tower prefix:
+        'model.' for plain Qwen3, 'model.language_model.' for the Qwen3-VL text
+        tower (the two towers are architecturally identical)."""
+        for i in range(n_layers):
+            s = f"{prefix}layers.{i}."
             d = f"layers.{i}."
             dst[d + "input_layernorm.weight"] = src[s + "input_layernorm.weight"]
             dst[d + "post_attention_layernorm.weight"] = src[s + "post_attention_layernorm.weight"]
@@ -226,6 +256,42 @@ class ExportQwen3(nn.Module):
             else:
                 dst[d + "mlp.gate_proj.weight"] = src[s + "mlp.gate_proj.weight"]
                 dst[d + "mlp.up_proj.weight"] = src[s + "mlp.up_proj.weight"]
+        return dst
+
+    @staticmethod
+    def from_hf(hf_model, fuse_gate_up=False, fuse_qkv=False, use_past=True, logits_last_only=False):
+        cfg = hf_model.config
+        m = ExportQwen3(cfg, fuse_gate_up, fuse_qkv, use_past, logits_last_only)
+        src = hf_model.state_dict()
+        dst = {}
+        dst["embed_tokens.weight"] = src["model.embed_tokens.weight"]
+        dst["norm.weight"] = src["model.norm.weight"]
+        # 0.6B ties lm_head to embeddings; state dict may or may not carry lm_head
+        dst["lm_head.weight"] = src.get("lm_head.weight", src["model.embed_tokens.weight"])
+        ExportQwen3._map_layers(dst, src, "model.", cfg.num_hidden_layers, fuse_gate_up, fuse_qkv)
+        m.load_state_dict(dst, strict=True)
+        return m.eval()
+
+    @staticmethod
+    def from_hf_vl_text(hf_vl, fuse_gate_up=False, fuse_qkv=False, use_past=True,
+                        logits_last_only=False, n_deepstack=3):
+        """Qwen3-VL text tower: embeddings-in + deepstack.
+
+        Architecturally identical to plain Qwen3 text, so it reuses ExportQwen3
+        wholesale; only the checkpoint prefix and the two new modes differ. The
+        embedding table is deliberately NOT loaded -- the runtime does the token
+        lookup from an external LUT so it can splice visual features in first.
+        """
+        cfg = hf_vl.config.text_config
+        m = ExportQwen3(cfg, fuse_gate_up, fuse_qkv, use_past, logits_last_only,
+                        input_embeds=True, n_deepstack=n_deepstack)
+        src = hf_vl.state_dict()
+        p = "model.language_model."
+        dst = {}
+        dst["norm.weight"] = src[p + "norm.weight"]
+        # tie_word_embeddings: true -> the checkpoint carries no lm_head.weight
+        dst["lm_head.weight"] = src.get("lm_head.weight", src[p + "embed_tokens.weight"])
+        ExportQwen3._map_layers(dst, src, p, cfg.num_hidden_layers, fuse_gate_up, fuse_qkv)
         m.load_state_dict(dst, strict=True)
         return m.eval()
 
