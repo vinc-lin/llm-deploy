@@ -34,7 +34,16 @@ NDEEP=${NDEEP:-3}
 # 4B fp32 does not fit in 8 GB of VRAM; CPU is not a preference here
 DEVICE=${QUANT_DEVICE:-cpu}
 PAST=$((CTX + CL - 1))
-Q=(--vl-text --n-deepstack "$NDEEP" --vl-calib "$CALIB" --lean-export
+# NOT --lean-export. It deletes quantsim scratch between stages and the decode
+# stage needs some of it: with the flag, a decode run adopting the prefill run's
+# encodings lands on DIFFERENT weight encodings. Bisected on 0.6B, same model and
+# flags, one variable: 0/308 differing param encodings without it, 100/308 with.
+# The 4B VL run showed the same signature (130/396, first divergences on the same
+# k_proj/o_proj tensors). Consequences are subtle and device-only: prefill and
+# decode end up with weights one quantization step apart on ~0.02% of elements,
+# and the ctx-bin cannot dedup them, so it carries both copies (7.7 GB instead of
+# ~4.3 GB). See scripts/quant/quantize_aimet.py --lean-export.
+Q=(--vl-text --n-deepstack "$NDEEP" --vl-calib "$CALIB"
    --device "$DEVICE" "${EXTRA_FLAGS[@]}")
 
 disk_guard

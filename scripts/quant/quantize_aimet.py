@@ -301,7 +301,29 @@ def main():
                     help="do not leave quantsim's two disposable full-size "
                          "copies (model.pth, all-markers scratch export) on "
                          "disk: 66%% of the export bytes at 0.6B, ~30GB per "
-                         "graph at 4B. Shipped artifacts are unchanged.")
+                         "graph at 4B. SINGLE-GRAPH BUILDS ONLY -- see below.")
+    # DO NOT use --lean-export on a prefill+decode pair.
+    #
+    # It was validated as output-neutral by comparing one prefill run to itself
+    # with and without the flag: model.encodings, model_torch.encodings and the
+    # weight payload all byte-identical. That was the wrong shape of test. It
+    # never checked the property that matters across STAGES -- that a decode run
+    # adopting the prefill run's encodings still lands on identical weights.
+    #
+    # Bisected on Qwen3-0.6B, same model and flags, one variable:
+    #     without --lean-export   0/308 param encodings differ
+    #     with    --lean-export   100/308 differ
+    # The Qwen3-VL-4B run reproduced it at 130/396, diverging first on the same
+    # k_proj/o_proj tensors.
+    #
+    # Both consequences are invisible without a device: prefill and decode end
+    # up with weights one quantization step apart on ~0.02% of elements, so the
+    # two halves of the model disagree slightly; and the ctx-bin can no longer
+    # dedup them, so it carries both weight sets (7.7 GB rather than ~4.3 GB at
+    # 4B, with only the unquantized norms and lm_head still shared).
+    #
+    # Kept because the disk saving is real for a single-graph build such as the
+    # ViT, where there is no second stage to poison.
     ap.add_argument("--vl-calib",
                     help="--vl-text: .npz of multimodal calibration/eval windows "
                          "(scripts/quant/vl_calib_build.py)")
