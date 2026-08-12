@@ -34,7 +34,7 @@ NDEEP=${NDEEP:-3}
 # 4B fp32 does not fit in 8 GB of VRAM; CPU is not a preference here
 DEVICE=${QUANT_DEVICE:-cpu}
 PAST=$((CTX + CL - 1))
-Q=(--vl-text --n-deepstack "$NDEEP" --vl-calib "$CALIB"
+Q=(--vl-text --n-deepstack "$NDEEP" --vl-calib "$CALIB" --lean-export
    --device "$DEVICE" "${EXTRA_FLAGS[@]}")
 
 disk_guard
@@ -46,14 +46,25 @@ else
       --vit-onnx "$VIT" --out "$CALIB" --ar "$CL" --n-deepstack "$NDEEP"
 fi
 
-# 4B prefill and decode exports are ~8.6GB each and the decode run needs the
-# prefill dir still on disk, so guard for both before starting either.
-disk_guard 20
+# The old "~8.6GB each" here was the 0.6B number, not the 4B one. Measured
+# 0.6B: 8.5GB written per graph, of which only 2.9GB is load-bearing; --lean-
+# export (in $Q above) drops the rest. Scaled by the 5.35x parameter ratio the
+# 4B text tower writes ~31GB per graph and retains ~16GB, and the decode run
+# needs the prefill dir still on disk -- so guard for the pair, not one graph.
+#
+# WARNING: on a 47GB-RAM + 16GB-swap box the 4B export does NOT complete --
+# OOM-killed twice at anon-rss 37.4GB and 45.4GB with swap exhausted, both
+# times inside _create_onnx_model_with_markers. AIMET's legacy sim.export
+# holds four fp32 copies of the graph at once (sim.model + model_to_export +
+# the marker deepcopy + the in-memory ONNX proto = 4 x 15.0GB at 4B).
+# Calibration and --eval complete fine; it is only the export that does not
+# fit. See docs/LOCAL_ENV.md.
+disk_guard 40
 echo "== [2/5] AIMET W8A16 prefill quantization (CL=$CL) =="
 /usr/bin/time -v $PY "$LLMDEPLOY_ROOT/scripts/quant/quantize_aimet.py" \
     --model "$MODEL" --cl-prefill "$CL" --out "$QP" --eval "${Q[@]}"
 
-disk_guard 12
+disk_guard 40
 echo "== [3/5] decode export with prefill encodings (CTX=$CTX, past=$PAST) =="
 # Single encodings lineage: the decode graph adopts the prefill run's encodings
 # verbatim, so every shared tensor -- above all the KV path -- keeps byte-

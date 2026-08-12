@@ -97,6 +97,57 @@ Quantsim-vs-FP32 last-token argmax agreement on the 4 reference prompts: **3/4**
 (miss = "1+2+3+...+100 =", a near-tie; max|Δlogits| ≈ 1.3–1.6 across prompts).
 Consistent with the remote's on-device "coherent output" finding for W8A16.
 
+## Qwen3-VL-4B text tower: quantizes fine, does NOT export on this box (2026-08-12)
+
+Stage 2 Phase C. The W8A16 recipe itself is **validated at 4B**: 22 multimodal
+calibration windows, 396 weight tensors clipped, and `--eval` **4/4** last-token
+argmax agreement (bar is 3/4) — including both all-visual windows, whose
+activations span [-5.32, +4.97] against text's [-0.146, +0.124]. max|Δlogits|
+1.03–1.46.
+
+What does not fit is AIMET's **export**, killed by the OOM killer twice inside
+`_create_onnx_model_with_markers`:
+
+| attempt | env | anon-rss at kill | swap | wall |
+|---|---|---|---|---|
+| 1 | default (24 threads) | 37.4 GiB | 16 GiB exhausted | 23 min |
+| 2 | `MALLOC_ARENA_MAX=2`, `OMP_NUM_THREADS=8`, `-u` | 45.4 GiB | 16 GiB exhausted | 20.5 min |
+
+Machine budget is 47 GB RAM + 16 GB swap = 63 GB; attempt 2 committed ~61 GiB
+and still died. The cause is structural, not fragmentation: the legacy
+`sim.export` path holds **four** fp32 copies of the graph simultaneously —
+`sim.model`, `model_to_export` (`get_original_model` deepcopy), the marker
+deepcopy inside `_create_onnx_model_with_markers`, and the ONNX proto
+`torch.onnx.export` builds in memory before writing. At 4B the wrapper is
+4,022,468,096 params = 15.0 GiB, so that is 60 GiB before any runtime overhead.
+Allocator tuning bought ~3% and moved the deadline, not the wall.
+
+Things that do NOT help, measured rather than assumed:
+
+- Making `onnx.load` skip external data — **neither globally nor scoped** to
+  `aimet_torch._base.quantsim`. With the default `encoding_version = "1.0.0"`
+  the re-read at `_base/quantsim.py:1084` is forwarded to
+  `_derive_const_rescale_op_output_encodings`, which calls
+  `numpy_helper.to_array` on Mul/Div operands to find constant scalars; both
+  variants die with `ValidationError: Data of TensorProto (norm.weight) should
+  be stored in <uuid>.data`. It is also memory-neutral — 0.6B peak RSS 13.64 GB
+  scoped vs 13.57 GB baseline, because that read lands *after* the high-water
+  mark, not at it.
+- `update_all_onnx_nodes_name = False` would drop the later
+  `copy.deepcopy(onnx_model)`, but both kills happened *before* it, so it does
+  not move this peak either.
+
+The real lever is the API AIMET itself deprecates the old one in favour of:
+`sim.onnx.export()` / `aimet_torch/experimental/onnx/_export.py`. Switching
+would need the encodings names and `rename_aimet_io.py`'s positional I/O
+assumptions revalidated, and the prefill/decode encodings lineage re-proven.
+Failing that: more RAM, or a bigger `.wslconfig` swap (needs an elevated
+PowerShell + `wsl --shutdown`, so it cannot be done from inside the guest).
+
+`--lean-export` (see `quantize_aimet.py`) is unrelated to the OOM but keeps the
+disk honest: 66% of what quantsim writes per graph is scratch nothing reads
+(`model.pth` + the all-markers temp export's per-initializer files).
+
 ## Lookahead decoding build (2026-08-10, attacks the fragmentation root cause)
 
 The DDR collapse (49 → ~7 GB/s) comes from per-token weight streaming; the only
