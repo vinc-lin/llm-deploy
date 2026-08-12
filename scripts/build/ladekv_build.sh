@@ -45,18 +45,10 @@ for f in "$QP/model_torch.encodings" "$QP/model_filtered.encodings" \
   [[ -f $f ]] || { echo "MISSING prerequisite: $f (run full_build.sh + lade_build.sh $NAME first)"; exit 1; }
 done
 
-disk_guard() {  # standing constraint: never let Windows C: run dry
-  local free_gb
-  free_gb=$(df --output=avail -BG /mnt/c | tail -1 | tr -dc 0-9)
-  if (( free_gb < 6 )); then
-    echo "ABORT: C: free space ${free_gb}GB < 6GB"; exit 1
-  fi
-}
-
 if [[ -f "$QKV/model_renamed.onnx" && -z "${FORCE_EXPORT:-}" ]]; then
   echo "== [1-2/5] SKIP export+rename ($QKV/model_renamed.onnx exists; FORCE_EXPORT=1 to redo) =="
 else
-  disk_guard
+  disk_guard 20
   echo "== [1/5] AIMET past-KV prefill export (AR=$AR, past=$PAST) =="
   $PY "$LLMDEPLOY_ROOT/scripts/quant/quantize_aimet.py" --model "$MODEL" \
       --cl-prefill "$CL" --ctx "$CTX" --decode-ar "$AR" \

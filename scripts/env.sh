@@ -15,3 +15,18 @@ if [ -d "$QAIRT_SDK" ]; then
     export LD_LIBRARY_PATH=$QAIRT_SDK/lib/x86_64-linux-clang:$LLMDEPLOY_DATA/syslibs/extracted/usr/lib/x86_64-linux-gnu:/home/vinc/.local/share/uv/python/cpython-3.12.12-linux-x86_64-gnu/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
     export PYTHONPATH=$QAIRT_SDK/lib/python${PYTHONPATH:+:$PYTHONPATH}
 fi
+
+# Standing constraint: never let Windows C: run dry. $LLMDEPLOY_DATA lives on the
+# WSL ext4.vhdx, which sits on C:, grows on demand and never shrinks by itself.
+# A failed grow does NOT surface as ENOSPC -- the guest still believes it has
+# hundreds of free GB, so the host write fails and the kernel delivers SIGBUS to
+# every process touching an mmap'd page. That killed PID 1 and hard-crashed the
+# VM three times on 2026-08-12. Lives here, not per-script, so a new build script
+# cannot forget it. Pass the GB the NEXT step writes; 6 is the converter floor.
+disk_guard() {
+    local need_gb=${1:-6} free_gb
+    free_gb=$(df --output=avail -BG /mnt/c | tail -1 | tr -dc 0-9)
+    if (( free_gb < need_gb )); then
+        echo "ABORT: C: free space ${free_gb}GB < ${need_gb}GB" >&2; exit 1
+    fi
+}

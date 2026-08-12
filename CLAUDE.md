@@ -44,7 +44,19 @@ are a fatal Genie load error (KV quant params must be byte-identical).
 - Hub limit: 128 repo commits/hour. "Hung" commit phase with all blobs
   pre-uploaded = 429; diagnose with one foreground `HfApi().upload_file`,
   recover with spaced single-file commits after ~1h.
-- Never let Windows C: drop below 6 GB (converter temp) — build scripts guard this.
+- Never let Windows C: run dry: `$LLMDEPLOY_DATA` sits on the ext4.vhdx, which is
+  on C:. A failed vhdx grow is NOT ENOSPC — the guest still reports free space,
+  the host write fails, and every mmap'd page takes SIGBUS; PID 1 dies and the VM
+  hard-crashes with no OOM line anywhere (3x on 2026-08-12, during VL-4B stage 2).
+  Dumps land in `%LOCALAPPDATA%\Temp\wsl-crashes`; the `-N` suffix is the signal,
+  `-7` = SIGBUS.
+- `disk_guard [need_gb]` lives in `scripts/env.sh` (every build script sources it) —
+  call it before any multi-GB step, sized to that step: 6 GB is the converter
+  floor, a 4B export writes 8.6 GB and asks 20. A flat 6 GB check passes and then
+  still runs C: dry mid-step.
+- The vhdx is sparse and `/` is mounted `discard`, so deleting in-guest reclaims C:
+  with no compaction step. `ls` reports the ~448 GB virtual size and always will;
+  `du -h <vhdx>` (no `--apparent-size`) is the real consumption.
 - W4A16 is a dead end at 0.6B (per-channel, LPBQ-64, LPBQ+SeqMSE all fail the
   argmax gate); `--lpbq`/`--seq-mse` flags remain for larger models.
 

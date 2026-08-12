@@ -24,10 +24,12 @@ CONVERTER="$QAIRT_SDK/bin/x86_64-linux-clang/qairt-converter"
 PAST=$((CTX + CL - 1))
 TOTAL=$((PAST + 1))
 
+disk_guard 20
 echo "== [1/7] AIMET W8A16 prefill quantization (CL=$CL) =="
 $PY "$LLMDEPLOY_ROOT/scripts/quant/quantize_aimet.py" --model "$MODEL" \
     --cl-prefill "$CL" --out "$QP" ${QUANT_DEVICE:+--device "$QUANT_DEVICE"} "${EXTRA_FLAGS[@]}"
 
+disk_guard 20
 echo "== [2/7] decode export with prefill encodings (CTX=$CTX) =="
 $PY "$LLMDEPLOY_ROOT/scripts/quant/quantize_aimet.py" --model "$MODEL" \
     --cl-prefill "$CL" --ctx "$CTX" --export-decode "$QP" --out "$QD" \
@@ -43,6 +45,7 @@ $PY "$LLMDEPLOY_ROOT/scripts/quant/rename_aimet_io.py" \
     --model "$QD/model.onnx" --encodings "$QP/model_filtered.encodings" --layers 28 --with-past
 ENC=$QP/model_filtered_renamed.encodings
 
+disk_guard
 echo "== [5/7] convert prefill -> DLC =="
 mkdir -p "$DLC"
 $PY_QAIRT "$CONVERTER" --input_network "$QP/model_renamed.onnx" \
@@ -51,6 +54,7 @@ $PY_QAIRT "$CONVERTER" --input_network "$QP/model_renamed.onnx" \
     -d input_ids "1,$CL" -d attention_mask "1,$CL,$CL" \
     -d position_ids_cos "1,$CL,64" -d position_ids_sin "1,$CL,64"
 
+disk_guard
 echo "== [6/7] convert decode -> DLC (single source of truth: prefill encodings) =="
 DIMS=(-d input_ids "1,1" -d attention_mask "1,1,$TOTAL"
       -d position_ids_cos "1,1,64" -d position_ids_sin "1,1,64")
@@ -61,6 +65,7 @@ $PY_QAIRT "$CONVERTER" --input_network "$QD/model_renamed.onnx" \
     --output_path "$DLC/decode.dlc" --quantization_overrides "$ENC" \
     --float_bitwidth 16 --target_backend HTP "${DIMS[@]}"
 
+disk_guard
 echo "== [7/7] two-graph ctx-bin (vtcm 16, unsigned PD, v81) =="
 cd "$LLMDEPLOY_ROOT/configs"
 qnn-context-binary-generator \

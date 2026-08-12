@@ -37,6 +37,7 @@ PAST=$((CTX + CL - 1))
 Q=(--vl-text --n-deepstack "$NDEEP" --vl-calib "$CALIB"
    --device "$DEVICE" "${EXTRA_FLAGS[@]}")
 
+disk_guard
 echo "== [1/5] multimodal calibration windows (AR=$CL) =="
 if [ -f "$CALIB" ]; then
   echo "reusing $CALIB"
@@ -45,10 +46,14 @@ else
       --vit-onnx "$VIT" --out "$CALIB" --ar "$CL" --n-deepstack "$NDEEP"
 fi
 
+# 4B prefill and decode exports are ~8.6GB each and the decode run needs the
+# prefill dir still on disk, so guard for both before starting either.
+disk_guard 20
 echo "== [2/5] AIMET W8A16 prefill quantization (CL=$CL) =="
 /usr/bin/time -v $PY "$LLMDEPLOY_ROOT/scripts/quant/quantize_aimet.py" \
     --model "$MODEL" --cl-prefill "$CL" --out "$QP" --eval "${Q[@]}"
 
+disk_guard 12
 echo "== [3/5] decode export with prefill encodings (CTX=$CTX, past=$PAST) =="
 # Single encodings lineage: the decode graph adopts the prefill run's encodings
 # verbatim, so every shared tensor -- above all the KV path -- keeps byte-

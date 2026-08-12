@@ -32,15 +32,7 @@ for f in "$QP/model_torch.encodings" "$DLC/decode.dlc"; do
   [[ -f $f ]] || { echo "MISSING prerequisite: $f"; exit 1; }
 done
 
-disk_guard() {  # standing constraint: never let Windows C: run dry
-  local free_gb
-  free_gb=$(df --output=avail -BG /mnt/c | tail -1 | tr -dc 0-9)
-  if (( free_gb < 6 )); then
-    echo "ABORT: C: free space ${free_gb}GB < 6GB"; exit 1
-  fi
-}
-
-disk_guard
+disk_guard 20
 echo "== [1/4] prefill re-export (all-position logits, adopt encodings) =="
 $PY "$LLMDEPLOY_ROOT/scripts/quant/quantize_aimet.py" --model "$MODEL" \
     --cl-prefill "$CL" --out "$QP" --adopt-encodings "$QP" \
