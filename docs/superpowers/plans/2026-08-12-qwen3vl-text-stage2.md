@@ -401,7 +401,7 @@ $PY_DEPLOY scripts/export/extract_embed_lut.py \
   --model $LLMDEPLOY_DATA/models/Qwen3-VL-4B-Instruct \
   --out $LLMDEPLOY_DATA/work/lut/qwen3vl-4b
 ```
-Expected: a 389,003,840-byte file (151936 × 2560) and printed quant params.
+Expected: a 388,956,160-byte file (151936 × 2560 for ufixed8; ×2 for ufixed16) and printed quant params.
 
 Report the max dequant error. If it is large enough to worry you (say, worse
 than 1% relative on typical rows), say so — an 8-bit whole-table scale is what
