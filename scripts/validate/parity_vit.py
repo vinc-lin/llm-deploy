@@ -58,11 +58,17 @@ def main():
     worst_d, worst_cos = 0.0, 1.0
     for name, a, b in zip(names, got, refs):
         assert a.shape == b.shape, f"{name}: shape {a.shape} != {b.shape}"
+        # Must fire BEFORE the reduction below: max(0.0, nan) is 0.0 and
+        # min(1.0, nan) is 1.0, so a NaN reaching it is silently dropped and the
+        # gate exits 0 on a graph emitting garbage. Downstream fp16 conversion
+        # makes overflow-to-NaN a live failure mode, so it has to be loud.
+        assert np.isfinite(a).all(), f"{name}: ONNX output has non-finite values"
+        assert np.isfinite(b).all(), f"{name}: HF reference has non-finite values"
         d = float(np.abs(a - b).max())
-        cos = float(
-            np.dot(a.ravel(), b.ravel())
-            / (np.linalg.norm(a.ravel()) * np.linalg.norm(b.ravel()))
-        )
+        # float64 for the reduction: in float32 over 655k elements this returns
+        # values like 1.00000012, which is mathematically impossible for a cosine.
+        af, bf = a.ravel().astype(np.float64), b.ravel().astype(np.float64)
+        cos = float(np.dot(af, bf) / (np.linalg.norm(af) * np.linalg.norm(bf)))
         print(f"  {name:28s} max|d|={d:.3e} cos={cos:.8f}")
         worst_d, worst_cos = max(worst_d, d), min(worst_cos, cos)
 

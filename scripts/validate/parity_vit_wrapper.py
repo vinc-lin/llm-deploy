@@ -50,9 +50,16 @@ def main():
         (f"deepstack_visual_embed_{i}", got[1 + i], ref_deep[i]) for i in range(len(ref_deep))
     ]:
         assert a.shape == b.shape, f"{name}: shape {a.shape} != {b.shape}"
+        # Must fire BEFORE the `worst = max(worst, d)` reduction below:
+        # max(0.0, nan) is 0.0, so a NaN would be dropped rather than propagated
+        # and the gate would exit 0 on a wrapper emitting garbage.
+        assert torch.isfinite(a).all(), f"{name}: wrapper output has non-finite values"
+        assert torch.isfinite(b).all(), f"{name}: HF reference has non-finite values"
         d = (a - b).abs().max().item()
+        # float64: in float32 this reduction returns values like 1.00000012,
+        # which is mathematically impossible for a cosine.
         cos = torch.nn.functional.cosine_similarity(
-            a.flatten().unsqueeze(0), b.flatten().unsqueeze(0)
+            a.flatten().unsqueeze(0).double(), b.flatten().unsqueeze(0).double()
         ).item()
         print(f"  {name:28s} shape={tuple(a.shape)} max|d|={d:.3e} cos={cos:.8f}")
         worst = max(worst, d)
