@@ -14,36 +14,64 @@ lookup itself, host-side, from a raw LUT file: qualla::LUT memcpy's
 a flat, vocab-major, row-contiguous, little-endian dump with no header.
 
 --------------------------------------------------------------------------
-WHY ufixed16 IS THE DEFAULT -- do not "optimize" this back to 8 bits
+WHY float32 IS THE DEFAULT -- a fixed-point LUT SILENTLY NO-OPS against our
+graph, which is a worse failure than any precision argument
 --------------------------------------------------------------------------
-The SDK's reference VLM config (examples/Genie/configs/glm-4v/glm-4v.json)
-uses ufixed8, and that is a fine default for glm-4v.  It is the wrong default
-for THIS pipeline, for a reason specific to our quantization recipe:
+This default used to be ufixed16, justified by "the activation path is all
+16-bit".  That argument is superseded: it reasoned about precision, while the
+binding constraint turned out to be the runtime's dtype DISPATCH.
 
-  * Our text tower is W8A16.  Every single activation encoding produced by
-    AIMET is `"bw": 16` -- see work/quant/qwen3-0.6b-w8a16-prefill/
-    model.encodings, whose quantizer_args read `"activation_bitwidth": 16`.
-    `inputs_embeds` is an activation.  A ufixed8 LUT would therefore be the
-    only 8-bit tensor anywhere in the activation path.
-  * Genie requantizes the LUT into the graph's input encoding at runtime
-    (dialog.cpp:432 `requantScale = lutScale / inputScale`, dispatched through
-    tokenToEmbedRequantCallback<uint8_t, uint16_t>).  Requantizing 8 -> 16
-    cannot recover precision the LUT already discarded, so an 8-bit LUT
-    permanently caps the input precision below what the graph accepts.
-  * Measured on Qwen3-VL-4B: a single global ufixed8 scale costs a worst-row
-    cosine of 0.997328 (7.3% relative L2 error on that row).  The damage is
-    concentrated on *low-norm* rows -- byte-fallback tokens, rare CJK/Thai/
-    Arabic pieces, and the reserved vocab tail -- whose L2 norm is ~0.35
-    against a median of 1.11, so fixed absolute quantization noise costs them
-    ~3x more direction error.  ufixed16 removes this entirely.
+Genie converts the LUT into the graph input's encoding at runtime; the raw
+copy is only a fast path when the two already agree (dialog.cpp:631/677/844/
+1109, all guarded identically):
 
-The cost is 778 MB instead of 389 MB, and LUT.cpp mmaps the file
-(LUT.cpp:73), so that is page cache against a ~4 GB text tower, not committed
-RSS.  Correctness over size is this project's stated priority.
+    requantScale  = lutScale / inputScale                        (dialog.cpp:432)
+    requantOffset = requantScale * lutOffset - inputOffset
+    if (lutDataType == inputDataType && requantScale == 1 && requantOffset == 0)
+        decoderInput = std::move(encoderOutput);   // raw copy
+    else
+        requantEmbedding(...);                     // convert
 
-`--datatype ufixed8` is kept as a runnable, measured alternative in case the
-on-device memory budget turns out to be tight; the script reports both widths
-on every run so the A/B is always in front of you.
+So the LUT's scale need NOT match the graph input's -- Genie rescales.  What
+Genie cannot do is change dtype CLASS: Dialog::requantEmbedding
+(dialog.cpp:485-551) enumerates fixed->fixed pairs only --
+
+    ufixed4  -> {ufixed8, ufixed16}   (anything else: throws)
+    ufixed8  -> {ufixed8, ufixed16}
+    ufixed16 -> {ufixed8, ufixed16}
+    sfixed8  -> {sfixed8, sfixed16, ufixed16}
+    sfixed16 -> {sfixed8, sfixed16}
+
+-- and there is NO float16/float32 destination branch.  Outside the ufixed4
+case the if/else-if chain does not throw on an unhandled pair: it falls
+through and leaves the destination buffer UNTOUCHED.
+
+Our text tower's `inputs_embeds` is FLOAT_16 in the ctx-bin.  AIMET emits no
+encoding for it -- the HTP per-channel config leaves the first RMSNorm's INPUT
+quantizer disabled, so no graph I/O tensor carries an encoding at all
+(verified 2026-08-12) -- and qairt-converter --float_bitwidth 16 therefore
+leaves it float.  A ufixed16 LUT against a FLOAT_16 input is exactly the
+unhandled pair: no exception, no log, an untouched embedding buffer.
+
+float32 sidesteps the whole dispatch.  dialog.cpp:684 hands the fp32 bytes
+straight through, and nsp-model.cpp:3120 quantizeInput() converts per token
+into whatever the graph input actually is -- FLOAT_16, UFIXED_8 and UFIXED_16
+are all handled there.  It also makes the visual-feature range a non-issue:
+with a float32 LUT, Dialog::inputTensorQuantParam (dialog.cpp:444-460) reports
+FLOAT_32/1.0/0 to the image pipeline, so ViT features (measured [-5.9, +5.1],
+deepstack to +16.0 -- far outside the embedding table's [-0.198, +0.244]) are
+written unquantized instead of being squeezed into a table-derived scale.
+
+The cost is 1.56 GB instead of 778 MB, and LUT.cpp mmaps the file
+(LUT.cpp:73), so that is page cache, not committed RSS.  Correctness over size
+is this project's stated priority.
+
+`--datatype ufixed16` / `ufixed8` are kept as runnable, measured alternatives
+for a tight device-memory budget -- the script reports every width on each run
+so the A/B is always in front of you.  If you switch to one, you MUST also
+give `inputs_embeds` a fixed-point encoding in the ctx-bin, or you get the
+silent no-op above; scripts/validate/lint_embedding_dtype.py exists to make
+that mistake impossible to ship.
 
 --------------------------------------------------------------------------
 Quantization convention -- QNN scale/offset, NOT the ONNX/PyTorch zero_point
@@ -78,6 +106,7 @@ rather than the ~18 GB a full load would cost.
 """
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -92,6 +121,7 @@ ABS_HIST_BINS = 1 << 20
 # LUT.cpp memcpy's raw bytes straight to the HTP, which is little-endian, and
 # we must not inherit the host's byte order by accident.
 DTYPES = {
+    "float32": ("<f4", 32),
     "ufixed8": ("<u1", 8),
     "ufixed16": ("<u2", 16),
 }
@@ -165,19 +195,21 @@ def main():
     ap.add_argument("--out", required=True, type=Path, help="output directory")
     ap.add_argument(
         "--datatype",
-        default="ufixed16",
+        default="float32",
         choices=sorted(DTYPES),
-        help="LUT element type (default: ufixed16 -- see module docstring; the "
-        "activation path is all-16-bit, so ufixed8 would be its only 8-bit tensor)",
+        help="LUT element type (default: float32 -- see module docstring; a "
+        "fixed-point LUT against our FLOAT_16 `inputs_embeds` is an unhandled "
+        "pair in Dialog::requantEmbedding and silently writes nothing)",
     )
     args = ap.parse_args()
 
     np_dtype, bits = DTYPES[args.datatype]
-    qmax = (1 << bits) - 1
+    is_float = args.datatype == "float32"
+    qmax = 0 if is_float else (1 << bits) - 1
     nbytes = bits // 8
-    alt_name = "ufixed8" if args.datatype == "ufixed16" else "ufixed16"
-    alt_dtype, alt_bits = DTYPES[alt_name]
-    alt_qmax = (1 << alt_bits) - 1
+    # every OTHER supported width, measured on the same data so the A/B for a
+    # tight device-memory budget is never stale
+    alts = [n for n in ("ufixed16", "ufixed8") if n != args.datatype]
 
     key, shard = resolve_key(args.model)
     print(f"embedding tensor: {key}")
@@ -199,34 +231,54 @@ def main():
         )
 
         fmin, fmax, mean, std, row_absmax = scan_range(sl, n_rows, n_embd)
-        scale, offset = derive_scale_offset(fmin, fmax, qmax)
-        alt_scale, alt_offset = derive_scale_offset(fmin, fmax, alt_qmax)
+        # float32 ships the values verbatim: scale/offset are identity and are
+        # never consulted (dialog.cpp:684 takes the float32 fast path).
+        scale, offset = (1.0, 0) if is_float else derive_scale_offset(fmin, fmax, qmax)
+        alt_enc = {n: derive_scale_offset(fmin, fmax, (1 << DTYPES[n][1]) - 1)
+                   for n in alts}
 
         args.out.mkdir(parents=True, exist_ok=True)
         lut_path = args.out / f"embedding_{args.datatype}_lut.bin"
+        # Write-then-rename: this loop takes minutes and has been killed
+        # mid-flight before. A truncated .bin at the real path would sit there
+        # looking valid (LUT.cpp mmaps and strides blindly), and a params file
+        # describing a different datatype than the .bin beside it is exactly the
+        # silent mismatch this pipeline must never ship. os.replace() is atomic
+        # within a filesystem, so a kill leaves EITHER the old pair or the new
+        # pair -- never a mixture.
+        tmp_path = args.out / f".{lut_path.name}.partial"
 
         max_err, abs_err_total = 0.0, 0.0
-        alt_max_err, alt_min_cos = 0.0, 2.0
+        alt_max_err = {n: 0.0 for n in alts}
+        alt_min_cos = {n: 2.0 for n in alts}
         min_cos_row_scale = 2.0
         zero_rows = 0
         row_cos = np.full(n_rows, np.nan, dtype=np.float64)
         row_norm = np.zeros(n_rows, dtype=np.float64)
-        q_hist = np.zeros(qmax + 1, dtype=np.int64)
+        q_hist = None if is_float else np.zeros(qmax + 1, dtype=np.int64)
         abs_hist = np.zeros(ABS_HIST_BINS, dtype=np.int64)
         abs_hi = float(max(-fmin, fmax))
 
-        with open(lut_path, "wb") as out:
+        with open(tmp_path, "wb") as out:
             for lo, hi in chunks(n_rows):
+                if lo % (ROW_CHUNK * 8) == 0:
+                    print(f"  rows {lo}/{n_rows} ({lo / n_rows * 100:.0f}%)", flush=True)
                 w = sl[lo:hi].float().numpy().astype(np.float64)
-                q = quantize(w, scale, offset, qmax)
-                out.write(q.astype(np_dtype).tobytes())
+                if is_float:
+                    # source is bfloat16, so fp32 is exact: deq == w bit for bit
+                    stored = w.astype(np_dtype)
+                    out.write(stored.tobytes())
+                    deq = stored.astype(np.float64)
+                else:
+                    q = quantize(w, scale, offset, qmax)
+                    out.write(q.astype(np_dtype).tobytes())
+                    deq = scale * (q + offset)
+                    q_hist += np.bincount(q.astype(np.int64).ravel(), minlength=qmax + 1)
 
-                deq = scale * (q + offset)
                 assert np.isfinite(deq).all(), f"non-finite dequant in rows {lo}:{hi}"
                 err = np.abs(deq - w)
                 max_err = max(max_err, float(err.max()))
                 abs_err_total += float(err.sum())
-                q_hist += np.bincount(q.astype(np.int64).ravel(), minlength=qmax + 1)
                 abs_hist += np.histogram(
                     np.abs(w), bins=ABS_HIST_BINS, range=(0.0, abs_hi)
                 )[0]
@@ -240,44 +292,50 @@ def main():
                     idx = lo + np.flatnonzero(live)
                     row_cos[idx] = (w * deq).sum(axis=1)[live] / (n_w[live] * n_d[live])
 
-                    # The other supported width, measured on the same data so
-                    # the A/B is never stale.
-                    qa = quantize(w, alt_scale, alt_offset, alt_qmax)
-                    da = alt_scale * (qa + alt_offset)
-                    alt_max_err = max(alt_max_err, float(np.abs(da - w).max()))
-                    na = np.linalg.norm(da, axis=1)
-                    ca = (w * da).sum(axis=1)[live] / (n_w[live] * na[live])
-                    alt_min_cos = min(alt_min_cos, float(ca.min()))
+                    for n in alts:
+                        a_scale, a_offset = alt_enc[n]
+                        a_qmax = (1 << DTYPES[n][1]) - 1
+                        qa = quantize(w, a_scale, a_offset, a_qmax)
+                        da = a_scale * (qa + a_offset)
+                        alt_max_err[n] = max(alt_max_err[n], float(np.abs(da - w).max()))
+                        na = np.linalg.norm(da, axis=1)
+                        ca = (w * da).sum(axis=1)[live] / (n_w[live] * na[live])
+                        alt_min_cos[n] = min(alt_min_cos[n], float(ca.min()))
 
                     # Per-row scale/offset (informational: the Genie embedding
                     # block carries one global quant-param, so this is not
                     # expressible in the format -- it only sizes the headroom).
-                    rmin = w.min(axis=1, keepdims=True)
-                    rmax = w.max(axis=1, keepdims=True)
-                    rscale = np.maximum((rmax - rmin) / qmax, 1e-30)
-                    rzp = np.clip(np.rint(-rmin / rscale), 0, qmax)
-                    qr = np.clip(np.rint(w / rscale + rzp), 0, qmax)
-                    dr = rscale * (qr - rzp)
-                    nr = np.linalg.norm(dr, axis=1)
-                    ok = live & (nr > 0)
-                    if ok.any():
-                        cr = (w * dr).sum(axis=1)[ok] / (n_w[ok] * nr[ok])
-                        min_cos_row_scale = min(min_cos_row_scale, float(cr.min()))
+                    if not is_float:
+                        rmin = w.min(axis=1, keepdims=True)
+                        rmax = w.max(axis=1, keepdims=True)
+                        rscale = np.maximum((rmax - rmin) / qmax, 1e-30)
+                        rzp = np.clip(np.rint(-rmin / rscale), 0, qmax)
+                        qr = np.clip(np.rint(w / rscale + rzp), 0, qmax)
+                        dr = rscale * (qr - rzp)
+                        nr = np.linalg.norm(dr, axis=1)
+                        ok = live & (nr > 0)
+                        if ok.any():
+                            cr = (w * dr).sum(axis=1)[ok] / (n_w[ok] * nr[ok])
+                            min_cos_row_scale = min(min_cos_row_scale, float(cr.min()))
 
     n_vals = n_rows * n_embd
     expect_bytes = n_vals * nbytes
-    size_bytes = lut_path.stat().st_size
+    size_bytes = tmp_path.stat().st_size
     assert size_bytes == expect_bytes, (
-        f"{lut_path} is {size_bytes} bytes, expected {expect_bytes} "
-        f"({n_rows} x {n_embd} x {nbytes}B {args.datatype})"
+        f"{tmp_path} is {size_bytes} bytes, expected {expect_bytes} "
+        f"({n_rows} x {n_embd} x {nbytes}B {args.datatype}) -- partial file kept "
+        "for inspection; nothing was published"
     )
 
-    deq_min = scale * (0 + offset)
-    deq_max = scale * (qmax + offset)
+    deq_min, deq_max = (fmin, fmax) if is_float else (scale * offset,
+                                                      scale * (qmax + offset))
     assert np.isfinite([deq_min, deq_max, scale]).all(), (
         f"non-finite dequantized table bounds: scale={scale} "
         f"range=[{deq_min}, {deq_max}]"
     )
+    if is_float:
+        # bfloat16 -> float32 is exact; anything else means we wrote the wrong bytes
+        assert max_err == 0.0, f"float32 LUT is not bit-exact: max err {max_err}"
 
     params = {
         "version": 1,
@@ -285,17 +343,37 @@ def main():
         "lut-path": lut_path.name,
         "size": int(n_embd),
         "datatype": args.datatype,
+        # identity for float32: Genie takes the float32 fast path (dialog.cpp:684)
+        # and never consults these, but downstream tooling reads the same schema
         "quant-param": {"scale": scale, "offset": int(offset)},
         "n-vocab": int(n_rows),
         "source-key": key,
         "source-dtype": "bfloat16",
-        "dequant-formula": "float_value = scale * (q + offset)",
+        "dequant-formula": ("float_value = q (raw float32; quant-param is identity "
+                            "and unused)" if is_float
+                            else "float_value = scale * (q + offset)"),
         "element-bytes": nbytes,
         "byte-order": "little-endian",
         "bytes": int(size_bytes),
     }
+    # ---- publish: both files, or neither -----------------------------------
+    # .bin first, params second. A kill in the (microsecond) gap leaves the
+    # PREVIOUS params still pointing at the PREVIOUS .bin, which is a
+    # self-consistent pair; the reverse order would leave params naming a file
+    # that does not exist yet.
     params_path = args.out / "embedding_lut_params.json"
-    params_path.write_text(json.dumps(params, indent=2) + "\n")
+    params_tmp = args.out / ".embedding_lut_params.json.partial"
+    params_tmp.write_text(json.dumps(params, indent=2) + "\n")
+    os.replace(tmp_path, lut_path)
+    os.replace(params_tmp, params_path)
+
+    stale = sorted(p.name for p in args.out.glob("embedding_*_lut.bin")
+                   if p.name != lut_path.name)
+    if stale:
+        print(f"\nNOTE: {args.out} also holds {stale}, which "
+              f"{'is' if len(stale) == 1 else 'are'} no longer referenced by "
+              "embedding_lut_params.json. Delete by hand once you are sure no "
+              "bundle needs it.")
 
     # ---- report -------------------------------------------------------------
     abs_cdf = np.cumsum(abs_hist)
@@ -307,12 +385,17 @@ def main():
 
     print(f"\nwrote {lut_path} ({size_bytes:,} bytes)")
     print(f"wrote {params_path}")
-    print(f"\nquantization ({args.datatype}, single global scale/offset)")
-    print(f"  scale                    : {scale!r}")
-    print(f"  offset                   : {offset}   (= -zero_point)")
-    print(f"  representable range      : [{deq_min:.6f}, {deq_max:.6f}]")
-    print(f"  max abs dequant error    : {max_err:.6e}   ({max_err / scale:.3f} steps)")
-    print(f"  mean abs dequant error   : {abs_err_total / n_vals:.6e}")
+    if is_float:
+        print(f"\nstorage ({args.datatype}, verbatim -- no quantization)")
+        print(f"  value range              : [{deq_min:.6f}, {deq_max:.6f}]")
+        print(f"  max abs error vs source  : {max_err:.6e}   (bit-exact from bfloat16)")
+    else:
+        print(f"\nquantization ({args.datatype}, single global scale/offset)")
+        print(f"  scale                    : {scale!r}")
+        print(f"  offset                   : {offset}   (= -zero_point)")
+        print(f"  representable range      : [{deq_min:.6f}, {deq_max:.6f}]")
+        print(f"  max abs dequant error    : {max_err:.6e}   ({max_err / scale:.3f} steps)")
+        print(f"  mean abs dequant error   : {abs_err_total / n_vals:.6e}")
 
     live_cos = row_cos[~np.isnan(row_cos)]
     min_cos = float(live_cos.min())
@@ -337,38 +420,48 @@ def main():
     print(f"  min / max                : {fmin:.6f} / {fmax:.6f}")
     print(f"  mean / std               : {mean:.6e} / {std:.6e}")
     for p in (50.0, 90.0, 99.0, 99.9, 99.99, 99.999):
-        print(f"  p{p:<8g} of |w|        : {pct(p):.6f}   ({pct(p) / scale:.1f} steps)")
+        steps = "" if is_float else f"   ({pct(p) / scale:.1f} steps)"
+        print(f"  p{p:<8g} of |w|        : {pct(p):.6f}{steps}")
 
-    used = int((q_hist > 0).sum())
-    order = np.sort(q_hist)[::-1]
-    cum = np.cumsum(order) / n_vals
-    print(f"\nbin occupancy ({qmax + 1} available)")
-    print(f"  distinct bins used       : {used} ({used / (qmax + 1) * 100:.1f}%)")
-    for frac in (0.50, 0.90, 0.99):
-        print(
-            f"  bins holding {frac * 100:.0f}% of vals: "
-            f"{int(np.searchsorted(cum, frac) + 1)}"
-        )
-    print(f"  vals in top-1 bin        : {order[0] / n_vals * 100:.2f}%")
+    if not is_float:
+        used = int((q_hist > 0).sum())
+        order = np.sort(q_hist)[::-1]
+        cum = np.cumsum(order) / n_vals
+        print(f"\nbin occupancy ({qmax + 1} available)")
+        print(f"  distinct bins used       : {used} ({used / (qmax + 1) * 100:.1f}%)")
+        for frac in (0.50, 0.90, 0.99):
+            print(
+                f"  bins holding {frac * 100:.0f}% of vals: "
+                f"{int(np.searchsorted(cum, frac) + 1)}"
+            )
+        print(f"  vals in top-1 bin        : {order[0] / n_vals * 100:.2f}%")
 
     top = np.argsort(row_absmax)[::-1]
     print("\noutlier rows (by max |w| in the row)")
     print(f"  top-10 token ids         : {top[:10].tolist()}")
     print(f"  their max |w|            : {[round(float(row_absmax[i]), 4) for i in top[:10]]}")
-    for k in (1, 10, 100, 1000):
-        capped = float(row_absmax[top[k]])
-        print(
-            f"  drop top {k:<5d} rows     : |w| cap {capped:.6f} -> "
-            f"scale {2 * capped / qmax:.3e} "
-            f"({scale / (2 * capped / qmax):.2f}x finer)"
-        )
+    if not is_float:
+        for k in (1, 10, 100, 1000):
+            capped = float(row_absmax[top[k]])
+            print(
+                f"  drop top {k:<5d} rows     : |w| cap {capped:.6f} -> "
+                f"scale {2 * capped / qmax:.3e} "
+                f"({scale / (2 * capped / qmax):.2f}x finer)"
+            )
 
-    print("\nalternative width (not shipped by this run; --datatype to switch)")
-    print(
-        f"  {alt_name:<24s} : max err {alt_max_err:.6e}, "
-        f"min row cosine {alt_min_cos:.9f}, {n_vals * alt_bits // 8:,} bytes"
-    )
-    print(f"  per-row scale @ {args.datatype:<9s}: min row cosine {min_cos_row_scale:.9f}")
+    print("\nalternative widths (not shipped by this run; --datatype to switch)")
+    for n in alts:
+        print(
+            f"  {n:<24s} : max err {alt_max_err[n]:.6e}, "
+            f"min row cosine {alt_min_cos[n]:.9f}, "
+            f"{n_vals * DTYPES[n][1] // 8:,} bytes"
+        )
+    if not is_float:
+        print(f"  per-row scale @ {args.datatype:<9s}: min row cosine {min_cos_row_scale:.9f}")
+    else:
+        print("  NOTE: switching to a fixed-point LUT also requires a fixed-point")
+        print("        `inputs_embeds` encoding in the ctx-bin -- see the module")
+        print("        docstring and scripts/validate/lint_embedding_dtype.py")
 
 
 if __name__ == "__main__":
