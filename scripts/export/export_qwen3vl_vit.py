@@ -39,11 +39,32 @@ OPSET = 17
 
 
 def dims_of(t):
-    """Dim list; symbolic dims come back as their dim_param string, unset as 0."""
+    """Dim list; symbolic dims come back as their dim_param string, unset as 0.
+
+    Returns None for a tensor carrying no shape at all (unknown rank), which is
+    a strictly worse form of non-static than an unset dim and must not be
+    confused with the empty dim list of a rank-0 scalar.
+    """
+    if not t.type.tensor_type.HasField("shape"):
+        return None
     out = []
     for d in t.type.tensor_type.shape.dim:
         out.append(d.dim_param if d.WhichOneof("value") == "dim_param" else d.dim_value)
     return out
+
+
+def is_static(dims):
+    """True only if rank is known and every dim is a positive literal.
+
+    `all([])` is True, so unknown rank has to be rejected explicitly or it
+    sails through the very check meant to catch it. A rank-0 scalar also has
+    an empty dim list but IS static, hence None rather than [] as the sentinel.
+    """
+    return dims is not None and all(isinstance(x, int) and x > 0 for x in dims)
+
+
+def fmt_dims(dims):
+    return "<unknown rank>" if dims is None else str(dims)
 
 
 def main():
@@ -96,9 +117,9 @@ def main():
     ins = [(t.name, dims_of(t)) for t in m.graph.input]
     outs = [(t.name, dims_of(t)) for t in m.graph.output]
     for name, dims in ins:
-        print(f"  IN  {name}: {dims}")
+        print(f"  IN  {name}: {fmt_dims(dims)}")
     for name, dims in outs:
-        print(f"  OUT {name}: {dims}")
+        print(f"  OUT {name}: {fmt_dims(dims)}")
 
     assert [n for n, _ in ins] == ["pixel_values"], (
         f"graph must have exactly one input 'pixel_values', got {[n for n, _ in ins]} "
@@ -107,8 +128,7 @@ def main():
     assert [n for n, _ in outs] == names_out, (
         f"unexpected outputs {[n for n, _ in outs]}, expected {names_out}"
     )
-    bad = [(n, d) for n, d in ins + outs
-           if not all(isinstance(x, int) and x > 0 for x in d)]
+    bad = [(n, fmt_dims(d)) for n, d in ins + outs if not is_static(d)]
     assert not bad, (
         f"non-static shapes {bad} -- a constant did not fold; the graph is "
         "dynamic and unusable for the static-shape QNN pipeline"
