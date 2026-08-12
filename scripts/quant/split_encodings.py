@@ -14,10 +14,11 @@ across splits as the same buffer and requires identical quantization params
 (validateModel check 4). Deriving both chunks from ONE calibration run makes
 that automatic instead of something to reconcile afterwards.
 
-Naming: chunk modules are always local 0..n-1, so a later chunk's entries are
-renumbered by -start. Two spellings appear in the file and both are rewritten:
-  params      layers.<i>.<...>
-  activations /layers/layers.<i>/<...>
+Naming: the shipped path cuts AIMET's ONNX with onnx.utils.extract_model, which
+PRESERVES the original global names, so entries keep their layer indices. Pass
+--renumber only for a chunk graph that was re-exported with its own module list
+(local 0..n-1); getting this backwards matches 0/198 params and silently
+converts the whole chunk as FP16.
 
 Usage:
   split_encodings.py --encodings <whole.encodings> --split-at 18 --layers 36 \
@@ -64,6 +65,12 @@ def main():
     ap.add_argument("--split-at", type=int, required=True)
     ap.add_argument("--layers", type=int, required=True)
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--renumber", action="store_true",
+                    help="renumber a later chunk's layers to local 0..n-1. Only "
+                         "correct when the chunk graph was RE-EXPORTED with its "
+                         "own module list. The shipped path cuts AIMET's ONNX "
+                         "with onnx.utils.extract_model, which preserves the "
+                         "original global names, so leave this off there.")
     args = ap.parse_args()
 
     split, L = args.split_at, args.layers
@@ -101,8 +108,9 @@ def main():
             if li < split:
                 buckets[0].append(e)
             else:
-                e = dict(e)
-                e["name"] = renumber(n, -split)
+                if args.renumber:
+                    e = dict(e)
+                    e["name"] = renumber(n, -split)
                 buckets[1].append(e)
         for ci in (0, 1):
             chunks[ci][section] = buckets[ci]
@@ -127,10 +135,12 @@ def main():
     for ci in (0, 1):
         seen = {layer_of(name_of(e))
                 for e in chunks[ci]["param_encodings"]} - {None}
-        want = set(range(split if ci == 0 else L - split))
+        want = (set(range(split)) if ci == 0
+                else set(range(L - split)) if args.renumber
+                else set(range(split, L)))
         if seen != want:
-            raise SystemExit(f"chunk{ci} local layers {sorted(seen)[:5]}... "
-                             f"!= expected 0..{len(want)-1}")
+            raise SystemExit(f"chunk{ci} layers {sorted(seen)[:5]}... != "
+                             f"expected {min(want)}..{max(want)}")
 
     if unassigned:
         print(f"  layer-agnostic entries -> chunk1: {len(unassigned)} "
