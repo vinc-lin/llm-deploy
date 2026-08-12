@@ -179,11 +179,41 @@ the deepstack handling at `nsp-image-model.cpp:199` is a fallback that treats
 a `deepstack_visual_embed*` tensor as a graph's *primary* output — hinting at
 a per-graph decomposition rather than one graph with four outputs.
 
-Three possibilities, undecidable from here:
+Three possibilities, undecidable when this spec was written:
 
 - **(a)** Genie expects a specific graph decomposition we must match
 - **(b)** The wiring is app-level and we write it
 - **(c)** Deepstack is not supported end-to-end in 1.19
+
+### RESOLVED (2026-08-12, during Stage 1)
+
+**The answer is (c) for a stock pipeline, and (b) otherwise.**
+
+`Genie/src/pipeline/ImageEncoder.cpp` exposes exactly **one** output —
+`GENIE_NODE_IMAGE_ENCODER_EMBEDDING_OUTPUT`, published to the pipeline under
+the single tensor name `image_embeddings` — and
+`setEmbeddingOutputCallback` throws for any other IO name. Our graph emits
+four tensors. The three deepstack tensors therefore have no Genie node IO
+name and no route out of a stock `ImageEncoder` node: wiring ViT → LLM through
+`GeniePipeline` yields `image_features` only.
+
+Reading all four requires `qnn-net-run` against the ctx-bin, or a custom QNN
+driver. There is no `GenieImageEncoder` API at all — the image encoder is a
+*node type* inside the generic Node/Pipeline API, and `"image-encoder"` is
+consumed only by `GenieNodeConfig_createFromJson`.
+
+Two further facts established at the same time, both load-bearing for Stage 3:
+
+- **`genie-app` is the driver.** `genie-t2t-run` is `GenieDialog_*` only;
+  `genie-t2e-run` hard-requires a top-level `"embedding"` config key and is a
+  text-to-embedding tool. `genie-app` exposes `GenieNode_*`/`GeniePipeline_*`
+  as a script language, maps every `GENIE_NODE_IMAGE_ENCODER_*` role, and is
+  the SDK's own documented path for GLM-4v on HTP.
+- **Genie does no image preprocessing.** `node set image` reads the file as an
+  opaque blob into `GenieNode_setData`. The host must supply an already
+  preprocessed raw tensor.
+
+The mitigation below stands and is now the working assumption for Stage 3.
 
 **Mitigation — optional by construction.** The text graph takes the deepstack
 tensors as ordinary optional inputs; supplying zeros yields a model that is
@@ -219,6 +249,39 @@ prefill bug:
 
 Disk: ~80 GB needed (checkpoint ~8 GB, FP32 ONNX, DLC, ctx-bins); 623 GB free
 on the ext4 data volume.
+
+## 9b. Stage 1 outcome (2026-08-12)
+
+Built and published: 810 MiB FP16 ctx-bin, single graph `vit`, 412,863,488
+params, 4.19 GMAC/forward. All four gates pass and each was mutation-tested.
+
+| Gate | Worst max abs diff |
+|---|---|
+| 1 — wrapper vs HF (torch) | 6.2e-05 |
+| 2 — ONNX vs HF (ONNX Runtime) | 7.1e-05 |
+| 3 — converted DLC vs HF (`qnn-net-run`, CPU backend) | 3.6e-03 |
+| 4 — ctx-bin contract lint | — |
+
+Three findings worth carrying into Stage 2:
+
+1. **The converter substitutes the GELU variant.** `qairt-converter` runs
+   `MatchGeluApproxPass` once per vision block (24×), replacing Qwen3-VL's
+   `gelu_pytorch_tanh` with QNN's exact erf GELU — 4.73e-04 per element,
+   accumulating to the 3.6e-03 in Gate 3. This is a systematic activation
+   substitution, not noise, and it is why Gate 3's tolerance is ~50× Gate 2's.
+   Expect the same pass to fire on the text tower's activations.
+2. **The CPU backend has no FP16 path.** `libQnnCpu.so` rejects an FP16 DLC at
+   graph composition (`OpConfig validation failed for FullyConnected`). Gate 3
+   therefore validates an FP32 conversion of the same ONNX — the converter's
+   translation, not the shipped file's numerics. The same constraint applies
+   to the text tower, so plan its DLC gate the same way.
+3. **`graph_names` is a name-keyed selector, in BOTH configs.** A graph whose
+   name is absent from the list binds to no tuning block and silently compiles
+   at O=0 / 4 MB VTCM / 0 HVX threads. This bit the project before on device
+   (`BUILD_GUIDE.md` §5.4b, `verify32`, root cause of the LADE SIGSEGV). The
+   ViT build now asserts `optimizationLevel`, `vtcmSize`, `numHvxThreads` and
+   `graphName` read back out of the finalised binary; Stage 2 must do the
+   same. See `docs/NOTES-vit-htp-config.md`.
 
 ## 10. Out of scope
 
