@@ -81,47 +81,69 @@ def fmt_dims(dims):
     return "<unknown rank>" if dims is None else str(dims)
 
 
-def io_spec(cfg, n_deepstack, seq, past_len):
+BOUNDARY = "last_hidden_states"
+
+
+def io_spec(cfg, n_deepstack, seq, past_len, layer_range=None):
     """(name, shape) for every graph I/O, inputs in ExportQwen3.forward order.
 
     Single source of truth: the dummy trace inputs, the declared input_names
     and the post-export shape guard are all derived from this, so the three can
     never drift apart.
+
+    `layer_range=(start, end)` describes one chunk of a split export. Two rules
+    from docs/NOTES-genie-splits.md are load-bearing here:
+
+    * KV tensors keep GLOBAL layer indices. Renumbering a later chunk's caches
+      to 0..n-1 would collide with the first chunk's names, and Genie treats
+      same-named tensors across splits as THE SAME BUFFER -- the two chunks'
+      caches would silently alias.
+    * The boundary tensor is rank-3 [1, S, H] on BOTH sides. `inputs_embeds` is
+      rank-4 by Genie's convention, but the module returns rank 3, and Genie
+      does not check that split boundary shapes agree -- so the two sides are
+      made identical here rather than left to match by element count.
     """
     L, n_kv, D, H = (cfg.num_hidden_layers, cfg.num_key_value_heads,
                      cfg.head_dim, cfg.hidden_size)
+    start, end = (0, L) if layer_range is None else layer_range
+    is_first, is_last = start == 0, end == L
+
     ins = [
-        ("inputs_embeds", [1, 1, seq, H]),
+        ("inputs_embeds", [1, 1, seq, H]) if is_first else (BOUNDARY, [1, seq, H]),
         ("attention_mask", [1, seq, past_len + seq]),
         ("position_ids_cos", [1, seq, D // 2]),
         ("position_ids_sin", [1, seq, D // 2]),
     ]
     ins += [(f"deepstack_visual_embed_{i}", [1, 1, seq, H]) for i in range(n_deepstack)]
     if past_len:
-        for i in range(L):
+        for i in range(start, end):
             # Genie contract: keys transposed [1, n_kv, D, P], values [1, n_kv, P, D]
             ins += [(f"past_key_{i}_in", [1, n_kv, D, past_len]),
                     (f"past_value_{i}_in", [1, n_kv, past_len, D])]
-    outs = [("logits", [1, seq, cfg.vocab_size])]
-    for i in range(L):
+    outs = [("logits", [1, seq, cfg.vocab_size]) if is_last else (BOUNDARY, [1, seq, H])]
+    for i in range(start, end):
         outs += [(f"past_key_{i}_out", [1, n_kv, D, seq]),
                  (f"past_value_{i}_out", [1, n_kv, seq, D])]
     return ins, outs
 
 
-def export_graph(model, cfg, out_path, seq, past_len, n_deepstack):
-    ins, outs = io_spec(cfg, n_deepstack, seq, past_len)
+def export_graph(model, cfg, out_path, seq, past_len, n_deepstack, layer_range=None):
+    ins, outs = io_spec(cfg, n_deepstack, seq, past_len, layer_range)
     # use_past only gates whether the past-KV arguments are read, so the same
     # weights serve both graphs; see the note in main() on why that matters.
     model.use_past = past_len > 0
 
+    L = cfg.num_hidden_layers
+    start, end = (0, L) if layer_range is None else layer_range
+
     cos, sin = rope_tables(torch.arange(past_len, past_len + seq),
                            cfg.head_dim, rope_theta_of(cfg))
-    args = [torch.zeros(1, 1, seq, cfg.hidden_size),
-            causal_mask(seq, past_len + seq), cos, sin]
+    head = (torch.zeros(1, 1, seq, cfg.hidden_size) if start == 0
+            else torch.zeros(1, seq, cfg.hidden_size))
+    args = [head, causal_mask(seq, past_len + seq), cos, sin]
     args += [torch.zeros(1, 1, seq, cfg.hidden_size) for _ in range(n_deepstack)]
     if past_len:
-        for _ in range(cfg.num_hidden_layers):
+        for _ in range(end - start):
             args += [torch.zeros(1, cfg.num_key_value_heads, cfg.head_dim, past_len),
                      torch.zeros(1, cfg.num_key_value_heads, past_len, cfg.head_dim)]
     assert [list(a.shape) for a in args] == [s for _, s in ins], (
@@ -212,6 +234,12 @@ def main():
     ap.add_argument("--cl-prefill", type=int, default=128)
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--n-deepstack", type=int, default=3)
+    ap.add_argument("--split-at", type=int, default=0,
+                    help="split the layer stack at this GLOBAL layer index, "
+                         "emitting prefill_0/decode_0 (layers [0,N)) and "
+                         "prefill_1/decode_1 (layers [N,L)). 0 = no split. "
+                         "Required for 4B: one ctx-bin cannot hold the tower "
+                         "(3.5 GiB per-graph serialization limit).")
     ap.add_argument("--parity-check", action="store_true",
                     help="compare wrapper logits vs HF forward before export")
     args = ap.parse_args()
@@ -223,36 +251,67 @@ def main():
     cfg = hf.config.text_config
     out = Path(args.out)
 
-    # ONE wrapper for both graphs. At fp32 the HF model is ~18 GB and each
-    # wrapper another ~16 GB; building a second one (or keeping hf alive through
-    # export, where constant folding transposes every weight) does not fit in
-    # RAM. use_past is a plain flag that only gates reading the past-KV args, so
-    # export_graph flips it per graph.
-    model = ExportQwen3.from_hf_vl_text(hf, use_past=True, logits_last_only=False,
-                                        n_deepstack=args.n_deepstack)
-    if args.parity_check:
-        parity_check(model, hf, cfg, args.n_deepstack)
-    del hf
-    gc.collect()
+    L = cfg.num_hidden_layers
+    split = args.split_at
+    if split and not 0 < split < L:
+        raise SystemExit(f"--split-at {split} must be inside (0, {L})")
+    chunks = [(0, split), (split, L)] if split else [(0, L)]
 
     # decode past length: window is ctx + cl_prefill - 1 so that after one
     # decode step total == ctx + cl_prefill (== ctx-bin max CL, e.g. 2048+128)
     past_len = args.ctx + args.cl_prefill - 1
-    # own subdirectory per graph: external data filenames are not graph-stable
-    graphs = [("prefill", out / "prefill" / "prefill.onnx", args.cl_prefill, 0),
-              ("decode", out / "decode" / "decode.onnx", 1, past_len)]
+
+    if args.parity_check and split:
+        raise SystemExit(
+            "--parity-check compares a whole-tower forward and does not apply to a "
+            "split export; scripts/validate/parity_vl_text_split.py proves chunk "
+            "equivalence against the unsplit tower instead")
+
+    # Graph NAMES are the split wiring: Genie assigns split index by sorted name
+    # within each (AR, CL) group (nsp-model.cpp:365-372), and a graph's name is
+    # baked in at conversion time from the DLC basename. prefill_0 < prefill_1
+    # and decode_0 < decode_1 sort into chunk order. See
+    # docs/NOTES-genie-splits.md.
+    todo = []
+    for ci, (s, e) in enumerate(chunks):
+        sfx = f"_{ci}" if split else ""
+        # deepstack lands on GLOBAL layers 0..n-1, so only the first chunk takes it
+        nd = args.n_deepstack if s == 0 else 0
+        todo.append((ci, (s, e), nd, f"prefill{sfx}", args.cl_prefill, 0))
+        todo.append((ci, (s, e), nd, f"decode{sfx}", 1, past_len))
 
     specs = []
-    for tag, path, seq, past in graphs:
-        print(f"exporting {tag} (S={seq}, past={past})...", flush=True)
-        export_graph(model, cfg, path, seq, past, args.n_deepstack)
-        specs.append(io_spec(cfg, args.n_deepstack, seq, past))
+    for ci, (s, e) in enumerate(chunks):
+        # One wrapper per chunk, serving both its AR variants. At fp32 the HF
+        # model is ~18 GB and a full wrapper another ~16 GB, so wrappers are
+        # built and freed one at a time; use_past only gates reading the past-KV
+        # args, so export_graph flips it per graph.
+        print(f"building chunk {ci}: layers [{s}, {e})", flush=True)
+        model = ExportQwen3.from_hf_vl_text(
+            hf, use_past=True, logits_last_only=False,
+            n_deepstack=args.n_deepstack if s == 0 else 0,
+            layer_range=(s, e) if split else None)
+        if args.parity_check:
+            parity_check(model, hf, cfg, args.n_deepstack)
+        for c, rng, nd, tag, seq, past in todo:
+            if c != ci:
+                continue
+            print(f"exporting {tag} (S={seq}, past={past}, layers {rng})...", flush=True)
+            # own subdirectory per graph: external data filenames are not
+            # graph-stable and collide between graphs
+            path = out / tag / f"{tag}.onnx"
+            export_graph(model, cfg, path, seq, past, nd,
+                         layer_range=rng if split else None)
+            specs.append((tag, path, io_spec(cfg, nd, seq, past,
+                                             rng if split else None)))
+        del model
+        gc.collect()
 
     # free the weights before onnx.checker: it reloads the external data
-    del model
+    del hf
     gc.collect()
 
-    for (tag, path, _, _), (ins, outs) in zip(graphs, specs):
+    for tag, path, (ins, outs) in specs:
         verify_graph(path, ins, outs)
 
 
