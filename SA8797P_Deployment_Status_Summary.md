@@ -2,6 +2,23 @@
 
 *Last updated: 2026-08-09*
 
+> ## ⚠️ Inherited document — partly superseded
+>
+> This is the **remote team's** status as of 2026-08-09, written for a different
+> environment (`/mnt/code/…`, `sa8797_deploy_kit`, conda envs). It remains the best
+> record of the *hardware and GVM* findings in §1 and §3.2, which nothing since has
+> contradicted. But several §2–§4 claims have since been disproved or completed on
+> this project. Corrections are marked inline below and consolidated in
+> **`docs/REFERENCE.md`**, which is the current-truth document. The files it
+> references in its header (`SA8797P_DEPLOYMENT_KNOWLEDGE.md`, `GETTING_STARTED.md`,
+> `TROUBLESHOOTING.md`, the dated investigations) are **not present in this repo**.
+>
+> Headline reversals:
+> - **"`lm_head` INT8 degrades quality" (§2.2) is wrong** — device-measured parity at 0.6B.
+> - **QKV fusion is done** (§3.1 says "not yet") — encodings-level surgery, built and device-tested.
+> - **Decode is ~6.3–6.5 tok/s** on our builds, not §2.1's 7.4–8.2.
+> - **All ctx-bins are ~1.09 GB**, not 1.5 GB.
+
 This is a concise status of what we have, what works, what doesn't, and what's next for LLM deployment on the Qualcomm SA8797P (nordy / Gen5) automotive SoC via QAIRT 2.48.x + Genie T2T 1.19.0.
 
 For detailed step-by-step procedures, error catalogs, and dated investigation logs, see:
@@ -78,7 +95,7 @@ The Android image runs as a **guest VM (GVM)** under QualVM hypervisor on top of
 | Build-time config | `O: 3`, `vtcm_mb: 16`, `num_cores: 1`, `hvx_threads: 4`, `sparse_weights_compression: 1`, `rpc_polling_time: 9999`, `pd_session: unsigned`, `extended_udma: true` |
 | Runtime perf profile | `llm_decode_burst` (highest tier) |
 | Dialog QnnHtp block | `pos-id-dim: 64`, `kv-dim: 128`, `rope-theta: 1000000.0`, `cpu-mask: "0xe0"`, `poll: true`, `allow-async-init: true` |
-| **Decode throughput** | **7.4–8.2 tok/s** (warm, burst) |
+| **Decode throughput** | **7.4–8.2 tok/s** (warm, burst) — ⚠️ *our builds measure **6.3–6.5 tok/s** AR-1 on device (2026-08-10/11), and **10.8 tok/s** with LADE speculative decoding (2026-08-11). The 7.4–8.2 figure has never been reproduced here.* |
 | Perf profile ladder (warm) | burst / `llm_decode_burst` = 7.4–7.5 tok/s → high_perf/powersave = 6.3 → balanced = 5.4 → default/low_power_saver = 3.8 (1.95× swing) |
 | Prefill / TTFT | Not precisely measured; short-context TTFT is acceptable |
 | Output quality | Coherent (no quantization-induced garbage) |
@@ -103,7 +120,15 @@ The validated pipeline (scripted in `scripts/quant/quantize_aimet.py`):
    - Calibration: ~10 mixed Chinese/English/code/math prompts
    - `clip_weights_to_7f7f(sim)` to avoid INT8 saturation
    - RMSNorm forced to 16-bit
-   - **Critical:** `embed_tokens`, final `norm`, `lm_head` kept in FP16 (their quantizers disabled). Otherwise HTP v81 rejects `Gather` on INT16 weight with error `0xc26`; `lm_head` INT8 degrades quality.
+   - **Critical:** `embed_tokens`, final `norm`, `lm_head` kept in FP16 (their quantizers disabled). Otherwise HTP v81 rejects `Gather` on INT16 weight with error `0xc26`; ~~`lm_head` INT8 degrades quality~~.
+
+   > **Correction (2026-08-12):** the `lm_head`-INT8 quality claim is **not
+   > supported**. An INT8 per-channel head (`--quant-head`) held 3/4 argmax
+   > locally and showed no visible degradation on device under greedy sampling
+   > at 0.6B. It is still not worth shipping, for an unrelated reason: under
+   > LADE it costs ~10% n-gram acceptance and nets −14% tok/s. Keeping the head
+   > FP16 remains the default; the *reason* in this line is wrong. See
+   > `reports/qwen3-0.6b-w8a16qh-ladekv-test-report.md`.
    - K/V projection outputs kept in FP16 (cross-graph KV cache cannot have mismatched INT16 scales between prefill and decode).
 
 3. **Encodings filter** (`scripts/quant/filter_aimet_w8a16.py`)
@@ -167,11 +192,27 @@ python3 $QAIRT/bin/x86_64-linux-clang/qairt-converter \
 |---|---|---|
 | **W8A8** (INT8 activations, per-tensor UINT8 asymmetric) | All variants (v15–v18) produce **garbage output** | Per-tensor UINT8 asymmetric (the only activation quant HTP v81 MatMul supports) clips heavy-tailed LLM activations (attention scores, residuals). Per-channel activations not supported on v81. Axis fixes alone don't resolve. |
 | **W4A16 / INT4 blockwise weights** | Converter **folds s4 weights back to FP16**; `htp_v2.json` has zero INT4 MatMul kernels | INT4 MatMul requires HTP v75 (Snapdragon 8 Gen 3) or newer. v81 has no INT4 MatMul support. |
-| **QKV fusion + W8A16** (fusing q/k/v into one `qkv_proj` MatMul) | Build-time OK with `vtcm_mb=24` (zero spill), but two runtime blockers: (1) `vtcm_mb=24` rejected on unsigned PD; (2) Q/K/V share one output tensor and one output quantizer — Q needs INT16 for attention MatMul, K/V must stay FP16 across the prefill/decode graph boundary. Single-quantizer choice → either cross-graph INT16 scale mismatch (error 5005) or garbage output if all-FP16. | Needs ONNX graph surgery: `qkv_proj → DQ → Split → Quantize(Q only)`; not yet done. |
+| ~~**QKV fusion + W8A16**~~ **— SOLVED, see correction below** | Build-time OK with `vtcm_mb=24` (zero spill), but two runtime blockers: (1) `vtcm_mb=24` rejected on unsigned PD; (2) Q/K/V share one output tensor and one output quantizer — Q needs INT16 for attention MatMul, K/V must stay FP16 across the prefill/decode graph boundary. Single-quantizer choice → either cross-graph INT16 scale mismatch (error 5005) or garbage output if all-FP16. | ~~Needs ONNX graph surgery: `qkv_proj → DQ → Split → Quantize(Q only)`; not yet done.~~ |
 | **`--preserve_io_datatype` on qairt-converter** | `input_ids` stays INT64 → unsupported by HTP; combining with `--source_model_input_datatype int32` errors. Even after ONNX cast to INT32, combined with disabled qkv output quantizer gave garbage. | Let converter auto-cast INT64→INT32. |
 | **2-core ctx-bin (`num_cores=2`)** | Compiles (1.5 GB binary) but Genie T2T 1.19 fails with error 5005 (`QNN_ERROR_NOT_SUPPORTED`) or runs at **3.96 tok/s** (slower than single-core). | Multi-core needs custom QNN API code or a newer Genie. Genie creates a single-core device internally with no JSON option to override. |
 | **Multiple concurrent Genie instances** | 2 instances → 4.0 tok/s each (8 total) — linear BW split, no per-sequence gain. | Confirms decode is 100% DDR-bound. |
 | **`sparse_weights_compression=1`** | Build reports `sparse_weights_compression bytes saved: 0`. | Model isn't sparse enough; no gain. |
+
+> **Corrections (2026-08-12):**
+>
+> - **QKV fusion is done.** Solved not with ONNX surgery but at the **encodings**
+>   level (`scripts/export/qkv_surgery.py`, 28/28 grafts): the donor `q_proj`
+>   INT16 encoding is grafted onto the Q split, K/V splits stay FP16. Converter
+>   and generator accept it at `vtcm_mb=16`, and it ran on device. The catch is
+>   that it **buys nothing**: 6.27–6.5 tok/s ≈ baseline. The remote's 3.4× DDR
+>   reduction was measured at `vtcm_mb=24`, which unsigned PD rejects; at 16 MB
+>   all variants already show zero VTCM spill, so there is no spill to remove.
+> - **W4A16 dead end, restated.** This row's reasoning is also internally
+>   inconsistent ("requires v75 or newer" vs "v81 has no INT4 support" — v81 is
+>   newer than v75). Our own result supersedes it and is about **accuracy**, not
+>   kernels: per-channel INT4, LPBQ block-64, and LPBQ+SeqMSE all score **0/4** on
+>   the argmax gate W8A16 passes 3/4. Dead end at 0.6B regardless of kernel
+>   support; flags remain for larger models.
 | **QAIRT 2.43 AUTO + built-in quantizer** | Same per-tensor UINT8 activations → same W8A8 garbage; no `llm_decode_*` perf profiles. | No improvement. |
 
 ---

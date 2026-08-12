@@ -74,13 +74,22 @@ restores canonical Genie names (positional + consumer-pattern checks).
 
 ## Full-size build results (CL=128 / CTX=1024, weight-shared, vtcm 16, v81)
 
-| Variant | ctx-bin | Build-time DDR read (prefill / decode) | VTCM spill |
+> ⚠️ **The ctx-bin column below is superseded** (it records the 2026-08-10 v1-era
+> builds). Every current 0.6B ctx-bin measures **~1.09 GB**, not 1.5 GB — verified
+> 2026-08-12: baseline 1,087,074,304 B · fusegu 1,085,747,200 · fuseqkv
+> 1,085,644,800 · fuseqkvgu 1,084,137,472 · lade 1,099,091,968 · ladekv
+> 1,106,276,352. The DDR-read and spill columns are unaffected. See
+> `docs/REFERENCE.md` for the open question about what changed between v1 and v2.
+
+| Variant | ctx-bin (v1-era, stale) | Build-time DDR read (prefill / decode) | VTCM spill |
 |---|---|---|---|
 | baseline W8A16 | 1.5 GB (2.1 GB without weight sharing) | 759 MB / 957 MB | 0 |
 | + Gate-Up fusion | 1.5 GB | 769 MB / 961 MB | 0 |
 | + QKV fusion (surgery 28/28) | 1.5 GB | 763 MB / 961 MB | 0 |
 
-Weight sharing reproduces the remote's recorded 1.5 GB binary size exactly.
+*(The 763 / 961 pair above is the source of a since-corrected `--quant-head`
+claim in `BUILD_GUIDE.md` §5.7 — they are one build's prefill and decode figures,
+not a before/after.)*
 
 **Key observation vs summary §3.3/§4.3-Q1:** at vtcm 16, fusion gives **no
 build-time DDR byte reduction** (remote's 3.4× reduction was measured at
@@ -159,7 +168,7 @@ graph (decode wrapper at S=32, past=1120, all-position logits) via
 
 | Artifact | Result |
 |---|---|
-| 3-graph ctx-bin (prefill128 + decode1 + verify32) | **1.5 GB** — weight sharing held across all 3 |
+| 3-graph ctx-bin (prefill128 + decode1 + verify32) | **1.5 GB** — weight sharing held across all 3 *(stale: the shipped `-lade` bin measures 1,099,091,968 B ≈ 1.10 GB)* |
 | verify32 dims | ids [1,32], mask [1,32,1152], past 1120, logits [1,32,151936] ✓ |
 | AR=8 ONNX verify parity vs HF (CL=32/ctx=96) | all-position argmax match, max|Δ| 3.05e-05 |
 | Bundle | `qwen3_06b_w8a16_lade.tar.gz` (lade + basic dialog configs, same bin) |

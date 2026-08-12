@@ -67,8 +67,15 @@ are a fatal Genie load error (KV quant params must be byte-identical).
   `du -h <vhdx>` (no `--apparent-size`) is the real consumption.
 - W4A16 is a dead end at 0.6B (per-channel, LPBQ-64, LPBQ+SeqMSE all fail the
   argmax gate); `--lpbq`/`--seq-mse` flags remain for larger models.
+- `--quant-head` (W8 lm_head) is a **net LADE regression**: −14% tok/s on device
+  (9.3 vs 10.8), because it costs ~10% n-gram acceptance. Quality is fine; the
+  DDR win does not survive spec-decode amortization. It also needs
+  `--keep-head-weight` or the filter strips the encoding and you silently get an
+  FP16 head — verify with `qairt-dlc-info | grep lm_head.weight` → `sFxp_8`.
 
 ## Docs
 
-`docs/BUILD_GUIDE.md` (full recipes) · `docs/LOCAL_ENV.md` (provenance, aimet
-workarounds) · `docs/NOTES-genie-io.md` (Genie/qualla runtime contract, cited).
+**`docs/REFERENCE.md` first** (consolidated current truth: contracts, measured
+numbers, dead ends, open questions) · `docs/BUILD_GUIDE.md` (full recipes) ·
+`docs/LOCAL_ENV.md` (provenance, aimet workarounds) · `docs/NOTES-genie-io.md`
+(Genie/qualla runtime contract, cited).

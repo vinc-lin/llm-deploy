@@ -2,10 +2,28 @@
 
 > **Test date:** 2026-08-10 (bundles re-uploaded ~17:00 UTC that day)
 > **Source:** HF `vinccniv` W8A16 device bundles
-> **Reconstructed from** the three screen photographs in `reports/IMG_3004..IMG_3006.HEIC`.
+> **Reconstructed from** the three screen photographs formerly at `reports/IMG_3004..IMG_3006.HEIC`
+> (deleted 2026-08-12 once transcribed — this document is now the record).
 > Content is transcribed verbatim where legible; derived figures are marked as such.
 > Supersedes the failure analysis in
 > [`qwen3-0.6b-w8a16-fuseqkvgu-test-report.md`](qwen3-0.6b-w8a16-fuseqkvgu-test-report.md) (v1 bundles).
+
+> ## ⚠️ Two on-screen conclusions were later disproved — kept as the historical record
+>
+> 1. **§4's root-cause reading is wrong.** It attributes the v1→v2 fix to weight
+>    layout/encoding ("per-channel axis alignment", "weight scaling mismatch"). The actual
+>    fix was the **all-position logits** export (`[1,AR,V]` instead of `[1,1,V]`) — a graph
+>    *shape* change, not a quantization change. See `docs/NOTES-genie-io.md` § "Prefill
+>    logits contract". §7 item 4 ("the fix is in the quantization/ctx-bin generation
+>    pipeline") is wrong for the same reason.
+> 2. **§3's LADE assessment is wrong.** It guesses a missing draft head/verifier or an ABI
+>    mismatch. The verifier graph was in the ctx-bin all along; the bug was one missing
+>    entry — `verify32` absent from `graph_names` in `htp_backend_ext_config.json` — plus a
+>    second, independent qualla bug (`rand() % 0` on 1-token prompts). Both are pinned to
+>    SDK source in `docs/NOTES-genie-io.md`; the working build is
+>    [`qwen3-0.6b-w8a16-ladekv-test-report.md`](qwen3-0.6b-w8a16-ladekv-test-report.md).
+>
+> The measured KPIs, configs and byte counts below are unaffected.
 
 ---
 

@@ -5,8 +5,9 @@
 **Source bundle:** HF `qwen3_06b_w8a16_ladekv.tar.gz` (892 MiB)
 **Runtime:** libGenie 1.19.0 · QAIRT 2.48.40.260702
 
-> **Provenance.** Consolidated from the six screen photographs in `reports/0811/IMG_3008..IMG_3013.HEIC`,
-> which capture a rendered view of `SA8797P_Qwen3-0.6B_W8A16_LADEKV_Test_Report_2026-08-11.md`.
+> **Provenance.** Consolidated from the six screen photographs formerly at
+> `reports/0811/IMG_3008..IMG_3013.HEIC` (deleted 2026-08-12 once transcribed — this document is
+> now the record), which captured a rendered view of `SA8797P_Qwen3-0.6B_W8A16_LADEKV_Test_Report_2026-08-11.md`.
 > Transcribed verbatim where legible. Everything under
 > [§10 Verification](#10-verification-against-the-local-bundle) and
 > [§11 Numeric consistency review](#11-numeric-consistency-review) is **analysis added here**, not

@@ -1,8 +1,24 @@
 # Qwen3-0.6B W8A16 + QKV + GU Fusion — Full Test Data Sheet
 
-> Reconstructed from the ten screen photographs in `reports/IMG_2992..IMG_3003.jpeg`.
+> Reconstructed from the ten screen photographs formerly at `reports/IMG_2992..IMG_3003.jpeg`
+> (no longer retained — this document is now the record).
 > Content is transcribed verbatim where legible; a few glyphs obscured by screen glare are
 > marked with `[?]` and listed under [Transcription notes](#transcription-notes).
+
+> ## ⚠️ The root cause in §12/§13 was wrong — kept as the historical record
+>
+> This report attributes the garbage output to *"the fused QKV attention block produces
+> incorrect K and/or V values on HTP v81"*. **It is not fusion.** Root-caused device-free
+> on 2026-08-11 to **our prefill export**: it emitted last-token-only logits `[1,1,V]`,
+> while qualla left-aligns the prompt and samples logits at row `n_process − 1` — an
+> out-of-bounds read on a 1-row buffer, giving zeros/noise and `argmax = token 0 = "!"`
+> (the observed `!!!!!` floods). **All v1 bundles were affected, fused or not.** The
+> encodings surgery was verified clean at both JSON and DLC level.
+>
+> Mechanism with line-level SDK citations: `docs/NOTES-genie-io.md` § "Prefill logits
+> contract". Fixed by exporting all-position logits; regression guard is
+> `scripts/validate/parity_qualla_read.py`. Everything else here — the KPIs, configs,
+> logs, and the observation that output was broken from token 1 — stands.
 
 ---
 

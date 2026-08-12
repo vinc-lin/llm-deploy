@@ -120,7 +120,12 @@ with `logits_last_only=False`. Regression guard:
 *Sources: `qualla/engines/qnn-htp/KVCache/kvmanager.cpp`, `nsp-model.cpp`,
 `nsp-graph.cpp`, `attention-mask.cpp`, `dialogs/lhd-dec.cpp`, `context.cpp`.*
 
-**Graph selection is pure numeric best-fit on (AR, CL)** — names are cosmetic.
+**Graph selection is pure numeric best-fit on (AR, CL)** — names are cosmetic
+*to Genie's graph picker*. They are **not** cosmetic to the HTP backend: names are
+what `htp_backend_ext_config.json` keys its per-graph tuning on, and they are baked
+into the DLC at conversion time from the `--output_path` basename (dots included),
+so a name that stops matching silently costs that graph its VTCM/O/HVX settings —
+see `docs/NOTES-vit-htp-config.md`.
 CL: `m_supported_variants.lower_bound(n_valid_kv)` (kvmanager.cpp:408) —
 smallest CL ≥ current KV. AR: smallest `arN >= n_tokens`, else largest smaller
 (chunking fallback) (kvmanager.cpp:388-406). AR from `numElements(input_ids)`,

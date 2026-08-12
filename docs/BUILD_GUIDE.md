@@ -169,11 +169,20 @@ remote team's "error 5005".)
   the AR-1 decode graph (~155 ms/tok). Quote tok/s numbers per phase.
 - Device-measured (v2, 2026-08-11): decode ~6.5 tok/s, prefill-phase
   ~23.8 tok/s, init ~0.8 s, RAM ~163 MB.
-- **Graph selection is numeric best-fit on (AR, CL) — names are cosmetic.**
-  Genie picks the smallest CL ≥ current KV, then the smallest AR ≥ the batch
-  size (largest smaller AR = chunking fallback). Consequences: two graphs may
-  never share an (AR, CL) pair (hard load error), and in topology B a 12-token
-  prompt runs on `verify32`, not on the graph named `prefill`.
+- **Graph selection is numeric best-fit on (AR, CL) — names are cosmetic *to
+  Genie*.** Genie picks the smallest CL ≥ current KV, then the smallest AR ≥ the
+  batch size (largest smaller AR = chunking fallback). Consequences: two graphs
+  may never share an (AR, CL) pair (hard load error), and in topology B a
+  12-token prompt runs on `verify32`, not on the graph named `prefill`.
+- **Graph names are NOT cosmetic to the HTP backend.** `htp_backend_ext_config.json`
+  scopes its tuning block by `graph_names`; a graph whose name is absent silently
+  gets backend defaults (4 MB VTCM, 24 MB spill) — no warning, exit 0. The name is
+  baked in at conversion time from the `--output_path` **basename, dots included**
+  (converting to `decode.dlc.new` yields graph `decode_dlc`), and renaming the file
+  afterwards does not change it. Always convert straight to the final filename and
+  verify against the ctx-bin before bundling (§6). See
+  `docs/NOTES-vit-htp-config.md` for the measured cost: 345× the DDR spill traffic
+  from a build whose log is clean.
 
 ### 3.5 Past-KV prefill contract (topology B)
 
@@ -346,10 +355,35 @@ chain (not the §5.6 fast path):
 ```
 
 - `--quant-head`: quantizes the `lm_head` **weight** to INT8 per-channel while
-  leaving its activations FP16. The FP16 head is ~311 MB of the ~960 MB/token
-  decode stream; measured effect is **961 → 763 MB/token (−20.6%)** in the
-  converter's DDR summary, at unchanged quality (3/4 argmax = baseline).
-  Verify by grepping `read_total_bytes` in the build log.
+  leaving its activations FP16. Must be passed together with
+  `--keep-head-weight` (the build scripts forward it automatically) — without it
+  `filter_aimet_w8a16.py` strips the encoding and the converter silently emits
+  `Float_16`, producing a build byte-identical to a non-qh one. Verify, don't
+  assume: `qairt-dlc-info -i prefill.dlc | grep lm_head.weight` must show
+  `sFxp_8`, not `Float_16`.
+
+  What it actually buys, measured (2026-08-12):
+
+  | | value |
+  |---|---|
+  | `lm_head` size | 311.2 MB FP16 → 155.6 MB INT8 (151936 × 1024) |
+  | DLC | 1,074,293,920 → 922,965,680 B (**−151.3 MB**) ✅ |
+  | ctx-bin | 1,106,276,352 → 1,093,767,168 B (**−12.5 MB only**) ⚠️ |
+  | device, LADE mode | **9.3 vs 10.8 tok/s (−14%)** ❌ |
+  | quality | unchanged (3/4 argmax local; device parity confirmed) ✅ |
+
+  So ~139 MB of the saving reappears when the generator prepares the context
+  blob, and on device the variant is a **net regression** under LADE — the head
+  quantization costs ~10% n-gram acceptance, which dominates any per-call gain
+  (`reports/qwen3-0.6b-w8a16qh-ladekv-test-report.md`). Do not ship `qh` for
+  speculative decoding. It remains untested in AR-1 basic mode, where acceptance
+  is irrelevant.
+
+  ⚠️ Earlier revisions of this guide claimed "961 → 763 MB/token (−20.6%)" here.
+  That was wrong: both numbers come from `ctxbin-ws.log` of 2026-08-10 — the
+  prefill (763,410,432) and decode (961,130,496) `read_total_bytes` of one
+  *non-qh* weight-shared build, two days before `--quant-head` existed. No
+  converter DDR summary for a real qh build has been recorded.
 - `--weight-bw 4` (+ optional `--lpbq`, `--seq-mse`): **W4A16 is a dead end at
   0.6B.** All three recipes — per-channel int4, LPBQ block-64, LPBQ+SeqMSE —
   scored 0/4 on the `--eval` argmax gate that W8A16 passes 3/4
@@ -369,7 +403,9 @@ Device-free gates, in order; each has a known-good reference value:
 | Verify graph (lade) | `scripts/validate/parity_verify.py` | batched rows match HF, ~3e-05 |
 | Quant quality | `quantize_aimet.py … --eval` | last-token argmax agreement ≥ 3/4 prompts |
 | DLC shape | `qairt-dlc-info -i prefill.dlc \| grep logits` | `1,128,151936` — never `1,1,…` |
-| Ctx-bin | `qnn-context-binary-utility --json_file info.json` | all graphs listed; logits dims per §3.1; ~1.1 GB for 0.6B |
+| **Graph names** | `qnn-context-binary-utility --json_file info.json` → `info.graphs[].info.graphName` | exactly the names in **both** `htp_config.json` and `htp_backend_ext_config.json` — a mismatch silently reverts that graph to backend defaults (§3.4) |
+| Ctx-bin | `qnn-context-binary-utility --json_file info.json` | all graphs listed; logits dims per §3.1; ~1.09 GB for 0.6B (2- or 3-graph, weight-shared) |
+| Quantized head | `qairt-dlc-info -i prefill.dlc \| grep lm_head.weight` | `sFxp_8` if `--quant-head` was used, else `Float_16` (§5.7) |
 
 ## 7. Bundle and ship
 
@@ -451,7 +487,10 @@ environment.
 | Genie load error about duplicate graphs / KV quant params | Two graphs share an (AR, CL) pair, or DLCs came from different encodings runs (§3.3). |
 | HF upload progress frozen, sockets CLOSE-WAIT | Proxy drop — the watchdog handles it, but set `SOCKET_CHECKS=999999` (§7). If blobs are uploaded but commits never land: 429 rate limit (§7). |
 | HF repo unexpectedly public | `hf upload-large-folder` reset it — restore with `update_repo_settings(private=True)` (§7). |
-| WSL2 C: drive filling up | Build scripts call `disk_guard` (abort < 6 GB); compact the VHD from Windows if hit. |
+| WSL2 C: drive filling up | Call `disk_guard <need_gb>` (in `env.sh`) before every multi-GB step, **sized to that step**: 6 GB is the converter floor, a 4B export writes 8.6 GB and should ask 20. A flat 6 GB check passes and then still runs C: dry mid-step. No compaction step is needed to recover: the vhdx is sparse and `/` is mounted `discard`, so deleting in-guest returns the space to C:. (`ls` always reports the ~448 GB virtual size; `du -h <vhdx>` without `--apparent-size` is the real consumption.) |
+| WSL2 VM hard-crashes, no OOM line anywhere | C: ran dry and the vhdx grow failed. This is **not** ENOSPC — the guest still reports free space, the host write fails, and every mmap'd page takes SIGBUS; PID 1 dies and the VM dies with it (3× on 2026-08-12 during VL-4B stage 2). Dumps land in `%LOCALAPPDATA%\Temp\wsl-crashes`; the `-N` filename suffix is the signal, `-7` = SIGBUS. Prevention is `disk_guard`, above. |
+| `--quant-head` build looks identical to a normal one | `--keep-head-weight` missing → the encodings filter stripped the head encoding and the converter emitted `Float_16`. Check with `qairt-dlc-info \| grep lm_head.weight` (§5.7). |
+| Ctx-bin much larger than one DLC in a multi-graph build | Weight sharing not effective. A 3-graph 0.6B bin should be ~1.09 GB, not 1.8–2.2 GB — check `context.weight_sharing_enabled` in `configs/htp_config.json`. |
 
 ## 9. Map of the repo
 
@@ -471,7 +510,9 @@ environment.
 | `scripts/build/bundle.sh` | device bundle assembly |
 | `scripts/validate/parity_onnx.py`, `parity_qualla_read.py`, `parity_ladekv_read.py`, `parity_verify.py` | validation gates (§6) |
 | `scripts/util/hf_upload_watchdog.sh` | supervised HF upload |
+| `docs/REFERENCE.md` | **consolidated, corrected reference — start here** |
 | `docs/NOTES-genie-io.md` | the Genie contract with SDK source citations — read before touching graph I/O |
+| `docs/NOTES-vit-htp-config.md` | why graph names must appear in the backend config (§3.4) |
 | `docs/LOCAL_ENV.md` | environment provenance + progress log |
-| `reports/` | device test reports (v1 failure analysis, v2 validation) |
-| `SA8797P_Deployment_Status_Summary.md` | project-level status (authoritative) |
+| `reports/` | device test reports (v1 failure analysis, v2 validation, ladekv, qh) |
+| `SA8797P_Deployment_Status_Summary.md` | inherited remote-team status, 2026-08-09 — **partly superseded**, see its banner and `docs/REFERENCE.md` |
