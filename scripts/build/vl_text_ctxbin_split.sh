@@ -25,7 +25,10 @@ CL=${2:-128}
 CTX=${3:-2048}
 SPLIT=${4:-18}
 
-ONNX=$LLMDEPLOY_DATA/work/onnx/qwen3vl-4b-text-split
+# AIMET's own export, cut at the layer seam by split_aimet_onnx.py. NOT the
+# torch re-export: torch.onnx.export renames Linear weights, so only 72/198
+# param encodings would match and most layers would convert as FP16.
+ONNX=${ONNX:-$LLMDEPLOY_DATA/work/onnx/qwen3vl-4b-aimet-split}
 ENCDIR=$LLMDEPLOY_DATA/work/quant/$NAME-split-enc
 DLC=$LLMDEPLOY_DATA/work/dlc/$NAME-split
 CTXBIN=$LLMDEPLOY_DATA/work/ctxbin/$NAME-split
@@ -44,7 +47,7 @@ VTCM_MB=16           # step 3 reads them back out of each finalized binary and
 HVX_THREADS=4        # fails the build if the config did not bind
 
 for g in prefill_0 decode_0 prefill_1 decode_1; do
-    [ -f "$ONNX/$g/$g.onnx" ] || { echo "missing $ONNX/$g/$g.onnx -- run export_qwen3vl_text.py --split-at $SPLIT"; exit 1; }
+    [ -f "$ONNX/$g/$g.onnx" ] || { echo "missing $ONNX/$g/$g.onnx -- run split_aimet_onnx.py"; exit 1; }
 done
 for c in 0 1; do
     [ -f "$ENCDIR/chunk$c.encodings" ] || { echo "missing $ENCDIR/chunk$c.encodings -- run split_encodings.py"; exit 1; }
