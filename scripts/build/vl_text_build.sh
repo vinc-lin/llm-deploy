@@ -74,7 +74,13 @@ echo "== [3/5] decode export with prefill encodings (CTX=$CTX, past=$PAST) =="
     --out "$QD" "${Q[@]}"
 
 echo "== [4/5] encodings filter =="
-$PY "$LLMDEPLOY_ROOT/scripts/quant/filter_aimet_w8a16.py" "$QP/model.encodings"
+# --quant-head keeps lm_head's 8-bit weight quantizer; the filter strips every
+# lm_head encoding by default, so it must be told to spare that one param.
+HEAD_FLAG=()
+for f in "${EXTRA_FLAGS[@]}"; do
+    [ "$f" = "--quant-head" ] && HEAD_FLAG=(--keep-head-weight)
+done
+$PY "$LLMDEPLOY_ROOT/scripts/quant/filter_aimet_w8a16.py" "$QP/model.encodings" "${HEAD_FLAG[@]}"
 
 echo "== [5/5] canonical I/O rename (layers=$LAYERS) =="
 $PY "$LLMDEPLOY_ROOT/scripts/quant/rename_aimet_io.py" \

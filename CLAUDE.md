@@ -26,8 +26,16 @@ are a fatal Genie load error (KV quant params must be byte-identical).
 ## Hard contracts (violations = silent device garbage or SIGSEGV)
 
 - Prefill graphs MUST emit all-position logits `[1,AR,vocab]`.
-- Genie picks graphs by numeric (AR, CL) best-fit — names are cosmetic; never
-  ship two graphs with the same (AR, CL); avoid AR==CL (bertcache) graphs with lade.
+- Genie picks graphs by numeric (AR, CL) best-fit — names are cosmetic *to Genie*;
+  never ship two graphs with the same (AR, CL); avoid AR==CL (bertcache) graphs with lade.
+- **Graph names are NOT cosmetic to the HTP backend.** A graph's name is baked in
+  at conversion time from the `--output_path` basename, dots included: converting
+  to `decode.dlc.new` yields graph `decode_dlc`, and renaming the file afterwards
+  does NOT change it. `htp_backend_ext_config.json`'s `graph_names` must match the
+  names inside the ctx-bin exactly, or that graph silently gets backend defaults
+  (4 MB VTCM, 24 MB spill) — or, for lade, a null-pointer SIGSEGV on the first
+  speculation step. Always convert straight to the final filename, and verify with
+  `qnn-context-binary-utility --json_file` before bundling.
 - Read `docs/NOTES-genie-io.md` before touching graph topology or configs.
 
 ## Validation gates (run before shipping any bundle)

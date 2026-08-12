@@ -39,7 +39,13 @@ $PY "$LLMDEPLOY_ROOT/scripts/quant/quantize_aimet.py" --model "$MODEL" \
     ${QUANT_DEVICE:+--device "$QUANT_DEVICE"} "${EXTRA_FLAGS[@]}"
 
 echo "== [2/4] filter + rename =="
-$PY "$LLMDEPLOY_ROOT/scripts/quant/filter_aimet_w8a16.py" "$QP/model.encodings"
+# --quant-head keeps lm_head's 8-bit weight quantizer; the filter strips every
+# lm_head encoding by default, so it must be told to spare that one param.
+HEAD_FLAG=()
+for f in "${EXTRA_FLAGS[@]}"; do
+    [ "$f" = "--quant-head" ] && HEAD_FLAG=(--keep-head-weight)
+done
+$PY "$LLMDEPLOY_ROOT/scripts/quant/filter_aimet_w8a16.py" "$QP/model.encodings" "${HEAD_FLAG[@]}"
 $PY "$LLMDEPLOY_ROOT/scripts/quant/rename_aimet_io.py" \
     --model "$QP/model.onnx" --encodings "$QP/model_filtered.encodings" --layers 28
 
