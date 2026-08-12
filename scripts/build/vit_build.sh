@@ -15,7 +15,7 @@
 # config_file_path relative to cwd). Device/graph values (v81, unsigned PD,
 # vtcm_mb 16, O=3, hvx_threads 4) are carried over unchanged; the text-only
 # extras (weight sharing, extended_udma, sparse_weights_compression) are
-# dropped.
+# dropped. Measurements and precedent: docs/NOTES-vit-htp-config.md.
 #
 # Usage: vit_build.sh [name]
 set -euo pipefail
@@ -26,7 +26,11 @@ ONNX=$LLMDEPLOY_DATA/work/onnx/qwen3vl-4b-vit/vit.onnx
 DLC=$LLMDEPLOY_DATA/work/dlc/$NAME
 CTXBIN=$LLMDEPLOY_DATA/work/ctxbin/$NAME
 CONVERTER="$QAIRT_SDK/bin/x86_64-linux-clang/qairt-converter"
-GRAPH=vit            # ctx-bin graph name == DLC basename
+GRAPH=vit            # ctx-bin graph name == DLC basename -- ASSERTED in step 3,
+                     # because the backend-extension config keys on this name
+OPT_LEVEL=3          # these three are what the generated config exists to secure;
+VTCM_MB=16           # step 3 reads them back out of the finalized binary and
+HVX_THREADS=4        # fails the build if the config did not bind
 
 [ -f "$ONNX" ] || { echo "missing $ONNX -- run export_qwen3vl_vit.py first"; exit 1; }
 
@@ -46,9 +50,9 @@ cat > "$CTXBIN/htp_backend_config.json" <<JSONEOF
       "graph_names": [
         "$GRAPH"
       ],
-      "O": 3,
-      "vtcm_mb": 16,
-      "hvx_threads": 4,
+      "O": $OPT_LEVEL,
+      "vtcm_mb": $VTCM_MB,
+      "hvx_threads": $HVX_THREADS,
       "fp16_relaxed_precision": 0
     }
   ],
@@ -85,14 +89,51 @@ qnn-context-binary-generator \
     --output_dir "$CTXBIN" --binary_file "${NAME}_ctx" \
     --config_file htp_config.json
 
-echo "== [3/3] dump graph info =="
+echo "== [3/3] dump graph info and verify the config bound =="
 qnn-context-binary-utility --context_binary "$CTXBIN/${NAME}_ctx.bin" \
     --json_file "$CTXBIN/info.json"
 $PY_DEPLOY - <<PYEOF
 import json
+import sys
+
 d = json.load(open("$CTXBIN/info.json"))
-for g in d["info"]["graphs"]:
+graphs = d["info"]["graphs"]
+for g in graphs:
     print("GRAPH:", g["info"]["graphName"])
+
+# A backend-extension config that fails to bind does not error -- the graph just
+# compiles with defaults (O=0, vtcm 4 MB, 0 HVX threads) and the log stays clean.
+# That exact silent regression shipped once already: verify32 omitted from
+# graph_names, 4 MB VTCM + 24 MB spill on device, LADE SIGSEGV
+# (docs/BUILD_GUIDE.md section 5.4b). With no device, this readback is the only
+# place it is detectable, so it is a build failure, not a warning.
+errs = []
+if len(graphs) != 1:
+    errs.append("expected 1 graph, found %d: %r"
+                % (len(graphs), [g["info"]["graphName"] for g in graphs]))
+else:
+    info = graphs[0]["info"]
+    if info["graphName"] != "$GRAPH":
+        errs.append("graphName is %r, expected %r -- graph_names in "
+                    "htp_backend_config.json keys on that string, so the config "
+                    "bound to nothing" % (info["graphName"], "$GRAPH"))
+    blob = info.get("graphBlobInfo", {}).get("info", {})
+    for key, want in (("optimizationLevel", $OPT_LEVEL),
+                      ("vtcmSize", $VTCM_MB),
+                      ("numHvxThreads", $HVX_THREADS)):
+        if blob.get(key) != want:
+            errs.append("%s is %r, expected %r" % (key, blob.get(key), want))
+
+if errs:
+    print("BUILD REJECTED: htp_backend_config.json did not take effect")
+    for e in errs:
+        print("  - " + e)
+    print("  see docs/NOTES-vit-htp-config.md")
+    sys.exit(1)
+
+blob = graphs[0]["info"]["graphBlobInfo"]["info"]
+print("CONFIG BOUND: O=%d vtcm=%d MB hvx_threads=%d"
+      % (blob["optimizationLevel"], blob["vtcmSize"], blob["numHvxThreads"]))
 PYEOF
 ls -lh "$CTXBIN"
 echo "VIT BUILD COMPLETE: $CTXBIN/${NAME}_ctx.bin"
