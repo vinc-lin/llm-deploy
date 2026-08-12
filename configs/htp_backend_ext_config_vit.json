@@ -1,0 +1,25 @@
+{
+  "graphs": [
+    {
+      "graph_names": [
+        "vit"
+      ],
+      "O": 3,
+      "vtcm_mb": 16,
+      "hvx_threads": 4
+    }
+  ],
+  "devices": [
+    {
+      "dsp_arch": "v81",
+      "pd_session": "unsigned",
+      "cores": [
+        {
+          "core_id": 0,
+          "perf_profile": "burst",
+          "rpc_polling_time": 9999
+        }
+      ]
+    }
+  ]
+}
