@@ -23,10 +23,17 @@ fi
 # every process touching an mmap'd page. That killed PID 1 and hard-crashed the
 # VM three times on 2026-08-12. Lives here, not per-script, so a new build script
 # cannot forget it. Pass the GB the NEXT step writes; 6 is the converter floor.
+# Guard the volume the writes actually land on: on WSL that is Windows C:, since
+# the guest's own df reports the vhdx's virtual free space and not the host's;
+# off WSL (e.g. tank) there is no vhdx indirection, so check the data volume.
 disk_guard() {
-    local need_gb=${1:-6} free_gb
-    free_gb=$(df --output=avail -BG /mnt/c | tail -1 | tr -dc 0-9)
+    local need_gb=${1:-6} free_gb target
+    if [ -d /mnt/c ]; then target=/mnt/c; else target=$LLMDEPLOY_DATA; fi
+    free_gb=$(df --output=avail -BG "$target" 2>/dev/null | tail -1 | tr -dc 0-9)
+    if [ -z "$free_gb" ]; then
+        echo "ABORT: disk_guard cannot read free space on $target" >&2; exit 1
+    fi
     if (( free_gb < need_gb )); then
-        echo "ABORT: C: free space ${free_gb}GB < ${need_gb}GB" >&2; exit 1
+        echo "ABORT: $target free space ${free_gb}GB < ${need_gb}GB" >&2; exit 1
     fi
 }
