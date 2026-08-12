@@ -127,6 +127,60 @@ def vl_batches(path, cfg, S, n_deepstack, device, split):
     return out
 
 
+def suppress_torch_model_dump():
+    """Stop quantsim.export writing the model.pth nobody reads.
+
+    export() builds `model_to_export` for the ONNX export and, on the way,
+    torch.save()s it as <prefix>.pth. Nothing in this repo consumes that file
+    -- the chain is model.onnx + model.encodings -> rename -> converter -- and
+    AIMET itself DeprecationWarns the dump on every call. It is one full fp32
+    copy of the graph: 2.80 GiB at 0.6B, 15.0 GiB at 4B, per graph, written to
+    the ext4.vhdx whose growth failure delivered SIGBUS to PID 1 on 2026-08-12.
+
+    Flipping the module flag skips only the torch.save; model_to_export is
+    still built and still exported to ONNX, so model.onnx / model.encodings /
+    model_torch.encodings come out byte-identical (verified on Qwen3-0.6B).
+    """
+    import aimet_torch._base.quantsim as _qs
+    _qs._SAVE_TORCH_MODEL_DURING_EXPORT = False
+    print("lean-export: model.pth dump disabled")
+
+
+def drop_export_scratch(out):
+    """Delete the all-markers scratch export that quantsim.export leaves behind.
+
+    set_node_names() renders the graph a second time with marker nodes at every
+    module level, as temp_onnx_model_with_all_markers.onnx plus ONE EXTERNAL
+    FILE PER INITIALIZER, and never cleans up. On 0.6B that is 198 files
+    totalling 2.80 GiB -- as much as the real export -- and it scales with the
+    model: ~15 GiB at 4B, per graph.
+
+    The keep-set is derived from the shipped model.onnx itself rather than from
+    a hardcoded name pattern: whatever external files it references are load-
+    bearing, everything else in the directory is scratch. On 0.6B the two sets
+    are provably disjoint (model.onnx -> 1 uuid .data file; the marker model ->
+    198 per-tensor files; overlap 0), so this cannot strand the real weights.
+    """
+    from onnx.external_data_helper import _get_all_tensors
+    import onnx as _onnx
+    out = Path(out)
+    model = out / "model.onnx"
+    if not model.exists():
+        return
+    m = _onnx.load(str(model), load_external_data=False)
+    keep = {e.value for t in _get_all_tensors(m)
+            for e in t.external_data if e.key == "location"}
+    keep |= {"model.onnx", "model.encodings", "model_torch.encodings"}
+    freed = n = 0
+    for f in out.iterdir():
+        if f.is_file() and f.name not in keep:
+            freed += f.stat().st_size
+            f.unlink()
+            n += 1
+    print(f"lean-export: removed {n} scratch files, {freed / 2**30:.2f} GiB; "
+          f"kept {len(keep)} artifacts")
+
+
 def _quantized_modules(sim):
     from aimet_torch.v2.nn import BaseQuantizationMixin
     for name, m in sim.model.named_modules():
@@ -243,6 +297,11 @@ def main():
                          "docstring). Requires --vl-calib for the calibration windows.")
     ap.add_argument("--n-deepstack", type=int, default=3,
                     help="--vl-text: number of deepstack_visual_embed_i inputs")
+    ap.add_argument("--lean-export", action="store_true",
+                    help="do not leave quantsim's two disposable full-size "
+                         "copies (model.pth, all-markers scratch export) on "
+                         "disk: 66%% of the export bytes at 0.6B, ~30GB per "
+                         "graph at 4B. Shipped artifacts are unchanged.")
     ap.add_argument("--vl-calib",
                     help="--vl-text: .npz of multimodal calibration/eval windows "
                          "(scripts/quant/vl_calib_build.py)")
@@ -438,12 +497,20 @@ def main():
     # 0.6B is ~2.4GB). Force the external-data path unconditionally.
     import aimet_torch.onnx_utils as _onnx_utils
     _onnx_utils._onnx_model_size_larger_than_max_protobuf = lambda _m: True
-    # NOTE: do NOT try to save memory here by patching onnx.load globally to skip
-    # external data. aimet_torch.onnx_utils.restore_onnx_graph_initializers reads
-    # initializer VALUES (-> numpy_helper.to_array) and dies with
-    #   ValidationError: Data of TensorProto (tensor name: norm.weight) should be
-    #   stored in <uuid>.data, but it doesn't exist or is not accessible
-    # Measured on Qwen3-0.6B, 2026-08-12.
+    # NOTE: do NOT try to save memory here by making onnx.load skip external
+    # data -- not globally, and not scoped to aimet_torch._base.quantsim either.
+    # The re-read at _base/quantsim.py:1084 looks like a names-only lookup, but
+    # with the default encoding_version 1.0.0 the ModelProto is forwarded to
+    # _export_encodings_to_1_0_0 -> _derive_const_rescale_op_output_encodings,
+    # which calls numpy_helper.to_array on Mul/Div operands to decide which are
+    # constant scalars. Withhold the data and it dies with
+    #   ValidationError: Data of TensorProto (tensor name: norm.weight) should
+    #   be stored in <uuid>.data, but it doesn't exist or is not accessible
+    # Both variants measured on Qwen3-0.6B, 2026-08-12; the scoped one also
+    # bought nothing -- peak RSS 13.64 GB vs 13.57 GB baseline, because that
+    # read happens after the export's real high-water mark, not at it.
+    if args.lean_export:
+        suppress_torch_model_dump()
     dummy = tuple(t.cpu() for t in dummy)
     del model                     # export needs only sim.model; frees ~16 GB at 4B
     gc.collect()
@@ -456,6 +523,8 @@ def main():
     except OSError:
         pass
     sim.export(str(out), "model", dummy_input=dummy)
+    if args.lean_export:
+        drop_export_scratch(out)
     print(f"exported quantsim to {out} (model.onnx + model.encodings)")
 
 
