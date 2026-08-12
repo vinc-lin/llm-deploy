@@ -14,8 +14,23 @@ Reconstructed from SA8797P_Deployment_Status_Summary.md §2.2:
 
 Written against the AIMET v1-style API (aimet_torch.quantsim). If the installed
 aimet-torch 2.x rejects these calls, see docs/LOCAL_ENV.md for the version pin.
+
+--vl-text switches the whole run to the Qwen3-VL text tower (Stage 2). It is
+strictly opt-in: with the flag absent every code path below is the plain-Qwen3
+one, byte-for-byte. What the flag changes:
+  - checkpoint class Qwen3VLForConditionalGeneration, config = cfg.text_config
+  - wrapper built by ExportQwen3.from_hf_vl_text (embeddings-in + deepstack)
+  - the graph's first input is inputs_embeds [1, 1, AR, H], not input_ids, so
+    calibration feeds EMBEDDINGS -- taken from a prebuilt multimodal window set
+    (scripts/quant/vl_calib_build.py) with real ViT features spliced in
+  - n_deepstack extra [1, 1, AR, H] inputs, which sit BETWEEN cos/sin and the
+    past-KV tail in forward order (see ExportQwen3.forward)
+The cross-graph encodings lineage (--export-decode / --adopt-encodings) is
+untouched: the decode graph still adopts the prefill run's encodings verbatim,
+which is what keeps the KV quant params byte-identical across graphs.
 """
 import argparse
+import gc
 import os
 import sys
 from pathlib import Path
@@ -39,6 +54,77 @@ CALIB_PROMPTS = [
     "SELECT name, COUNT(*) FROM users GROUP BY name;",
     "深度学习模型的量化是指将浮点权重转换为低比特整数表示。",
 ]
+
+EVAL_PROMPTS = ["The capital of France is", "def fibonacci(n):",
+                "解释一下什么是注意力机制。", "1+2+3+...+100 ="]
+
+
+def text_batches(tok, cfg, prompts, S, device):
+    """(input_ids, attention_mask, cos, sin) windows for the plain text tower.
+
+    The prompt is RIGHT-aligned in the S-slot window and the pad columns are
+    masked out -- unchanged from the original inline construction, which lived
+    in three copies (calibrate / seq_mse / eval); this is that same code, once.
+    Returned per sample: (forward-args tuple, n_valid, label). n_valid == S
+    because right-alignment puts the last real token in the last row, so the
+    eval read at row n_valid-1 is the window's last row, as before.
+    """
+    batches = []
+    for p in prompts:
+        ids = tok(p, return_tensors="pt").input_ids[:, :S]
+        n = ids.shape[1]
+        padded = torch.zeros(1, S, dtype=torch.int32, device=device)
+        padded[0, -n:] = ids[0]
+        cmask = causal_mask(S, S).to(device)  # rank-3 [1, S, S]
+        cmask[:, :, : S - n] = -100.0
+        pos = torch.cat([torch.zeros(S - n, dtype=torch.long), torch.arange(n)])
+        c, s_ = rope_tables(pos, cfg.head_dim, rope_theta_of(cfg))
+        batches.append(((padded, cmask, c.to(device), s_.to(device)), S, p))
+    return batches
+
+
+def vl_batches(path, cfg, S, n_deepstack, device, split):
+    """Multimodal windows for the VL text tower, built by vl_calib_build.py.
+
+    Each window is one AR-sized prefill window exactly as qualla feeds it:
+    content LEFT-aligned, pad slots carrying the pad-token embedding, pad rows
+    masked out (nsp-model.cpp:1994-2016). inputs_embeds carries real token
+    embeddings with real ViT image features spliced onto the image-token
+    positions; the deepstack tensors are non-zero on exactly that span.
+
+    The zero-padding contract is load-bearing and re-checked here, not just in
+    the builder: a deepstack tensor that is non-zero off the visual span adds
+    visual features onto text tokens, which is silent garbage rather than an
+    error. Returns (forward-args tuple, n_valid, label) per window.
+    """
+    import numpy as np
+    with np.load(path) as f:
+        # NpzFile decompresses a whole array on every __getitem__, so pull each
+        # key exactly once rather than per sample.
+        d = {k: f[k] for k in f.files}
+    H = cfg.hidden_size
+    assert int(d["hidden"]) == H, f"calib hidden {int(d['hidden'])} != model {H}"
+    assert int(d["ar"]) == S, f"calib AR {int(d['ar'])} != --cl-prefill {S}"
+    assert int(d["n_deepstack"]) == n_deepstack, (
+        f"calib has {int(d['n_deepstack'])} deepstack levels, need {n_deepstack}")
+    out = []
+    for i, sp in enumerate(d["split"]):
+        if str(sp) != split:
+            continue
+        vis = torch.from_numpy(d["vis_mask"][i])                    # [AR] bool
+        deep = [torch.from_numpy(d["deep"][i, j]) for j in range(n_deepstack)]
+        for j, t in enumerate(deep):
+            off = t.reshape(S, H)[~vis]
+            assert not off.any(), (
+                f"sample {i} deepstack level {j}: {int((off != 0).sum())} non-zero "
+                "elements outside the visual span -- the graph would add visual "
+                "features onto text tokens")
+        args_ = [torch.from_numpy(d["embeds"][i]), torch.from_numpy(d["mask"][i]),
+                 torch.from_numpy(d["cos"][i]), torch.from_numpy(d["sin"][i])] + deep
+        out.append((tuple(a.to(device) for a in args_),
+                    int(d["n_valid"][i]), str(d["desc"][i])))
+    assert out, f"no '{split}' windows in {path}"
+    return out
 
 
 def _quantized_modules(sim):
@@ -152,7 +238,20 @@ def main():
                          "previous prefill run of the same variant (graph-shape-only "
                          "rebuilds — keeps every scale bit-identical to the existing "
                          "decode/verify DLCs so they can be reused as-is)")
+    ap.add_argument("--vl-text", action="store_true",
+                    help="Qwen3-VL text tower: embeddings-in + deepstack (see module "
+                         "docstring). Requires --vl-calib for the calibration windows.")
+    ap.add_argument("--n-deepstack", type=int, default=3,
+                    help="--vl-text: number of deepstack_visual_embed_i inputs")
+    ap.add_argument("--vl-calib",
+                    help="--vl-text: .npz of multimodal calibration/eval windows "
+                         "(scripts/quant/vl_calib_build.py)")
     args = ap.parse_args()
+    if args.vl_text and not args.vl_calib:
+        # the windows are needed to calibrate, and (except on the decode path,
+        # where --eval is a no-op) to evaluate
+        assert args.export_decode or (args.adopt_encodings and not args.eval), (
+            "--vl-text needs --vl-calib (multimodal calibration/eval windows)")
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from aimet_common.defs import QuantScheme
@@ -180,34 +279,58 @@ def main():
                 return ret
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    hf = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32)
-    cfg = hf.config
+    if args.vl_text:
+        from transformers import Qwen3VLForConditionalGeneration
+        hf = Qwen3VLForConditionalGeneration.from_pretrained(
+            args.model, dtype=torch.float32, attn_implementation="eager").eval()
+        cfg = hf.config.text_config      # 36 layers, 2560 hidden, 32/8 heads, hd 128
+    else:
+        hf = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32)
+        cfg = hf.config
     S = args.cl_prefill
+
+    def build_wrapper(use_past):
+        # logits_last_only MUST be False: Genie's basic dialog left-aligns input
+        # and samples logits row n_process-1 (qualla nsp-model.cpp:3295) — a
+        # last-only head reads out of bounds on device (2026-08-11 root cause).
+        if args.vl_text:
+            return ExportQwen3.from_hf_vl_text(
+                hf, args.fuse_gate_up, args.fuse_qkv, use_past=use_past,
+                logits_last_only=False, n_deepstack=args.n_deepstack)
+        return ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
+                                   use_past=use_past, logits_last_only=False)
+
+    def head_dummies(ar):
+        """The graph inputs that bracket mask/cos/sin: the token-or-embedding
+        input, and (VL only) the deepstack tensors, which precede the past-KV
+        tail in ExportQwen3.forward's variadic order."""
+        if args.vl_text:
+            return (torch.zeros(1, 1, ar, cfg.hidden_size, device=args.device),
+                    [torch.zeros(1, 1, ar, cfg.hidden_size, device=args.device)
+                     for _ in range(args.n_deepstack)])
+        return torch.zeros(1, ar, dtype=torch.int32, device=args.device), []
+
     if args.export_decode:
         ar = args.decode_ar
         past = args.ctx + S - ar  # total window (past + ar) stays ctx + cl_prefill
-        model = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
-                                    use_past=True, logits_last_only=False).to(args.device)
+        model = build_wrapper(use_past=True).to(args.device)
         n_kv, hd = cfg.num_key_value_heads, cfg.head_dim
         mask = torch.zeros(1, ar, past + ar, device=args.device)
         cos, sin = rope_tables(torch.arange(past, past + ar), cfg.head_dim, rope_theta_of(cfg))
-        dummy = [torch.zeros(1, ar, dtype=torch.int32, device=args.device),
-                 mask, cos.to(args.device), sin.to(args.device)]
+        first, deep = head_dummies(ar)
+        dummy = [first, mask, cos.to(args.device), sin.to(args.device), *deep]
         for _ in range(cfg.num_hidden_layers):
             dummy += [torch.zeros(1, n_kv, hd, past, device=args.device),
                       torch.zeros(1, n_kv, past, hd, device=args.device)]
         dummy = tuple(dummy)
     else:
-        # logits_last_only MUST be False: Genie's basic dialog left-aligns input
-        # and samples logits row n_process-1 (qualla nsp-model.cpp:3295) — a
-        # last-only head reads out of bounds on device (2026-08-11 root cause).
-        model = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
-                                    use_past=False, logits_last_only=False).to(args.device)
+        model = build_wrapper(use_past=False).to(args.device)
         mask = causal_mask(S, S).to(args.device)
         cos, sin = rope_tables(torch.arange(S), cfg.head_dim, rope_theta_of(cfg))
-        dummy_ids = torch.zeros(1, S, dtype=torch.int32, device=args.device)
-        dummy = (dummy_ids, mask, cos.to(args.device), sin.to(args.device))
+        first, deep = head_dummies(S)
+        dummy = (first, mask, cos.to(args.device), sin.to(args.device), *deep)
     del hf
+    gc.collect()   # the VL checkpoint is ~17.6 GB fp32; do not wait for cycles
 
     sim = QuantizationSimModel(
         model,
@@ -247,19 +370,6 @@ def main():
                     kept += 1
         print(f"weight_bw={args.weight_bw}: kept {kept} attention projections at 8-bit")
 
-    def calibrate(m, _):
-        with torch.no_grad():
-            for p in CALIB_PROMPTS:
-                ids = tok(p, return_tensors="pt").input_ids[:, :S]
-                n = ids.shape[1]
-                padded = torch.zeros(1, S, dtype=torch.int32, device=args.device)
-                padded[0, -n:] = ids[0]
-                cmask = causal_mask(S, S).to(args.device)  # rank-3 [1, S, S]
-                cmask[:, :, : S - n] = -100.0
-                pos = torch.cat([torch.zeros(S - n, dtype=torch.long), torch.arange(n)])
-                c, s_ = rope_tables(pos, cfg.head_dim, rope_theta_of(cfg))
-                m(padded, cmask, c.to(args.device), s_.to(args.device))
-
     if args.export_decode:
         # No calibration: adopt the prefill run's encodings so every shared
         # tensor (weights, activations, KV path) has IDENTICAL scales across
@@ -273,52 +383,48 @@ def main():
         sim.load_encodings(str(Path(args.adopt_encodings) / "model_torch.encodings"),
                            strict=False)
     else:
+        if args.vl_text:
+            batches = [b for b, _, _ in vl_batches(args.vl_calib, cfg, S,
+                                                   args.n_deepstack, args.device, "calib")]
+            print(f"calibration: {len(batches)} multimodal windows from {args.vl_calib}")
+        else:
+            batches = [b for b, _, _ in text_batches(tok, cfg, CALIB_PROMPTS, S, args.device)]
         if args.seq_mse:
             # Sequential MSE picks per-layer optimal weight-encoding candidates
             # by minimizing activation MSE — Qualcomm's documented make-or-break
             # step for W4 LLM recipes. Must run BEFORE compute_encodings (it
             # freezes the chosen param encodings).
             from aimet_torch.seq_mse import apply_seq_mse
-            batches = []
-            with torch.no_grad():
-                for p in CALIB_PROMPTS:
-                    ids = tok(p, return_tensors="pt").input_ids[:, :S]
-                    n = ids.shape[1]
-                    padded = torch.zeros(1, S, dtype=torch.int32, device=args.device)
-                    padded[0, -n:] = ids[0]
-                    cmask = causal_mask(S, S).to(args.device)
-                    cmask[:, :, : S - n] = -100.0
-                    pos = torch.cat([torch.zeros(S - n, dtype=torch.long),
-                                     torch.arange(n)])
-                    c, s_ = rope_tables(pos, cfg.head_dim, rope_theta_of(cfg))
-                    batches.append((padded, cmask, c.to(args.device), s_.to(args.device)))
             apply_seq_mse(sim=sim, data_loader=batches)
             print(f"seq_mse applied over {len(batches)} calibration batches")
+
+        def calibrate(m, _):
+            with torch.no_grad():
+                for i, b in enumerate(batches):
+                    m(*b)
+                    print(f"  calib {i + 1}/{len(batches)}", flush=True)
+
         sim.compute_encodings(calibrate, None)
         clip_weights_to_7f7f(sim)
 
     if args.eval and not args.export_decode:
-        eval_prompts = ["The capital of France is", "def fibonacci(n):",
-                        "解释一下什么是注意力机制。", "1+2+3+...+100 ="]
+        if args.vl_text:
+            samples = vl_batches(args.vl_calib, cfg, S, args.n_deepstack,
+                                 args.device, "eval")
+        else:
+            samples = text_batches(tok, cfg, EVAL_PROMPTS, S, args.device)
         agree = 0
-        for p in eval_prompts:
-            ids = tok(p, return_tensors="pt").input_ids[:, :S]
-            n = ids.shape[1]
-            padded = torch.zeros(1, S, dtype=torch.int32, device=args.device)
-            padded[0, -n:] = ids[0]
-            cmask = causal_mask(S, S).to(args.device)
-            cmask[:, :, : S - n] = -100.0
-            pos = torch.cat([torch.zeros(S - n, dtype=torch.long), torch.arange(n)])
-            c, s_ = rope_tables(pos, cfg.head_dim, rope_theta_of(cfg))
-            c, s_ = c.to(args.device), s_.to(args.device)
+        for b, n_valid, label in samples:
             with torch.no_grad():
-                q_logits = sim.model(padded, cmask, c, s_)[0][0, -1]
-                f_logits = model(padded, cmask, c, s_)[0][0, -1]
+                # qualla samples row n_process-1; for the right-aligned text
+                # windows n_valid == S, i.e. the window's last row, as before.
+                q_logits = sim.model(*b)[0][0, n_valid - 1]
+                f_logits = model(*b)[0][0, n_valid - 1]
             top1 = q_logits.argmax().item() == f_logits.argmax().item()
             agree += int(top1)
-            print(f"[eval] {p!r}: quant argmax {'==' if top1 else '!='} fp32 argmax; "
+            print(f"[eval] {label!r}: quant argmax {'==' if top1 else '!='} fp32 argmax; "
                   f"max|dlogits|={float((q_logits - f_logits).abs().max()):.3f}")
-        print(f"[eval] last-token argmax agreement: {agree}/{len(eval_prompts)}")
+        print(f"[eval] last-token argmax agreement: {agree}/{len(samples)}")
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -332,7 +438,24 @@ def main():
     # 0.6B is ~2.4GB). Force the external-data path unconditionally.
     import aimet_torch.onnx_utils as _onnx_utils
     _onnx_utils._onnx_model_size_larger_than_max_protobuf = lambda _m: True
-    sim.export(str(out), "model", dummy_input=tuple(t.cpu() for t in dummy))
+    # NOTE: do NOT try to save memory here by patching onnx.load globally to skip
+    # external data. aimet_torch.onnx_utils.restore_onnx_graph_initializers reads
+    # initializer VALUES (-> numpy_helper.to_array) and dies with
+    #   ValidationError: Data of TensorProto (tensor name: norm.weight) should be
+    #   stored in <uuid>.data, but it doesn't exist or is not accessible
+    # Measured on Qwen3-0.6B, 2026-08-12.
+    dummy = tuple(t.cpu() for t in dummy)
+    del model                     # export needs only sim.model; frees ~16 GB at 4B
+    gc.collect()
+    # glibc keeps freed arenas mapped; at 4B that is 16 GB the export stage would
+    # otherwise have to grow around. Ask for it back explicitly (allocator hint
+    # only — it cannot change any tensor value).
+    import ctypes
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass
+    sim.export(str(out), "model", dummy_input=dummy)
     print(f"exported quantsim to {out} (model.onnx + model.encodings)")
 
 
