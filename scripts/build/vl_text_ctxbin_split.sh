@@ -168,6 +168,11 @@ echo "== verify both binaries =="
 $PY_DEPLOY - <<PYEOF
 import json, sys
 
+# Per-chunk floor for sharedWeightsSize. Chunk 0 is 18 layers at W8 (~1.7 GB);
+# chunk 1 adds the FP16 lm_head. Set below the expected value, not at it, so
+# the check flags a collapse rather than policing normal variation.
+MIN_SHARED_GB = {0: 1.4, 1: 2.0}
+
 errs = []
 for c in (0, 1):
     part = c + 1
@@ -195,8 +200,16 @@ for c in (0, 1):
     for info in graphs.values():
         v2 = info.get("graphBlobInfoV2", {})
         shared = max(shared, (v2.get("info", v2) or {}).get("sharedWeightsSize", 0) or 0)
-    if shared <= 0:
-        errs.append(f"{part}_of_2 sharedWeightsSize {shared} -- weight sharing did not engage")
+    # "> 0" is far too weak: a build that shares only lm_head reports ~0.7 GB
+    # and passes, while duplicating every layer. The two graphs in a chunk hold
+    # the SAME weights, so sharing must account for most of one DLC. Reference:
+    # the shipped 0.6B/1.7B two-graph builds share 0.99 GB and 1.16 GB, i.e.
+    # essentially their whole weight set.
+    floor = MIN_SHARED_GB[c] * 2**30
+    if shared < floor:
+        errs.append(f"{part}_of_2 sharedWeightsSize {shared/2**30:.3f} GB < {MIN_SHARED_GB[c]} GB "
+                    f"-- weight sharing barely engaged, so the binary carries both "
+                    f"graphs' weights separately")
 
     for name, info in sorted(graphs.items()):
         ins = {t["info"]["name"] for t in info.get("graphInputs", [])}
