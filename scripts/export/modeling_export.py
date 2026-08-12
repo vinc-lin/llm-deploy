@@ -180,20 +180,34 @@ class ExportQwen3(nn.Module):
     """
 
     def __init__(self, cfg, fuse_gate_up=False, fuse_qkv=False, use_past=True, logits_last_only=False,
-                 input_embeds=False, n_deepstack=0):
+                 input_embeds=False, n_deepstack=0, n_layers=None, is_first=True, is_last=True):
         super().__init__()
         self.cfg = cfg
         self.use_past = use_past
         self.logits_last_only = logits_last_only
         self.input_embeds = input_embeds
         self.n_deepstack = n_deepstack
+        # Chunked (multi-ctx-bin) export: a 4B tower at W8A16 estimates 4.18 GiB
+        # and qnn-context-binary-generator rejects anything over 3.5 GiB per
+        # graph, so the layer stack is split across ctx-bins. A middle chunk
+        # takes hidden states in and hands hidden states out; only the first
+        # chunk owns the embedding path and only the last owns norm + lm_head.
+        # Defaults keep the whole-model behaviour byte-for-byte.
+        self.is_first = is_first
+        self.is_last = is_last
+        n_layers = cfg.num_hidden_layers if n_layers is None else n_layers
         # embeddings-in: the runtime owns the token LUT, keep it out of the graph
-        self.embed_tokens = None if input_embeds else nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.layers = nn.ModuleList(
-            [ExportLayer(cfg, fuse_gate_up, fuse_qkv) for _ in range(cfg.num_hidden_layers)]
+        self.embed_tokens = (
+            nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+            if (is_first and not input_embeds) else None
         )
-        self.norm = ExportRMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.layers = nn.ModuleList(
+            [ExportLayer(cfg, fuse_gate_up, fuse_qkv) for _ in range(n_layers)]
+        )
+        # Weights the chunk does not own must not exist, or they land in its
+        # ctx-bin as dead payload -- lm_head alone is 389 M params.
+        self.norm = ExportRMSNorm(cfg.hidden_size, cfg.rms_norm_eps) if is_last else None
+        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False) if is_last else None
 
     def forward(self, input_ids, attention_mask, position_ids_cos, position_ids_sin, *rest):
         # variadic tail: deepstack tensors first, then past-KV pairs. With the
@@ -201,8 +215,11 @@ class ExportQwen3(nn.Module):
         deep = rest[: self.n_deepstack]
         past = rest[self.n_deepstack:]
 
-        x = input_ids if self.input_embeds else self.embed_tokens(input_ids.to(torch.long))
-        if self.input_embeds and x.dim() == 4:
+        # A non-first chunk is fed `last_hidden_states` from the previous chunk,
+        # which is already [B, S, H] -- same handling as embeddings-in.
+        hidden_in = self.input_embeds or not self.is_first
+        x = input_ids if hidden_in else self.embed_tokens(input_ids.to(torch.long))
+        if hidden_in and x.dim() == 4:
             x = x.squeeze(1)   # Genie's documented [1,1,AR,H] -> [B,S,H]
         new_kv = []
         for i, layer in enumerate(self.layers):
@@ -221,6 +238,14 @@ class ExportQwen3(nn.Module):
             if i < self.n_deepstack:
                 d = deep[i]
                 x = x + (d.squeeze(1) if d.dim() == 4 else d)
+        if not self.is_last:
+            # Boundary tensor. Genie connects splits implicitly by NAME -- an
+            # input matching a previous split's output name is the same buffer
+            # (nsp-model.cpp:1453) -- and it does NOT check that their shapes
+            # agree ("Missing check : Shape of tensor between splits match up",
+            # nsp-graph.cpp:229). The exporter names this `last_hidden_states`
+            # on both sides; see docs/NOTES-genie-splits.md.
+            return (x, *new_kv)
         x = self.norm(x)
         if self.logits_last_only:
             x = x[:, -1:, :]
@@ -228,12 +253,16 @@ class ExportQwen3(nn.Module):
         return (logits, *new_kv)
 
     @staticmethod
-    def _map_layers(dst, src, prefix, n_layers, fuse_gate_up, fuse_qkv):
+    def _map_layers(dst, src, prefix, n_layers, fuse_gate_up, fuse_qkv, src_offset=0):
         """Copy the decoder-layer weights. `prefix` is the source tower prefix:
         'model.' for plain Qwen3, 'model.language_model.' for the Qwen3-VL text
-        tower (the two towers are architecturally identical)."""
+        tower (the two towers are architecturally identical).
+
+        `src_offset` shifts the SOURCE index for chunked exports: a chunk's
+        modules are always local 0..n-1, but its weights come from global
+        src_offset..src_offset+n-1."""
         for i in range(n_layers):
-            s = f"{prefix}layers.{i}."
+            s = f"{prefix}layers.{src_offset + i}."
             d = f"layers.{i}."
             dst[d + "input_layernorm.weight"] = src[s + "input_layernorm.weight"]
             dst[d + "post_attention_layernorm.weight"] = src[s + "post_attention_layernorm.weight"]
@@ -274,24 +303,42 @@ class ExportQwen3(nn.Module):
 
     @staticmethod
     def from_hf_vl_text(hf_vl, fuse_gate_up=False, fuse_qkv=False, use_past=True,
-                        logits_last_only=False, n_deepstack=3):
+                        logits_last_only=False, n_deepstack=3, layer_range=None):
         """Qwen3-VL text tower: embeddings-in + deepstack.
 
         Architecturally identical to plain Qwen3 text, so it reuses ExportQwen3
         wholesale; only the checkpoint prefix and the two new modes differ. The
         embedding table is deliberately NOT loaded -- the runtime does the token
         lookup from an external LUT so it can splice visual features in first.
+
+        `layer_range=(start, end)` builds one chunk of a split export, holding
+        global layers [start, end). The chunk owns the embedding path only if it
+        starts at 0, and norm + lm_head only if it ends at num_hidden_layers.
+        Deepstack lands on global layers 0..n_deepstack-1, so pass n_deepstack=0
+        for any chunk that does not start at 0. See docs/NOTES-genie-splits.md.
         """
         cfg = hf_vl.config.text_config
+        start, end = (0, cfg.num_hidden_layers) if layer_range is None else layer_range
+        if not 0 <= start < end <= cfg.num_hidden_layers:
+            raise ValueError(f"layer_range {(start, end)} outside [0, {cfg.num_hidden_layers}]")
+        is_first, is_last = start == 0, end == cfg.num_hidden_layers
+        if not is_first and n_deepstack:
+            raise ValueError(
+                f"n_deepstack={n_deepstack} but this chunk starts at layer {start}; "
+                "deepstack applies to global layers 0..n-1 only")
+
         m = ExportQwen3(cfg, fuse_gate_up, fuse_qkv, use_past, logits_last_only,
-                        input_embeds=True, n_deepstack=n_deepstack)
+                        input_embeds=True, n_deepstack=n_deepstack,
+                        n_layers=end - start, is_first=is_first, is_last=is_last)
         src = hf_vl.state_dict()
         p = "model.language_model."
         dst = {}
-        dst["norm.weight"] = src[p + "norm.weight"]
-        # tie_word_embeddings: true -> the checkpoint carries no lm_head.weight
-        dst["lm_head.weight"] = src.get("lm_head.weight", src[p + "embed_tokens.weight"])
-        ExportQwen3._map_layers(dst, src, p, cfg.num_hidden_layers, fuse_gate_up, fuse_qkv)
+        if is_last:
+            dst["norm.weight"] = src[p + "norm.weight"]
+            # tie_word_embeddings: true -> the checkpoint carries no lm_head.weight
+            dst["lm_head.weight"] = src.get("lm_head.weight", src[p + "embed_tokens.weight"])
+        ExportQwen3._map_layers(dst, src, p, end - start, fuse_gate_up, fuse_qkv,
+                                src_offset=start)
         m.load_state_dict(dst, strict=True)
         return m.eval()
 
