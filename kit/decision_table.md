@@ -32,6 +32,18 @@ contain **zero** `Eltwise_Binary` ops with `operation: 13` whose output is
 `[1,8,2,...]`. If any remain, the export flag did not propagate to that graph
 and the arm is invalid.
 
+**What the build side can already say about box B.** The converter reports
+`read_total_bytes` = **961,130,496 for the gqafix decode graph — unchanged from
+the pre-fix build**. That is expected and useful: the replication cost was
+intermediate-tensor traffic (264 MB written, 264 MB re-read), not weight reads,
+so removing it does not change what the graph streams. Combining the two:
+pre-fix the step moved ≈961 MB + ≈530 MB ≈ 1.49 GB, post-fix ≈961 MB. If the
+step were purely bandwidth-bound at an unchanged effective rate, 85 ms would
+become ≈55 ms, i.e. **≈18 tok/s** — which is the top of the projected range and
+independently corroborates it from the converter's own accounting rather than
+from the cycle profile. A result far below that, with cycles confirmed down,
+is box B.
+
 ---
 
 ## 1b. Known confound — `gqafix_local` is 1.52 GB, not 1.09 GB
@@ -115,13 +127,18 @@ bin against a 2-graph FP16 bin. This arm is the clean comparison, against
 
 ### CL=512 (priority 4)
 
-Cuts the KV read 132 → 59 MB and shrinks attention GEMV.
+Cuts the KV read and shrinks attention GEMV. **The converter's own accounting
+bounds this arm:** it reports `read_total_bytes` = 961,130,496 for the CL=1152
+decode graph (matching the figure behind the 2026-08-13 profiling package) and
+**873,048,064 for CL=512** — a 9.2% reduction. So ~9% is the *ceiling* for this
+arm even if decode is perfectly byte-bound, and the thresholds below are set
+against that ceiling rather than against a round number.
 
 | Observation | Pre-committed conclusion |
 |---|---|
-| **≥ +8%** | The KV read is a live term. Ship CL-sized product variants; build CL=768 next. |
-| **+2% … +8%** | Present but small. Offer CL variants only where the product allows a short context. |
-| **< +2%** | KV traffic is not binding. Drop workstream F. |
+| **≥ +5%** | More than half the available 9.2% is realised — the KV read is a live term and decode is substantially byte-bound. Ship CL-sized product variants; build CL=768 next. |
+| **+2% … +5%** | Present but partial. Offer CL variants only where the product already tolerates a short context. |
+| **< +2%** | Less than a quarter of the available traffic saving shows up: KV traffic is not what binds. Drop workstream F. |
 
 ### LADE acceptance map (priority 6)
 
