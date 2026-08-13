@@ -834,7 +834,62 @@ if __name__ == "__main__":
 
 ---
 
-## Phase 2 — Device pipeline assembly (Tier A)
+## ⚠ PHASE 2 REVISED (2026-08-14, after the Phase 0 probes)
+
+**The original Phase 2 below is SUPERSEDED.** Probe D established, and manual
+re-verification confirmed, that a stock `GeniePipeline` cannot drive an **FP16**
+vision tower on this SDK build:
+
+- `QnnNspImageModel::setupInputFP16` is an empty stub that discards the pixel
+  blob and returns success (`nsp-image-model.cpp:526-530`).
+- `getConverterMap()` has no `Float16` entries in either direction, so the
+  ImageEncoder→accumulator append throws (`Quantization.cpp:163-192`).
+
+See `docs/NOTES-genie-pipeline.md` §D for the full citation trail.
+
+**Decision (user, 2026-08-14): re-quantize the vision tower to fixed-point IO.**
+Rejected alternatives: a `qnn-net-run` + raw-embedding two-step (fastest, but
+skipping the ImageEncoder node means `setVisionParam` is never called, so MRoPE
+never engages for image rows — `ImageEncoder.cpp:136-138`, and there is no C API
+to set it otherwise); and a custom QNN driver (full fidelity including
+deepstack, but untestable without a device).
+
+Target: **W8A16** — weights int8, activations uint16 — matching the text tower.
+`QNN_DATATYPE_UFIXED_POINT_16` dispatches to the real `setupInput<uint16_t>`
+copy path (`nsp-image-model.cpp:541-543`), and `{UFixed16, Float32}` is present
+in the converter map, so both gaps close.
+
+**Unexpected upside:** the QNN CPU backend has no FP16 execution path, which is
+why `parity_vit_dlc.py` today validates via a throwaway FP32 DLC and explicitly
+disclaims that fp16 numerics stay unvalidated until device time. A *quantized*
+DLC **can** execute on the CPU backend, so the shipped artifact itself becomes
+directly gateable device-free — strictly stronger evidence than Stage 1 had.
+
+Revised task list replacing Tasks 8-11:
+
+- **8a** `scripts/quant/quantize_vit_aimet.py` — AIMET W8A16 quantsim over
+  `ExportQwen3VLViT`, calibrated on a diverse image set, exporting
+  `model.onnx` + `model.encodings`. Gate: quantsim-vs-fp32 cosine on
+  `image_features` and all three deepstack outputs.
+- **8b** `scripts/build/vit_build_quant.sh` — convert with
+  `--quantization_overrides`, **assert the converted IO dtypes are actually
+  UFIXED_16** (not silently folded back to float), build the ctx-bin, verify
+  graph name and HTP config binding by reading the finalised binary back.
+- **8c** Gate: execute the shipped quantized DLC under `qnn-net-run` on the CPU
+  backend vs HF — the check Stage 1 could not run.
+- **8d** `preprocess_image.py` emits UFixed16 quantized with the graph's own
+  input encoding (scale/offset read from the DLC), not float.
+- **8e** `configs/genie_image_encoder_qwen3vl.json` gains
+  `engine.model.vision-param: {height: 32, width: 32}` — **patch units,
+  pre-merge** (`nsp-image-model.cpp:373`), mandatory for MRoPE to engage at all
+  (`ImageEncoder.cpp:46-47`).
+
+Tasks 9-13 (pipeline script, lint, bundle, runbook, upload) carry over with the
+image-encoder config and ctx-bin swapped for the quantized ones.
+
+---
+
+## Phase 2 — Device pipeline assembly (Tier A) — SUPERSEDED, see above
 
 ### Task 8: Pipeline node configs
 
