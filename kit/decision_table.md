@@ -34,6 +34,39 @@ and the arm is invalid.
 
 ---
 
+## 1b. Known confound — `gqafix_local` is 1.52 GB, not 1.09 GB
+
+Build-side finding, 2026-08-14. In the **2-graph** gqafix bin, ~444 MB of INT8
+decoder weights fell out of the shared-weights pool and became **per-graph
+constants**, so they are stored twice:
+
+| bin | sharedWeightsSize | constSize (per graph) | file |
+|---|---|---|---|
+| baseline `local` (2-graph) | 1,063 MB | 4 MB | 1.087 GB |
+| **gqafix `local` (2-graph)** | **623 MB** | **444 MB × 2** | **1.523 GB** |
+| gqafix `ladekv` (3-graph) | 1,067 MB | 0 | 1.087 GB |
+
+The weight *bytes* are unchanged (623 + 444 ≈ 1,067 MB); only their
+classification is. The 3-graph bin shares perfectly, so this is specific to the
+2-graph combination (bertcache CL=128 prefill + decode) under grouped
+attention. Root cause not yet established — it is in the ctx-bin generator's
+layout/sharing decision, not in the graph topology, which gates clean.
+
+**What this means for the session:**
+
+- Each graph still streams the same weights per step, so this should not change
+  decode traffic — but it is +436 MB of storage on a device whose `/data` runs
+  98–99% full, and it may affect init time and mmap behaviour.
+- **`p2_gqafix_local_basic` vs the 11.72 tok/s baseline is therefore not
+  size-matched.** If that arm underperforms, do not attribute it to the GQA fix
+  without checking the arm below.
+- **The clean comparison is `p2_gqafix_ladekv_basic` (priority 2) against
+  `p3_a1_ladekv_basic` (priority 3).** Same topology, same graph count, same
+  1.087 GB bin — the only difference is the attention. Treat that pair as the
+  primary evidence for box A vs box B above, and `gqafix_local` as corroboration.
+- Please report the observed init time for `gqafix_local` separately; that is
+  the measurement most likely to show the size cost.
+
 ## 2. Individual arms
 
 ### A1 — basic mode on the pre-fix plain `ladekv` bin (priority 3)

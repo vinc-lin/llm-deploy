@@ -98,6 +98,13 @@ run_arm p4_gqafix_cl512_basic   qwen3_06b_w8a16_gqafix_cl512   genie_dialog.json
 log ""
 log "=== PRIORITY 5 — config trims ==="
 run_arm p5_gqafix_dlbc_basic    qwen3_06b_w8a16_gqafix_dlbc    genie_dialog.json       "$P_TECH"
+# extended_udma has never actually been enabled in any build we shipped -- the
+# key was in the wrong config section and silently ignored. This is its first
+# real A/B. v81-and-above feature, so it is exactly on-target hardware.
+run_arm p5_gqafix_udma_basic    qwen3_06b_w8a16_gqafix_udma    genie_dialog.json       "$P_TECH"
+# C1: 2-graph bin with the PAST-KV prefill instead of bertcache. Separates
+# "graph count" from "which prefill graph" -- only informative if A1 was slow.
+run_arm p5_gqafix_pastkv2g      qwen3_06b_w8a16_gqafix_pastkv2g genie_dialog.json      "$P_TECH"
 run_arm p5_fuseqkvgu_lade       qwen3_06b_w8a16_fuseqkvgu_ladekv genie_dialog.json     "$P_TECH"
 
 # ---------------------------------------------------------------- priority 6

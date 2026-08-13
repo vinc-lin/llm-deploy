@@ -108,8 +108,12 @@ Only informative once priority 2 is known; see decision-table box B.
 
 ## Priority 5 — config trims
 
-`p5_gqafix_dlbc_basic` (activation DLBC), `p5_fuseqkvgu_lade` (fused QKV+Gate-Up
-on the pre-fix base, for continuity with earlier numbers).
+| Arm | Bundle | Tests |
+|---|---|---|
+| `p5_gqafix_dlbc_basic` | `qwen3_06b_w8a16_gqafix_dlbc` | activation DLBC (E1) |
+| `p5_gqafix_udma_basic` | `qwen3_06b_w8a16_gqafix_udma` | `extended_udma` — **its first real A/B**; the key had been in the wrong config section in every previous build and was silently ignored. v81-and-above feature |
+| `p5_gqafix_pastkv2g` | `qwen3_06b_w8a16_gqafix_pastkv2g` | C1: a 2-graph bin using the past-KV prefill instead of bertcache — separates "graph count" from "which prefill graph". Only informative if A1 came out slow |
+| `p5_fuseqkvgu_lade` | `qwen3_06b_w8a16_fuseqkvgu_ladekv` | fused QKV+Gate-Up on the pre-fix base, for continuity with earlier numbers |
 
 Also worth one runtime edit if time allows: in the `ladekv` bundle's
 `genie_dialog.json`, set `"spill-fill-bufsize": 640000000` (from 0) and re-run
