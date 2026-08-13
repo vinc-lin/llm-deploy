@@ -859,11 +859,24 @@ Target: **W8A16** — weights int8, activations uint16 — matching the text tow
 copy path (`nsp-image-model.cpp:541-543`), and `{UFixed16, Float32}` is present
 in the converter map, so both gaps close.
 
-**Unexpected upside:** the QNN CPU backend has no FP16 execution path, which is
-why `parity_vit_dlc.py` today validates via a throwaway FP32 DLC and explicitly
-disclaims that fp16 numerics stay unvalidated until device time. A *quantized*
-DLC **can** execute on the CPU backend, so the shipped artifact itself becomes
-directly gateable device-free — strictly stronger evidence than Stage 1 had.
+**A hoped-for upside that did NOT materialise.** This plan originally claimed
+that although the QNN CPU backend has no FP16 path (which is why
+`parity_vit_dlc.py` validates a throwaway FP32 DLC), a *quantized* DLC would be
+CPU-executable and so the shipped artifact would become directly gateable
+device-free. **That is false and was never verified before being asserted.**
+
+`libQnnCpu` has **no 16-bit fixed-point kernels at all** — established with a
+4x8 single-Gemm probe: `uFxp_8` composes (per-tensor and per-channel), `uFxp_16`
+fails `OpConfig validation ... FullyConnected`, regardless of `--target_backend`.
+Against the ViT it rejects the *first* op, `patch_embed`, whose input is
+`pixel_values`, so this is not the fp16 attention island. `libQnnGpu` will not
+initialise off-target, `libQnnHtpQemu` cannot create a context, and a ctx-bin is
+backend-final (`--retrieve_context` → "Context de-serialization failed").
+
+**There is no x86 execution path for W8A16 on this SDK.** So W8A16 is no better
+off than FP16 here: the gate covers conversion and fixed-point IO, while the
+internal quantization error is covered only by `quantize_vit_aimet.py --eval`
+at quantsim level. Device time remains the first real test.
 
 Revised task list replacing Tasks 8-11:
 
