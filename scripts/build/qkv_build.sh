@@ -25,11 +25,13 @@ CONVERTER="$QAIRT_SDK/bin/x86_64-linux-clang/qairt-converter"
 PAST=$((CTX + CL - 1))
 TOTAL=$((PAST + 1))
 
+disk_guard 20
 echo "== [1/8] fused prefill quantization =="
 $PY "$LLMDEPLOY_ROOT/scripts/quant/quantize_aimet.py" --model "$MODEL" \
     --cl-prefill "$CL" --fuse-qkv --out "$QP" \
     ${QUANT_DEVICE:+--device "$QUANT_DEVICE"} "${EXTRA[@]}"
 
+disk_guard 20
 echo "== [2/8] fused decode export =="
 $PY "$LLMDEPLOY_ROOT/scripts/quant/quantize_aimet.py" --model "$MODEL" \
     --cl-prefill "$CL" --ctx "$CTX" --fuse-qkv --export-decode "$QP" --out "$QD" \
@@ -55,6 +57,7 @@ echo "== [6/8] rename decode + overlap check =="
 $PY "$LLMDEPLOY_ROOT/scripts/quant/rename_aimet_io.py" \
     --model "$QD/model.onnx" --encodings "$ENC" --layers 28 --with-past
 
+disk_guard
 echo "== [7/8] convert prefill + decode =="
 mkdir -p "$DLC"
 $PY_QAIRT "$CONVERTER" --input_network "$QP/model_renamed.onnx" \
@@ -71,6 +74,7 @@ $PY_QAIRT "$CONVERTER" --input_network "$QD/model_renamed.onnx" \
     --output_path "$DLC/decode.dlc" --quantization_overrides "$ENC" \
     --float_bitwidth 16 --target_backend HTP "${DIMS[@]}"
 
+disk_guard
 echo "== [8/8] ctx-bin =="
 cd "$LLMDEPLOY_ROOT/configs"
 qnn-context-binary-generator \

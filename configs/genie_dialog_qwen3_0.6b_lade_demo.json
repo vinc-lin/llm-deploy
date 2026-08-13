@@ -1,0 +1,72 @@
+{
+  "_comment": "DEMO/interactive config: lade fast path + bounded generation + sampling. The other two dialogs in this bundle are greedy PARITY configs (temp 0, no max-num-tokens) — correct for validation, but in free-form use they loop until 'Context Size was exceeded' (HTP doc 8.2). Prompts must still be the full Qwen3 chat template WITH an empty <think>\n\n</think> block in the assistant prefix (bos-token is -1 because the template supplies <|im_start|> itself; do not set both).",
+  "dialog": {
+    "version": 1,
+    "type": "lade",
+    "max-num-tokens": 256,
+    "lade": {
+      "version": 1,
+      "window": 8,
+      "ngram": 3,
+      "gcap": 8,
+      "update-mode": "ALWAYS_FWD_ONE"
+    },
+    "context": {
+      "version": 1,
+      "size": 1024,
+      "n-vocab": 151936,
+      "bos-token": -1,
+      "eos-token": [
+        151645,
+        151643,
+        151647
+      ]
+    },
+    "sampler": {
+      "version": 1,
+      "seed": 42,
+      "temp": 0.85,
+      "top-k": 50,
+      "top-p": 0.9
+    },
+    "tokenizer": {
+      "version": 1,
+      "path": "tokenizer.json"
+    },
+    "engine": {
+      "version": 1,
+      "n-threads": 3,
+      "backend": {
+        "version": 1,
+        "type": "QnnHtp",
+        "QnnHtp": {
+          "version": 1,
+          "use-mmap": true,
+          "spill-fill-bufsize": 0,
+          "mmap-budget": 25,
+          "poll": true,
+          "cpu-mask": "0xe0",
+          "kv-dim": 128,
+          "allow-async-init": true,
+          "enable-graph-switching": true
+        },
+        "extensions": "htp_backend_ext_config.json"
+      },
+      "model": {
+        "version": 1,
+        "type": "binary",
+        "binary": {
+          "version": 1,
+          "ctx-bins": [
+            "qwen3-0.6b-w8a16-fuseqkvgu-ladekv_ctx.bin"
+          ]
+        },
+        "positional-encoding": {
+          "type": "rope",
+          "rope-dim": 64,
+          "rope-theta": 1000000
+        }
+      }
+    }
+  }
+}

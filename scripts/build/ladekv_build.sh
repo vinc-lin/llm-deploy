@@ -20,6 +20,12 @@
 # Requires completed full_build.sh + lade_build.sh for <name>.
 # Usage: ladekv_build.sh <name> [cl_prefill] [ctx] [ar_prefill]
 #   e.g. ladekv_build.sh qwen3-0.6b-w8a16 128 1024 128
+#
+# Fused variants (docs/MAX_TPS_QWEN3_0.6B.md §3): FUSE_FLAGS and ENC_SRC, same
+# contract as lade_build.sh — FUSE_FLAGS is appended to the quantize_aimet.py
+# export (the wrapper's structure depends on it) and ENC_SRC replaces the
+# encodings used for rename + conversion with the fused build's
+# model_surgery.encodings. All three graphs in the ctx-bin must share it.
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
 
@@ -28,6 +34,8 @@ CL=${2:-128}
 CTX=${3:-1024}
 AR=${4:-128}          # past-KV prefill AR
 VAR=${VERIFY_AR:-32}  # existing verify graph AR
+FUSE=()
+[[ -n "${FUSE_FLAGS:-}" ]] && read -r -a FUSE <<< "$FUSE_FLAGS"
 
 MODEL=${MODEL:-$LLMDEPLOY_DATA/models/Qwen3-0.6B}
 QP=$LLMDEPLOY_DATA/work/quant/$NAME-prefill
@@ -45,22 +53,32 @@ for f in "$QP/model_torch.encodings" "$QP/model_filtered.encodings" \
   [[ -f $f ]] || { echo "MISSING prerequisite: $f (run full_build.sh + lade_build.sh $NAME first)"; exit 1; }
 done
 
+if [[ -n "${ENC_SRC:-}" ]]; then
+  [[ -f $ENC_SRC ]] || { echo "MISSING ENC_SRC: $ENC_SRC"; exit 1; }
+  ENC_IN=$ENC_SRC        # already renamed; rename's own output is discarded
+  ENC=$ENC_SRC
+  echo "== encodings override: $ENC (fused lineage) =="
+else
+  ENC_IN=$QP/model_filtered.encodings
+  ENC=$QP/model_filtered_renamed.encodings
+fi
+
 if [[ -f "$QKV/model_renamed.onnx" && -z "${FORCE_EXPORT:-}" ]]; then
   echo "== [1-2/5] SKIP export+rename ($QKV/model_renamed.onnx exists; FORCE_EXPORT=1 to redo) =="
 else
   disk_guard 20
-  echo "== [1/5] AIMET past-KV prefill export (AR=$AR, past=$PAST) =="
+  echo "== [1/5] AIMET past-KV prefill export (AR=$AR, past=$PAST) ${FUSE[*]:-} =="
   $PY "$LLMDEPLOY_ROOT/scripts/quant/quantize_aimet.py" --model "$MODEL" \
       --cl-prefill "$CL" --ctx "$CTX" --decode-ar "$AR" \
-      --export-decode "$QP" --out "$QKV" ${QUANT_DEVICE:+--device "$QUANT_DEVICE"}
+      --export-decode "$QP" --out "$QKV" ${QUANT_DEVICE:+--device "$QUANT_DEVICE"} \
+      "${FUSE[@]}"
 
   disk_guard
   echo "== [2/5] canonical I/O rename =="
   $PY "$LLMDEPLOY_ROOT/scripts/quant/rename_aimet_io.py" \
-      --model "$QKV/model.onnx" --encodings "$QP/model_filtered.encodings" \
+      --model "$QKV/model.onnx" --encodings "$ENC_IN" \
       --layers 28 --with-past
 fi
-ENC=$QP/model_filtered_renamed.encodings
 
 echo "== [3/5] FP parity: qualla feed pattern incl. chunking (AR=$AR) =="
 $PY "$LLMDEPLOY_ROOT/scripts/validate/parity_ladekv_read.py" \
