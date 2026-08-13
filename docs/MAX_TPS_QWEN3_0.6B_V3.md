@@ -205,6 +205,109 @@ B cannot reach: **F (CL=512: 132→59 MB) and the W8 head (751→595 MB)** — t
 | 429 on commit phase | tarball-level commits; watchdog; spaced single-file recovery after ~1 h |
 | Kit leaks identifiers into a repo scrubbed twice | P0.2 redaction class applied to every kit file before upload (Phase-4 hygiene gate) |
 
+## 10b. Execution log — 2026-08-14
+
+Recorded as the plan was executed. Items here are device-free facts, not
+performance projections, so they are not gated by P0.5.
+
+### Phase 0 — complete
+
+| Item | Result |
+|---|---|
+| P0.1 | Fixed, gated, re-tarred, re-uploaded, **verified server-side**. Repo visibility read live before (private=True) and after (private=True) — no side-effect flip. The linter independently reproduced V2 §2.3's finding: exactly 3 bundles, exactly the demo dialogs. |
+| P0.2 | Report redacted (serial, jump-host string). A repo-wide leak scan is now a pre-commit step; it also caught V3's own P0.2 row, which quoted the jump-host name. |
+| P0.3 | Report committed as `docs/DEVICE_MEASUREMENT_REPORT_2026-08-13.md`, verbatim except redactions, with corrections in a §0 annotation block rather than edited into the body. |
+| P0.4 | `docs/DEVICE_TEAM_EXCHANGE_2026-08-14.md` drafted. |
+| P0.6 | **Decided: supplier IP stays out of the repo.** Both paths added to `.gitignore` (verified with `git check-ignore`). |
+
+**The raw 08-13 artifacts never existed locally.** Only the narrative report was
+transferred; `docs/test_artifacts/measurement_2026-08-13/` was never received.
+V3-1.1 as written ("grep the profiler artifacts") was therefore unrunnable — but
+its *purpose* was served better by the DLC itself, which is where V2 §1.1
+derived the hypothesis in the first place.
+
+### Phase 1 — complete, with one plan-changing correction and one negative result
+
+**V3-1.1 confirmed, and sharpened.** The 56 ops are exactly the predicted GQA
+replication (`[1,8,1,128,1152]→[1,8,2,128,1152]` and the V-side transpose), the
+mask is confirmed never expanded (enters `[1,1,1152]`, one `Unsqueeze`,
+broadcasts implicitly in the `Add`), and V2's byte arithmetic checks out against
+the real graph. **New:** their QNN type is `Eltwise_Binary` with `operation: 13`
+= **MULTIPLY**, against a `[1,1,2,1,1]` STATIC coefficient — the converter
+lowers ONNX `Expand` into a broadcast multiply-by-ones. V2 §1.1 called it "an
+ordinary unvectorized copy"; it is a broadcast FP16 multiply. Same byte volume,
+same conclusion, but the correct mechanism to cite.
+
+**V3-1.2 / B2 answered: no flag-only fix exists.** QAIRT 2.48's IR optimizer has
+60+ named passes (`graph_optimizer.py: OptimizationPassInfo.pass_name_mapping`);
+none targets GQA / `repeat_kv` / broadcast-MatMul. `configure_conditional_python_passes`
+is LSTM/GRU-only. The nearest candidates (`OPTIMIZE_UNMATCHED_MATMUL`,
+`ALIGN_MATMUL_RANKS`, `EXPAND_EXPANDOP_TO_ELTWISE`) do not avoid materialisation.
+The export rewrite (B3) was the only path — as V2 expected.
+
+**V3-1.3 FAILED — closed in ~40 s of compute, not the budgeted day.** The x86
+`libQnnHtpQemu.so` rejects v81 ctx-bins outright: `Request feature arch with
+value 81 unsupported`, `QnnContext_createFromBinary` err `0x138d`. Backend and
+device init succeed, so this is a hard capability gap, not a config problem.
+Retargeting to a supported arch (v75/v79) would change microarchitecture and
+kernel selection, so the cycles could not be compared to the 350.3M v81
+baseline — it fails acceptance by construction. **B7a stays a device
+experiment; open question #8 = No.**
+
+**V3-1.4 / E2 answered — and both audited keys are dead.** Written up in
+`docs/NOTES-htp-config-keys.md`:
+- `memory.extended_udma` has **never applied**. The field belongs to
+  `HtpContextConfig` (the `"context"` section); `HtpMemoryConfig` is
+  `extra="forbid"` and defines only `mem_type`. It is a v81-and-above feature,
+  i.e. a real unexplored lever we thought we already had.
+- `graph_configs_extra.sparse_weights_compression` is dead twice over: the
+  section is not in `_CONFIG_TYPES`, and the key does not exist anywhere in the
+  SDK. The capability is real but is a *graph optimization type*
+  (`QNN_HTP_GRAPH_OPTIMIZATION_TYPE_ENABLE_SPARSE_WEIGHTS_COMPRESSION = 6`),
+  reachable only via `graphs[].finalize_config`.
+- Bonus: `HtpGraphConfig.weights_packing` exists and has never been tried.
+
+Neither correction is folded into the gqafix trunk — that would confound B7b.
+They get their own ctx-bin-only variants.
+
+### Phase 2 — B3 implemented and validated device-free
+
+The rewrite is **rank-4 throughout**, which is simpler than either option in
+V3-2.1: Q groups to `[B,n_kv,rep*S,D]` by pure view (H factorises as
+`(n_kv, rep)` in HF's ordering), the MatMuls batch over `n_kv`, and the
+mask/softmax/output paths are structurally unchanged from the replicating form.
+The rank-5 broadcast-MatMul alternative was therefore **not** built: it offers
+nothing over this and carries more risk. V3-2.1's "build both" instruction was
+written to hedge against not being able to iterate — but the hedge is
+unnecessary when the primary form is strictly simpler.
+
+Gates passed, in order of cost:
+1. **Numerical equivalence** — max |diff| `6e-16` (float64) across decode
+   AR=1/past=1151, verify AR=32, prefill AR=128 both with and without past, and
+   fused-QKV variants. Bit-identical for decode.
+2. **ONNX** — `Expand` count 4 → 0 on a 2-layer toy (i.e. 56 → 0 at 28 layers).
+3. **Converter** — the grouping *survives conversion*: attention MatMuls come
+   out `1x8x2x256` instead of `1x16x1x256`, `Eltwise_Binary` 28 → 24,
+   `operation: 13` count 18 → 14 (exactly the 4 removed), and the extra
+   reshapes are folded away. This was the real risk and it is retired.
+4. **`scripts/validate/lint_gqa_ops.py`** — new hard gate, validated against
+   four cases including a negative control and the real shipped baseline (where
+   it independently re-confirms exactly 56 replication ops).
+
+`FUSE_FLAGS="--grouped-gqa"` is **load-bearing** for `lade_build.sh` and
+`ladekv_build.sh`: they re-export verify32 and the past-KV prefill with their
+own `quantize_aimet.py` calls. Omit it and those two graphs keep the old
+attention while adopting grouped encodings — the build succeeds, parity passes,
+the bin loads, and only the device is slow. That is what the new gate exists to
+catch.
+
+### Operational
+
+C: fell from 67 GB to ~50 GB during the first two quantization stages
+(8.6 GB per quant dir). Yesterday's `bisect-*` / `determinism` quant dirs
+(~60 GB) were **moved to `/mnt/x/llm-archive/`, not deleted** — they are recent
+and regenerable but not disposable without asking.
+
 ## 10. Open questions ledger (carried from V2 §7, plus)
 
 1–7. unchanged from V2.

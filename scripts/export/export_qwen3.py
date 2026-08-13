@@ -75,6 +75,9 @@ def main():
     ap.add_argument("--ctx", type=int, default=1024)
     ap.add_argument("--fuse-gate-up", action="store_true")
     ap.add_argument("--fuse-qkv", action="store_true")
+    ap.add_argument("--grouped-gqa", action="store_true",
+                    help="batch attention MatMuls over the KV heads instead of "
+                         "materialising replicated ones (removes the Expand pairs)")
     ap.add_argument("--ar-verify", type=int, default=0,
                     help="also export verify.onnx: a multi-token decode graph with "
                          "S=this (all-position logits) for lookahead/speculative "
@@ -89,7 +92,8 @@ def main():
     out = Path(args.out)
 
     if args.parity_check:
-        m = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv, use_past=False)
+        m = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv, use_past=False,
+                                grouped_gqa=args.grouped_gqa)
         ids = torch.randint(0, cfg.vocab_size, (1, 16), dtype=torch.int32)
         mask = causal_mask(16, 16)
         cos, sin = rope_tables(torch.arange(16), cfg.head_dim, rope_theta_of(cfg))
@@ -108,13 +112,15 @@ def main():
     # logits_last_only MUST be False: qualla samples row n_process-1 of an
     # all-position logits tensor (see module docstring).
     prefill = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
-                                  use_past=False, logits_last_only=False)
+                                  use_past=False, logits_last_only=False,
+                                  grouped_gqa=args.grouped_gqa)
     with torch.no_grad():
         export_graph(prefill, cfg, out / "prefill.onnx", args.cl_prefill, 0)
 
     print("exporting decode...")
     decode = ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
-                                 use_past=True, logits_last_only=False)
+                                 use_past=True, logits_last_only=False,
+                                 grouped_gqa=args.grouped_gqa)
     with torch.no_grad():
         export_graph(decode, cfg, out / "decode.onnx", 1, past_len)
 

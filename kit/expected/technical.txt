@@ -1,0 +1,3 @@
+**Hexagon DSP: An Overview**
+
+The Hexagon Digital Signal Processing (DSP) architecture is a high-performance, scalable solution designed to handle complex signal processing tasks efficiently. It is built on a modular, distributed architecture that allows for seamless integration
