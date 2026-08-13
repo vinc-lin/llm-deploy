@@ -58,7 +58,14 @@ def main():
     print(f"  {len(dec.graph.initializer)} initializers", flush=True)
 
     shared = [i for i in dec.graph.initializer if i.name in src]
-    sample = [t.name for t in shared[: args.sample]]
+    # Sample tensors that actually DIFFER. Taking the first N picks the
+    # layernorms, which have no encoding and are therefore already identical --
+    # they would report MATCH=True before any work was done, making the
+    # evidence vacuous.
+    differing = [t.name for t in shared if digest(t) != digest(src[t.name])]
+    print(f"  {len(differing)}/{len(shared)} shared initializers differ before unification",
+          flush=True)
+    sample = differing[: args.sample] or [t.name for t in shared[: args.sample]]
     before = {n: (digest(src[n]), digest(next(t for t in shared if t.name == n)))
               for n in sample}
 
