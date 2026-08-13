@@ -16,9 +16,11 @@
 # MANIFEST listing what actually ran. Send the whole directory back.
 set -u
 
-RESULTS=${1:-results}
 HERE=$(cd "$(dirname "$0")" && pwd)
-mkdir -p "$RESULTS"
+# Must be ABSOLUTE: each arm runs inside `cd "$BUNDLE"`, so a relative results
+# path would put --profile output under the bundle directory instead.
+mkdir -p "${1:-results}"
+RESULTS=$(cd "${1:-results}" && pwd)
 MANIFEST="$RESULTS/MANIFEST.txt"
 : > "$MANIFEST"
 
