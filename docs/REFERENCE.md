@@ -224,6 +224,23 @@ Fusion variants: Gate-Up keeps the fused `gate_up` output FP16 (requantized at
 `down_proj`); QKV grafts the donor `q_proj` INT16 encoding onto the Q split with
 K/V splits FP16, done at the **encodings** level by `qkv_surgery.py` (28/28).
 
+**Qwen3-VL ViT (W8A16, stage 3) inherits the same fused-QKV rule.** aimet-torch
+only quantizes *module* outputs, so the whole attention body — rotary, both
+MatMuls, Softmax, `attn.proj` — is functional code, carries no encodings, and
+converts to FP16 (exactly why the text tower's K/V projections are FP16). The
+ViT's QKV is one fused `nn.Linear`, so its output *is* a module output and *is*
+encoded, and V reaches `attn @ v` through nothing but Reshape/Transpose/Split/
+Squeeze — all of which merely inherit dtype. The converter dequantizes the Q/K
+path (their `.float()` Casts force a fallback) but leaves V as `uFxp_16`, then
+asks HTP for a `FLOAT_16 x UFIXED_16 -> FLOAT_16` MatMul that has no kernel:
+`validateOpConfig failed 3110` / `Failed to validate op /blocks.0/attn/MatMul_1
+with error 0xc26`, and ctx-bin generation dies at ComposeGraphs. No converter
+flag inserts the missing dequantize. `vit_build_quant.sh` step 1a drops that one
+activation encoding per block (24 of 243) — `qkv_surgery.py`'s step 1 verbatim,
+without the donor graft, which would buy nothing here. The QKV **weights** stay
+INT8 per-channel; the result is a strictly *higher*-precision graph than the
+quantsim that was measured.
+
 ### 4.1 Dead ends — do not re-run these
 
 | Approach | Result | Real reason |
@@ -235,6 +252,7 @@ K/V splits FP16, done at the **encodings** level by `qkv_surgery.py` (28/28).
 | **`sparse_weights_compression=1`** | 0 bytes saved | model isn't sparse |
 | **2-core ctx-bin** | error 5005, or 3.96 tok/s — slower | Genie 1.19 creates a single-core device internally, no JSON override |
 | **Multiple Genie instances** | 2 × 4.0 tok/s = 8 total | linear BW split — confirms decode is 100% DDR-bound |
+| **Executing any W8A16 graph on x86 (as a device-free numerics gate)** | impossible on this SDK | `libQnnCpu` has no 16-bit fixed-point kernels: a 4×8 single-Gemm probe composes with `uFxp_8` activations (per-tensor *and* per-channel weights) and fails `OpConfig validation … for FullyConnected` with `uFxp_16`, regardless of `--target_backend`. `libQnnGpu` refuses to initialise off-target ("TuningMode must be enabled on x86_64-linux-clang"); `libQnnHtpQemu` cannot create a context; a ctx-bin is backend-final, so `--retrieve_context` on CPU gives "Context de-serialization failed". Device-free gates must therefore run an **FP32 sibling** DLC (`parity_vit_dlc.py`, `parity_vit_quant.py`). |
 
 **Removed from this table 2026-08-13: QKV/Gate-Up fusion.** Our "no tok/s gain
 (6.27–6.5 ≈ baseline)" verdict compared against a v1-era fused build that was
@@ -262,6 +280,8 @@ shipping anything.
 | **Graph names** | `qnn-context-binary-utility --json_file` → `graphName` | exactly matches both HTP configs (§3.3) |
 | Quantized head | `qairt-dlc-info \| grep lm_head.weight` | `sFxp_8` with `--quant-head`, else `Float_16` |
 | Ctx-bin | `qnn-context-binary-utility --json_file` | all graphs listed, logits dims per §3.1, ~1.09 GB for 0.6B |
+| **ViT fixed-point I/O** | `vit_build_quant.sh` step 3 (fails the build itself) | `pixel_values` + all 4 outputs `QNN_DATATYPE_UFIXED_POINT_16`, scale/offset byte-equal to `model.encodings`, one graph named `vit`, O=3 / vtcm 16 / 4 HVX read back out of the binary |
+| **ViT quant numerics** | `parity_vit_quant.py` | min cos ≥ 0.99 on all four outputs (measured 0.9975 / 0.9998 / 0.9986 / 0.9977) |
 
 ---
 
