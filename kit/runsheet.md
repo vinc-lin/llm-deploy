@@ -62,6 +62,18 @@ qnn-profile-viewer --input_log out_gqafix/qnn-profiling-data_0.log \
 Run 3 reps. Send back `profile_gqafix_viewer.txt` for each, plus the raw
 `.log` files.
 
+> **Expect two `Unknown Key` warnings here, and ignore them.**
+> `htp_backend_config_decodeonly.json` still contains `memory.extended_udma`
+> and `graph_configs_extra.sparse_weights_compression`. We have since
+> established that **both are dead** — `extended_udma` belongs in the
+> `"context"` section, and `sparse_weights_compression` is not an SDK config key
+> at all (see `docs/NOTES-htp-config-keys.md`). They are left in place *on
+> purpose*: this config must stay byte-identical to the one behind the
+> 350,302,972-cycle baseline, or the comparison is not apples-to-apples. Since
+> both keys were ignored then and are ignored now, the comparison holds.
+> Everywhere else, `Unknown Key` still means that arm is not testing what it
+> claims.
+
 **Also send the 2026-08-13 originals if you still have them** — we never
 received `test2_decode_profile/`, so we have no per-op baseline to diff against,
 only the narrative table.
