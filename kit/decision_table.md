@@ -56,8 +56,23 @@ neither is `dlbc` or `extended_udma`. The sole predictor is presence of the
 exported graphs, so the effect is in the ctx-bin generator's layout/sharing
 decision. Root cause not yet established.
 
+More precisely, it is not that sharing "fails" — **the bertcache prefill graph
+requires one private ~444 MB copy of the decoder weights**, and the generator
+redistributes the rest around that. The hybrid bin shows it cleanly: the shared
+pool is full at 1,067 MB *and* the bertcache graph additionally carries 444 MB
+of constants, while its two sibling graphs carry none. Every affected bin lands
+at ≈1.51 GB however the accounting falls out.
+
 Bins carrying the bertcache prefill, and therefore this cost:
-`gqafix_local`, `gqafix_dlbc`, `gqafix_udma`, `gqafix_hybrid`.
+`gqafix_local`, `gqafix_dlbc`, `gqafix_udma`, `gqafix_hybrid`, `gqafix_qh`.
+
+**This changes what to expect from the W8-head arm.** In `gqafix_qh` the head
+lands in the duplicated pool (shared = 313 MB embed only; const = 599 MB =
+decoder + W8 head, twice), so the bin is 1.525 GB — *no smaller* than the FP16
+version despite halving the head. Do not read that as the head quantisation
+failing. Per **step**, the decode graph still reads its own copy, 155 MB instead
+of 311 MB, so the streaming saving is intact; only storage doubles. Judge that
+arm on tok/s alone.
 
 **What this means for the session:**
 
