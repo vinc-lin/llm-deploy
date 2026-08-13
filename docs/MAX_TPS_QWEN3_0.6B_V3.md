@@ -314,14 +314,21 @@ weight sharing**; bins without that graph share perfectly.
 | **gqafix 2-graph** | **bertcache** + decode | **623 MB** | **444 MB** | **1.523 GB** |
 | **gqafix lade** | **bertcache** + decode + verify32 | — | — | **1.529 GB** |
 | **gqafix dlbc** | **bertcache** + decode | — | — | **1.523 GB** |
+| **gqafix udma** | **bertcache** + decode | — | — | **1.524 GB** |
 | gqafix ladekv | past-KV prefill + decode + verify32 | 1,067 MB | 0 | 1.087 GB |
+| **gqafix pastkv2g** | **past-KV prefill + decode (2 graphs)** | — | — | **1.080 GB** |
 
 The weight *bytes* are unchanged — 623 shared + 444 const ≈ the original
 1,067 MB — so ~444 MB of INT8 decoder weights simply moved from the shared pool
-into per-graph constants and are therefore stored twice. Graph count is not the
-variable (the 3-graph ladekv shares; the 2-graph gqafix does not), `dlbc` is not
-the variable, and the topology gates clean, so this lives in the ctx-bin
-generator's layout/sharing decision rather than in the exported graph.
+into per-graph constants and are therefore stored twice.
+
+**The last row is decisive.** A *two*-graph bin that uses the past-KV prefill
+instead of the bertcache one shares perfectly (1.080 GB). So graph count is not
+the variable, `dlbc` is not the variable, `extended_udma` is not the variable,
+and the topology gates clean on all four graphs. The sole predictor is
+**presence of the CL=128 bertcache prefill graph**, and the effect therefore
+lives in the ctx-bin generator's layout/sharing decision rather than in the
+exported graph.
 
 Consequences, in order of importance:
 

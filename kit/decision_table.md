@@ -46,11 +46,18 @@ constants**, so they are stored twice:
 | **gqafix `local` (2-graph)** | **623 MB** | **444 MB × 2** | **1.523 GB** |
 | gqafix `ladekv` (3-graph) | 1,067 MB | 0 | 1.087 GB |
 
+| gqafix `pastkv2g` (2-graph, past-KV prefill) | — | — | 1.080 GB |
+
 The weight *bytes* are unchanged (623 + 444 ≈ 1,067 MB); only their
-classification is. The 3-graph bin shares perfectly, so this is specific to the
-2-graph combination (bertcache CL=128 prefill + decode) under grouped
-attention. Root cause not yet established — it is in the ctx-bin generator's
-layout/sharing decision, not in the graph topology, which gates clean.
+classification is. Isolated across six bins: a **two**-graph bin using the
+past-KV prefill shares perfectly, so graph count is not the variable, and
+neither is `dlbc` or `extended_udma`. The sole predictor is presence of the
+**CL=128 bertcache prefill graph**. The topology itself gates clean on all four
+exported graphs, so the effect is in the ctx-bin generator's layout/sharing
+decision. Root cause not yet established.
+
+Bins carrying the bertcache prefill, and therefore this cost:
+`gqafix_local`, `gqafix_dlbc`, `gqafix_udma`, `gqafix_hybrid`.
 
 **What this means for the session:**
 
