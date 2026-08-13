@@ -43,6 +43,14 @@ For detailed step-by-step procedures, error catalogs, and dated investigation lo
 | Peak INT8 aggregate | ~80 TOPS (silicon nominal) |
 | SDK used | QAIRT 2.48.40.260702, QNN API v2.37.0, libGenie 1.19.0 |
 
+> **Correction (2026-08-13):** per the official silicon spec quoted in
+> `docs/SA8797P_HTP_v81_Hardware_and_Deployment_Quantization_Reference_EN.md`
+> §1, each HTP has **8 HVX units** (not 4) and **16 MB VTCM** (not ~8 MB). The
+> "2 of 4 NSPs" reading in §1.2 below is therefore wrong: the observed 8 HVX
+> threads + 16 MB VTCM is **one full HTP**. 4 cores are visible to the
+> validator; Genie drives 1, so the theoretical multi-core upside is ×4, not
+> ×2. See `docs/REFERENCE.md` §1 and correction #14.
+
 ---
 
 ## 1.2 What we actually get from Android GVM
@@ -203,16 +211,18 @@ python3 $QAIRT/bin/x86_64-linux-clang/qairt-converter \
 > - **QKV fusion is done.** Solved not with ONNX surgery but at the **encodings**
 >   level (`scripts/export/qkv_surgery.py`, 28/28 grafts): the donor `q_proj`
 >   INT16 encoding is grafted onto the Q split, K/V splits stay FP16. Converter
->   and generator accept it at `vtcm_mb=16`, and it ran on device. The catch is
->   that it **buys nothing**: 6.27–6.5 tok/s ≈ baseline. The remote's 3.4× DDR
->   reduction was measured at `vtcm_mb=24`, which unsigned PD rejects; at 16 MB
->   all variants already show zero VTCM spill, so there is no spill to remove.
-> - **W4A16 dead end, restated.** This row's reasoning is also internally
->   inconsistent ("requires v75 or newer" vs "v81 has no INT4 support" — v81 is
->   newer than v75). Our own result supersedes it and is about **accuracy**, not
->   kernels: per-channel INT4, LPBQ block-64, and LPBQ+SeqMSE all score **0/4** on
->   the argmax gate W8A16 passes 3/4. Dead end at 0.6B regardless of kernel
->   support; flags remain for larger models.
+>   and generator accept it at `vtcm_mb=16`, and it ran on device.
+>   *(Revised 2026-08-13: the "buys nothing — 6.27–6.5 ≈ baseline" verdict that
+>   used to stand here compared against a garbage-output v1 build. The device
+>   team's working fused build measures **8.98 vs 7.79 unfused, +15%** —
+>   `docs/REFERENCE.md` §6.6, correction #15.)*
+> - **W4A16 dead end, restated.** This row argued it badly ("requires v75 or
+>   newer" vs "v81 has no INT4 support" — v81 *is* newer than v75), but
+>   *(revised 2026-08-13)* its conclusion was right: `htp_v2.json` has **zero**
+>   INT4 MatMul/FC kernels (SDK 2.43 & 2.48) and qairt-converter folds s4 → f16.
+>   Independently, accuracy also fails: per-channel INT4, LPBQ block-64, and
+>   LPBQ+SeqMSE all score **0/4** on the argmax gate W8A16 passes 3/4. Dead end
+>   on both grounds, at any size — `docs/REFERENCE.md` §4.1, correction #8.
 | **QAIRT 2.43 AUTO + built-in quantizer** | Same per-tensor UINT8 activations → same W8A8 garbage; no `llm_decode_*` perf profiles. | No improvement. |
 
 ---

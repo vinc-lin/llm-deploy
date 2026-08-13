@@ -2,8 +2,15 @@
 
 Builds W8A16 Qwen3 Genie ctx-bins/bundles for Qualcomm SA8797P (Hexagon v81,
 QAIRT 2.48.40, libGenie 1.19) with no device access. Bundles ship via HF
-`vinccniv/sa8797p-qwen3-w8a16-bundles` (private); this repo holds only
+`vinccniv/sa8797p-qwen3-w8a16-bundles` (Qwen3-VL artifacts:
+`vinccniv/sa8797p-qwen3vl-4b-bundles`). This repo holds only
 scripts/configs/docs.
+
+**Repo visibility is switched often and deliberately by the user — this file
+does not state it on purpose.** Read it live (`HfApi().repo_info(r).private`)
+if it matters; change it **only** when asked in that message; if a bulk upload
+flips it as a side effect, report and stop. Flipping it unasked — in either
+direction — has caused four incidents.
 
 ## Setup
 
@@ -65,8 +72,9 @@ are a fatal Genie load error (KV quant params must be byte-identical).
 - The vhdx is sparse and `/` is mounted `discard`, so deleting in-guest reclaims C:
   with no compaction step. `ls` reports the ~448 GB virtual size and always will;
   `du -h <vhdx>` (no `--apparent-size`) is the real consumption.
-- W4A16 is a dead end at 0.6B (per-channel, LPBQ-64, LPBQ+SeqMSE all fail the
-  argmax gate); `--lpbq`/`--seq-mse` flags remain for larger models.
+- W4A16 is a dead end on this SDK at any size: quality 0/4 at 0.6B, AND v81's
+  `htp_v2.json` ships zero INT4 matmul kernels — the converter folds s4→f16
+  (`--lpbq`/`--seq-mse` stay only for a future SDK).
 - `--quant-head` (W8 lm_head) is a **net LADE regression**: −14% tok/s on device
   (9.3 vs 10.8), because it costs ~10% n-gram acceptance. Quality is fine; the
   DDR win does not survive spec-decode amortization. It also needs
@@ -78,4 +86,7 @@ are a fatal Genie load error (KV quant params must be byte-identical).
 **`docs/REFERENCE.md` first** (consolidated current truth: contracts, measured
 numbers, dead ends, open questions) · `docs/BUILD_GUIDE.md` (full recipes) ·
 `docs/LOCAL_ENV.md` (provenance, aimet workarounds) · `docs/NOTES-genie-io.md`
-(Genie/qualla runtime contract, cited).
+(Genie/qualla runtime contract, cited) · `docs/NOTES-genie-splits.md`
+(multi-ctx-bin contract — mandatory ≳2B) ·
+`docs/SA8797P_HTP_v81_Hardware_and_Deployment_Quantization_Reference_EN.md`
+(device team's measured hardware truth, annotated).

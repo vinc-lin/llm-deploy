@@ -1,9 +1,13 @@
 # SA8797P LLM Deployment — Consolidated Reference
 
-*Current truth as of 2026-08-12. Supersedes conflicting statements anywhere else
+*Current truth as of 2026-08-13. Supersedes conflicting statements anywhere else
 in this repo. Every number here is either device-measured, tool-measured on this
 machine, or cited to SDK source — claims that could not be verified are marked
-as such rather than repeated.*
+as such rather than repeated. 2026-08-13: reconciled against the device team's
+measured-only characterization,
+`docs/SA8797P_HTP_v81_Hardware_and_Deployment_Quantization_Reference_EN.md`
+("the HTP doc" below) — corrections #14–18 and open questions §8.8–8.10 came
+out of that reconciliation.*
 
 **Read this first.** Then `docs/BUILD_GUIDE.md` for step-by-step recipes and
 `docs/NOTES-genie-io.md` for the line-cited Genie contract.
@@ -15,7 +19,7 @@ as such rather than repeated.*
 | | |
 |---|---|
 | **Best sustained decode, 0.6B** | **10.8 tok/s** — LADE speculative decoding, `qwen3_06b_w8a16_ladekv` (2026-08-11) |
-| Non-speculative AR-1 decode | 6.3–6.5 tok/s (~155 ms/step) |
+| Non-speculative AR-1 decode | 6.3–6.5 tok/s (~155 ms/step) on our bundles; **7.8 on the device team's own builds** — unexplained build-side delta (§8.8) |
 | Bertcache early phase (topology A only) | ~23.8 tok/s for the first ~117 tokens, then falls to AR-1 |
 | Output correctness | ✅ since v2 (2026-08-10) |
 | Quantization | W8A16 (INT8 per-channel weights, FP16 activations) — the only recipe that works |
@@ -27,32 +31,44 @@ as such rather than repeated.*
 so the only lever that *divides* bytes/token is emitting more than one token per
 weight-streaming pass. LADE already bought 1.7×; a learned draft head (`eaglet`,
 `spd`) is the next step up, and acceptance rate — not per-call latency — is the
-thing to optimize (§6.3).
+thing to optimize (§6.3). Two levers reopened 2026-08-13: **QKV+Gate-Up fusion**
+(+15% on the device team's working fused build — correction #15) and the **~20%
+build-side gap** between their unfused builds and ours (§8.8).
 
 ---
 
 ## 1. Hardware and runtime reality
 
-Inherited from the remote team's characterization (2026-08-09) and not
-contradicted by anything since.
+Source: the HTP doc (device team, measured-only, 2026-08-12), which quotes the
+official silicon spec and supersedes the 2026-08-09 remote summary's hardware
+picture (correction #14).
 
 | Attribute | Value |
 |---|---|
 | SoC | SA8797P (nordy / Gen5 / Snapdragon Ride Flex) |
-| HTP | Hexagon v81, 4 NSPs on silicon (~8 MB VTCM each, ~80 TOPS INT8 nominal) |
-| **What the Android GVM guest actually gets** | **2 of 4 NSPs, 16 MB VTCM total, unsigned PD** |
-| VTCM ceiling | 16 MB — `vtcm_mb: 24` is rejected at runtime (`0x138d`) |
+| HTP | Hexagon v81 × 4 on silicon. Each HTP = 12-thread Q6 scalar core + **8× HVX** (1024-bit SIMD) + 1× HMX (INT8/16 + FP16 matrix sub-units) + **16 MB VTCM** + L2 |
+| **What the Android GVM guest actually drives** | **one full HTP** — 8 HVX threads (fixed across all workloads), 16 MB VTCM (= exactly one HTP's), unsigned PD. `qnn-platform-validator` reports 4 cores *visible*; Genie creates a single-core device. Hypervisor allocation mask unknown (§8.6). |
+| VTCM ceiling | 16 MB — `vtcm_mb: 24` compiles offline but is rejected at runtime (`0x138d`); `pd_session: "signed"` with an unsigned skel silently falls back to unsigned |
 | Runtime | QAIRT 2.48.40.260702 · QNN API v2.37.0 · libGenie 1.19.0 |
 | DVFS | works via Genie `backend.extensions` JSON, 4 tiers, 1.95× swing. `qnn-net-run --perf_profile` is a no-op. Always use `llm_decode_burst`. |
-| Burst BW, one large contiguous matmul | ~49 GB/s |
-| Effective BW, real LLM decode | **~6–7 GB/s** |
-| FastRPC per-call | ~220 µs (hypervisor-mediated `hfastrpc`) |
-| Not available | zero-copy sharedbuf · DSP hardware queue · clock visibility |
+| Burst BW, one large contiguous matmul | 49–67 GB/s depending on timing definition (33.6 MB weight in 500–684 µs, excl-wait vs total) |
+| Effective BW, real LLM decode | **~6–7 GB/s** — confirmed two independent ways: our converter DDR estimate (~957 MB/token) and the device team's back-calculation (~924 MB/token × 7.4 tok/s) |
+| Peak FP16 compute (M ≥ 512 matmul) | ~2.7–2.8 TOPS — far below nominal; why is an open FAE question |
+| FastRPC per-call | ~220 µs round-trip (hypervisor-mediated `hfastrpc`), ~50–60 µs fixed submit/sync, 30–60 µs steady-state inter-op wait |
+| Graph-switch latency | 79–93 ms (prefill ↔ decode) |
+| Prefill throughput | 266 tok/s at 12 prompt tokens → **1100+ tok/s** at 53+ (fixed overhead amortizes) |
+| Init | cold (first run after reconnect) 1.8–2.0 s · warm 786–820 ms |
+| Not available | zero-copy sharedbuf · DSP hardware queue · clock visibility · multi-HTP under Genie · KV quantization via config (§4.1) |
 
-**The central performance fact:** the ~7× collapse from 49 → 7 GB/s is
+**The central performance fact:** the ~7–10× collapse from 49–67 → 7 GB/s is
 *access-pattern fragmentation* (28 layers of small MatMuls + KV traffic + per-op
-sync), not a clock cap. Decode is per-token weight streaming over DDR. Compute is
-not the bottleneck and neither is DVFS — both are already at ceiling.
+sync, now quantified: ~220 µs per RPC dispatch, 30–60 µs steady-state inter-op
+wait), not a clock cap. Decode is per-token weight streaming over DDR. Compute
+is not the bottleneck and neither is DVFS — both are already at ceiling. A
+corollary: fewer, larger ops help twice — big contiguous reads stream closer to
+the 49–67 GB/s figure, and every fused-away op refunds its dispatch overhead.
+That is presumably where fusion's +15% comes from (§6.6), and it should matter
+*more* at 4B (bigger per-op weights, more layers).
 
 Reference point for how much the hypervisor costs: the same class of model on a
 QNX-native EVB with 4 cores runs **129.7 tok/s** (Qwen3-VL 4B, official Qualcomm
@@ -129,7 +145,10 @@ All graphs in one ctx-bin share weights, so every DLC must convert against **the
 same encodings file** (the prefill run's). KV quant params must be byte-identical
 across graphs for same-named tensors, or Genie fails the load. Never recalibrate
 one graph of a set — that is what `--export-decode` / `--adopt-encodings` exist
-for. (This is the failure class behind the remote team's "error 5005".)
+for. (Historically blamed for the remote team's "error 5005"; the HTP doc §9
+instead ties 5005 to NOT_SUPPORTED triggers — `vtcm_mb > 16`, multi-core — so
+treat that attribution as unconfirmed. The mismatch itself is still a hard
+load failure.)
 
 ### 3.3 Graph names — cosmetic to Genie, load-bearing for the backend
 
@@ -209,13 +228,20 @@ K/V splits FP16, done at the **encodings** level by `qkv_surgery.py` (28/28).
 
 | Approach | Result | Real reason |
 |---|---|---|
-| **W8A8** | garbage, all variants (v15–v18) | v81 MatMul supports only per-tensor UINT8 asymmetric activations, which clip heavy-tailed LLM activations. Per-channel activations unsupported. |
-| **W4A16 at 0.6B** | **0/4** on the argmax gate W8A16 passes 3/4 (`max\|Δlogits\|` 16–25 vs 1.3–1.7) | Accuracy, not kernel support. All three recipes fail: per-channel INT4, LPBQ block-64, LPBQ+SeqMSE. `--lpbq`/`--seq-mse` remain for larger models. |
-| **QKV/Gate-Up fusion for speed** | builds fine, **no tok/s gain** (6.27–6.5 ≈ baseline) | The remote's 3.4× DDR reduction was measured at `vtcm_mb=24`, which unsigned PD rejects. At 16 MB every variant already shows **zero** VTCM spill — there is no spill left to remove. |
+| **W8A8** | garbage, all variants (v15–v19; v19 also slow — 4.32 tok/s, 730 MB spill) | v81 MatMul supports only per-tensor UINT8 asymmetric activations, which clip heavy-tailed LLM activations. Per-channel activations unsupported. |
+| **W4A16, any size** | **0/4** on the argmax gate at 0.6B — and INT4 cannot execute anyway | Two independent kills. Accuracy: all three recipes fail at 0.6B (per-channel INT4, LPBQ block-64, LPBQ+SeqMSE; `max\|Δlogits\|` 16–25 vs W8A16's 1.3–1.7). Kernels: `htp_v2.json` has **zero** INT4 MatMul/FC entries (SDK 2.43 & 2.48) and qairt-converter folds s4 weights back to f16 (HTP doc §5.3/§10.1). `--lpbq`/`--seq-mse` stay in the script only for a future SDK that ships the kernels. |
+| **KV INT8 via Genie `kv-quantization: true`** | no effect on HTP | The flag exists only in the QnnGenAiTransformer **CPU** backend (HTP doc §5.4). Native KV INT8 needs ONNX-level graph changes plus an unconfirmed kernel path — FAE question. |
 | **`--quant-head` (W8 lm_head) under LADE** | **−14% tok/s** | Costs ~10% n-gram acceptance; the DDR saving does not survive spec-decode amortization (§6.3). |
 | **`sparse_weights_compression=1`** | 0 bytes saved | model isn't sparse |
 | **2-core ctx-bin** | error 5005, or 3.96 tok/s — slower | Genie 1.19 creates a single-core device internally, no JSON override |
 | **Multiple Genie instances** | 2 × 4.0 tok/s = 8 total | linear BW split — confirms decode is 100% DDR-bound |
+
+**Removed from this table 2026-08-13: QKV/Gate-Up fusion.** Our "no tok/s gain
+(6.27–6.5 ≈ baseline)" verdict compared against a v1-era fused build that was
+emitting garbage output, so it never actually measured fusion. The device
+team's *working* fused build measures **8.98 vs 7.79 unfused (+15%)**, decode
+DDR read 880 vs ~960 MB (§6.6, correction #15). Re-test on topology B;
+first-class candidate for the 4B build.
 
 ---
 
@@ -355,6 +381,29 @@ byte-counting model under-predicts the real gain.
 *(These are all pre-2026-08-11 builds. No converter DDR summary has been recorded
 for a real `--quant-head` build.)*
 
+### 6.6 Device-team independent measurements (HTP doc, 2026-08-12)
+
+Their own builds, not our HF bundles — their unfused ctx-bin is **1.01 GB vs
+our 1.087 GB**, so the artifacts differ:
+
+| Configuration (theirs) | tok/s | Notes |
+|---|---|---|
+| Unfused W8A16, graph-switching + mmap | **7.79–7.80** | init 786 ms, TTFT 805 ms, 128 tokens generated, coherent output |
+| QKV + Gate-Up fused W8A16, vtcm 16 | **8.98 (+15%)** | coherent output; decode DDR read 880 MB; ctx-bin 1.086–1.09 GB |
+| Unfused W8A8 v19 | 4.32 | garbled — W8A8 stays dead |
+
+Two things do not reconcile with our measurements and stay open:
+
+- **Their unfused AR-1 decode is ~20% faster than our v2 bundle** (7.8 vs 6.5).
+  Not runtime config — their §8.2/§8.3 configs match our shipped
+  `configs/genie_dialog_qwen3_0.6b.json` + `htp_backend_ext_config.json`
+  field-for-field (`poll`, `cpu-mask 0xe0`, `n-threads 3`,
+  `rpc_polling_time 9999`, `llm_decode_burst`). The difference is in the build
+  (§8.8).
+- **Their fused build gains +15% where our A/B showed nothing** — but our
+  "fused" data point was a v1-era garbage-output build, so theirs is the only
+  valid fused-vs-unfused measurement in existence (correction #15).
+
 ---
 
 ## 7. Corrections ledger
@@ -372,16 +421,62 @@ the index of what changed.
 | 5 | `--quant-head` measures **961 → 763 MB/token (−20.6%)** | BUILD_GUIDE §5.7 | Fabricated from unrelated numbers: both figures are the prefill (763,410,432) and decode (961,130,496) `read_total_bytes` of **one non-qh build**, in `ctxbin-ws.log` dated 2026-08-10 — two days before `--quant-head` existed. Real effect: §6.4. |
 | 6 | **`lm_head` INT8 degrades quality** | remote summary §2.2 | Not supported. 3/4 argmax locally, device parity confirmed at 0.6B greedy. Keep the head FP16 by default, but for the acceptance-rate reason (§6.4), not this one. |
 | 7 | QKV fusion **"not yet done", needs ONNX surgery** | remote summary §3.1, §4.1 | Done at the encodings level (28/28 grafts), built and device-tested. It just buys nothing at vtcm 16. |
-| 8 | W4A16 fails because **v81 has no INT4 MatMul kernel** | remote summary §3.1 | That row is also self-contradictory ("requires v75 or newer" — v81 *is* newer). Our result is about **accuracy**: 0/4 on the argmax gate, all three recipes. |
+| 8 | (rewritten 2026-08-13 — this entry itself was wrong) W4A16 fails **solely on accuracy**; the "no INT4 kernel" claim was dismissed for bad sourcing | this file until 2026-08-13; remote summary §3.1 argued it badly | The kernel claim is real and now directly measured: **zero** INT4 MatMul/FC entries in `htp_v2.json` (SDK 2.43 & 2.48), and qairt-converter folds s4 weights to f16 (HTP doc §5.3/§10.1). Our 0/4 accuracy result at 0.6B also stands. W4A16 is dead on both grounds (§4.1). |
 | 9 | ctx-bins are **1.5 GB** | LOCAL_ENV, remote summary §2.1 | ~**1.09 GB** for every current 0.6B build — measured 2026-08-12. See open question §8.2. |
 | 10 | Graph names are **cosmetic** | BUILD_GUIDE §3.4, NOTES-genie-io | Cosmetic to Genie's picker only. Load-bearing for the HTP backend config (§3.3). |
 | 11 | Disk: **flat 6 GB `disk_guard`, compact the VHD to recover** | BUILD_GUIDE §8 | `disk_guard <need_gb>` must be **sized to the step** (a 4B export writes 8.6 GB). No compaction needed — the vhdx is sparse and `/` is mounted `discard`. |
-| 12 | Decode throughput **7.4–8.2 tok/s** | remote summary §2.1 | Never reproduced here; our builds measure 6.3–6.5 AR-1. |
+| 12 | (revised 2026-08-13) Decode throughput **7.4–8.2 tok/s** — dismissed here as "never reproduced" | remote summary §2.1; the dismissal was this file's until 2026-08-13 | Reproduced by the device team on **their own** unfused builds: 7.79–7.80 tok/s, runtime configs identical to ours (HTP doc §3.2). Our bundles still measure 6.3–6.5 — the ~20% delta is build-side and unexplained (§8.8). |
 | 13 | qh cold start is **+134% vs ladekv** (1070 vs ~458 ms) | qh report §1, §4 | Units mismatch — 1070 ms is init→first-logits, 458 ms is TTFT measured from prefill start. Like-for-like the ladekv build takes **1247 ms** to first logits, so qh is ~177 ms *faster*, not 134% slower (§6.1). |
+| 14 | The GVM guest gets **2 of 4 NSPs** (~8 MB VTCM each, "4 HVX threads per NSP") | remote summary §1.1–1.2; this file §1 until 2026-08-13 | Official spec: each HTP has **8 HVX units and 16 MB VTCM**. The observed 8 HVX threads + 16 MB VTCM is **one full HTP**, not two halves. 4 cores are visible to `qnn-platform-validator`; Genie drives 1. Theoretical multi-HTP upside is ×4, not ×2; the allocation mask is unknown (§8.6). |
+| 15 | QKV/Gate-Up fusion **buys no tok/s** — dead end | this file §4.1 until 2026-08-13; BUILD_GUIDE §5.3 | The verdict was measured against a v1-era fused build that was emitting garbage. The device team's working fused build: **8.98 vs 7.79 unfused (+15%)**, decode DDR 880 vs ~960 MB (§6.6). Fusion is back on the table — re-test on topology B. |
+| 16 | **LADE is broken on this platform** (SIGSEGV @ PC 0x4c2d58; "needs a Qualcomm fix") | HTP doc §7/§9/§12.6 | Stale by a day: LADE ran **10.8 tok/s on 2026-08-11** (9.3 for qh, 08-12) on the same device. The crash is config-side — the HTP doc's own §8.3 `graph_names` lists only `["prefill","decode"]`, and an unlisted verify graph null-pointers on the first speculation step (§3.3); the AR==CL and 1-token-prompt traps also apply (§3.4). |
+| 17 | **`lm_head` must remain FP16** (else error 0xc26) | HTP doc §5.1 | 0xc26 is the **embedding Gather** restriction only. An INT8 (`sFxp_8`) lm_head builds, loads, and runs with unchanged quality — verified in the qh build (§6.4). We keep it FP16 by default for the LADE-acceptance reason, not supportability. |
+| 18 | Unfused W8A16 at vtcm 16 spills **1.49 GB** at build time | HTP doc §4.2 ("older optctx2" row) | *Probable, not proven:* the graph-names-mismatch artifact — an unlisted graph gets 4 MB VTCM, and that exact failure measured 1.446 GB of spill here (`docs/NOTES-vit-htp-config.md`). Every correctly-configured vtcm-16 build, theirs and ours, spills ~0. |
+| 19 | An oversized ctx-bin means **weight sharing is disabled** (check `weight_sharing_enabled`) | this file §8.2; MAX_TPS §2 A.4 as originally written | Incomplete. Weight sharing can be **on and working** and the bin still inflate, because dedup needs the graphs' exported **weights to be byte-identical**, and a *calibrated* export is not byte-identical to an `--export-decode` export of the same model — see §6.7. Check which export path each graph came from before touching the config. |
+
+---
+
+## 6.7 Calibrated vs `--export-decode` weights are not byte-identical (2026-08-13)
+
+Measured on the fused Qwen3-0.6B build, comparing the ONNX initializers the
+converter actually consumes:
+
+| Pair | `layers.0.mlp.gate_up_proj.weight` |
+|---|---|
+| calibrated prefill vs `--export-decode` decode | **3,505,204 / 6,291,456 elements differ** (~56%), ~1 quantization step, max rel 4.0e-02 |
+| `--export-decode` decode vs `--export-decode` verify32 | **bit-identical** |
+| prefill built **with** `--eval` vs **without** | **bit-identical** |
+
+The calibration path runs `clip_weights_to_7f7f(sim)` after
+`compute_encodings`; the `--export-decode` path calls `load_encodings` and
+never clips. `--eval` was suspected and is **exonerated** — it is a pure
+read-only evaluation and changes no exported byte.
+
+Consequence for ctx-bin size, measured the same day at 0.6B fused:
+
+| ctx-bin | Graphs | Size |
+|---|---|---|
+| `fuseqkvgu` (intermediate) | calibrated prefill + decode | 1,524,551,680 B |
+| `fuseqkvgu-lade` (intermediate) | calibrated prefill + decode + verify32 | 1,536,610,304 B |
+| **`fuseqkvgu-ladekv` (shipped)** | past-KV prefill + decode + verify32, **all `--export-decode`** | **1,102,467,072 B** |
+
+So the LADE/LADEKV bundles dedup perfectly *because* all three of their graphs
+come from `--export-decode` adopting one prefill's encodings. The two-graph
+`_local` bundles mix the two paths and are the ones to watch. **The oversized
+intermediates above are expected and disposable — do not "fix" them.**
+
+Still unexplained: the 2026-08-10 fused two-graph bin measured 1,084,137,472 B
+and the non-fused one 1,087,074,304 B, i.e. both deduped despite mixing the two
+export paths. Their quant dirs are gone, so the difference cannot be
+reconstructed. Treat two-graph bin sizes as uninformative until this is closed.
 
 ---
 
 ## 8. Open questions
+
+*Outstanding: `docs/DEVICE_MEASUREMENT_REQUEST_2026-08-13.md` asks the device
+team for run-now measurements covering §8.3, §8.8, §8.9, and the op-level
+decode profile (where the ~155 ms/step actually goes).*
 
 ### 8.1 Where do the ~139 MB go? *(qh, §6.4)*
 The DLC shrinks 151 MB, the ctx-bin only 12.5 MB. Hypothesis: HTP re-materializes
@@ -408,7 +503,9 @@ We build with `soc_model` unspecified. The SDK maps SA8797 → `soc_id 72`, and
 Qualcomm's HTP docs state that specifying it at O=3 "could turn on additional
 [algorithms] which may further improve inference performance". Real performance
 possibly left on the table, for **all** builds, not just the ViT. Needs a measured
-A/B before the next device run.
+A/B before the next device run. The HTP doc's §8.4 "verified working" build sets
+`soc_id: 72` **and** `soc_model: 72` explicitly — one more reason to just set
+them and A/B once.
 
 ### 8.5 AR-32 ↔ AR-1 reshape churn
 After every dialog-level KV update the cache is reshaped to the smallest
@@ -416,10 +513,16 @@ registered AR. In LADE that means an AR-32↔AR-1 reshape every iteration. If de
 KPIs ever implicate it, the lever is a LADE-only ctx-bin with no AR-1 graph — the
 graph is never invoked anyway (§6.1).
 
-### 8.6 Environmental, unchanged from the remote team
-4 NSPs instead of 2 (needs QNX-side VM config) · whether signed PD grants more
-VTCM · `DDR_PERF_MODE` (C API option 7, not exposed in Genie JSON) · QNX shell
-access via serial, the single highest-leverage change available (5–15× potential).
+### 8.6 Environmental (revised 2026-08-13 per the HTP doc)
+Multi-HTP for the guest — 4 cores are *visible* to `qnn-platform-validator`, but
+Genie creates a single-core device and the observed 8 HVX + 16 MB VTCM is
+exactly **one** HTP, so the theoretical upside is ×4, not ×2; the hypervisor
+allocation mask is unknown (FAE) · whether signed PD grants more VTCM or
+resources (probe so far: `pd_session: "signed"` with an unsigned skel silently
+falls back, no error, no change) · whether DLBC is active and what it buys for
+LLM traffic (FAE) · `DDR_PERF_MODE` (C API option 7, not exposed in Genie JSON)
+· QNX shell access via serial, still the single highest-leverage environmental
+change available.
 
 ### 8.7 Qwen3-VL-4B stage 2
 The W8A16 recipe is **validated at 4B** — 22 multimodal calibration windows,
@@ -431,6 +534,34 @@ budget. The cause is structural — the legacy `sim.export` path holds four fp32
 copies of a 15.0 GiB graph. Allocator tuning bought ~3%. The real lever is
 switching to `sim.onnx.export()`, which needs the encodings names and
 `rename_aimet_io.py`'s positional assumptions revalidated.
+
+Downstream of export, the 4B text tower **must** ship as ≥2 ctx-bins:
+`qnn-context-binary-generator` has a hard 3.5 GiB per-graph serialization limit
+and the 36-layer graph estimates 4.18 GiB (weights only — context length does
+not move it). The split contract is in `docs/NOTES-genie-splits.md`.
+
+### 8.8 Why are the device team's builds ~20% faster?
+Their unfused W8A16 decodes at 7.79–7.80 tok/s where our v2 bundle measures
+6.5, with runtime configs identical field-for-field (§6.6). The delta is
+build-side: their unfused ctx-bin is 1.01 GB vs our 1.087 GB, so something
+structural differs — converter flags, context length, embedding handling, or
+calibration. Resolve by diffing their exact converter/quantizer invocations and
+a `qnn-context-binary-utility --json_file` dump of their bin against ours.
+Worth ~20% on every future build if it transfers.
+
+### 8.9 `hvx_threads`: 4 or 8?
+The runtime always reports **8 HVX threads in use**, on every workload size,
+yet both teams build and configure with `hvx_threads: 4` (HTP doc open
+question 7). Whether 8 at build/config time changes scheduling is an unrun,
+cheap A/B — set it in both `configs/htp_config.json` and
+`htp_backend_ext_config.json`.
+
+### 8.10 n-gram acceptance at 4B
+Everything LADE buys at 4B hinges on acceptance holding near 0.6B's ~1.94
+tokens/call, and 4B output distributions differ. Measure it in the first 4B
+device run. If it sags, the SDK's learned-draft dialogs (`eaglet`, `spd`, with
+Qwen3-4B-class example configs) are the designed answer (§6.3) — at ~4 GB
+streamed per verify call, acceptance is worth far more per point than at 0.6B.
 
 ---
 
@@ -459,9 +590,21 @@ uploads. Use `scripts/util/hf_upload_watchdog.sh`, and:
    then "hangs" with every byte already uploaded. Diagnose with one foreground
    `HfApi().upload_file` (a 429 surfaces in seconds). Recover by waiting ~1 h and
    committing one file at a time — blobs dedup, so each commit is instant.
-3. **`hf upload-large-folder` silently flips a private repo PUBLIC** (it applies
-   its default `private=False`). Re-check `HfApi().repo_info(repo).private` after
-   every bulk upload. Single `upload_file` commits don't touch repo settings.
+3. **`hf upload-large-folder` silently resets repo visibility and overwrites the
+   hub README** (it applies its own defaults rather than preserving settings).
+   Re-check `HfApi().repo_info(repo).private` and the README after every bulk
+   upload — but **report a change, never "restore" it from assumption**.
+   Visibility on the bundle repos is switched often and deliberately by the
+   user, so **this document does not record it**: read it live with
+   `HfApi().repo_info(repo).private` when it matters, change it only when
+   asked in that message, and if a bulk upload flipped it, say so and stop.
+   Acting on a remembered value has caused four incidents, in both directions.
+   Single `upload_file` commits don't touch repo settings.
+4. **Detach long uploads with `setsid`.** A backgrounded `upload_file` is killed
+   when its parent shell exits — the log just stops mid-progress-bar with no
+   error, which reads exactly like a proxy drop and sends you chasing the wrong
+   bug. `setsid nohup … & disown` survives; through the local proxy a 1.08 GB
+   blob then uploads in well under a minute.
 
 **Environment.** `source scripts/env.sh` first in every shell. `QUANT_DEVICE=cpu`
 for anything >0.6B on this 8 GB-VRAM box. Hard pins: `onnx==1.19.0` in **both**
@@ -479,8 +622,11 @@ cross-variant `load_encodings`).
 | **`docs/REFERENCE.md`** (this file) | **current truth** | start here |
 | `CLAUDE.md` | current | terse operating rules for agents |
 | `docs/BUILD_GUIDE.md` | current | step-by-step recipes, per-variant commands, troubleshooting |
+| `docs/MAX_TPS_QWEN3_0.6B.md` | current | the single path to the fastest 0.6B bundle — proven 10.8 tok/s recipe + fused-LADEKV candidate + config A/Bs |
 | `docs/NOTES-genie-io.md` | current, SDK-cited | the Genie/qualla contract — read before touching graph I/O |
 | `docs/NOTES-vit-htp-config.md` | current | why graph names must appear in the backend config |
+| `docs/NOTES-genie-splits.md` | current, SDK-cited | the multi-ctx-bin (split) contract — required for any graph over the 3.5 GiB serialization limit, i.e. every text tower ≳2B |
+| `docs/SA8797P_HTP_v81_Hardware_and_Deployment_Quantization_Reference_EN.md` | current, annotated | the device team's measured-only hardware/runtime truth (2026-08-12) — best hardware ground source. Three superseded claims are flagged in its header annotation (corrections #16–18). |
 | `docs/LOCAL_ENV.md` | current + historical log | environment provenance, AIMET workarounds, progress log. Its ctx-bin sizes are marked stale. |
 | `docs/SDK_INVENTORY.md` | current | what's in the QAIRT drop and what runs locally |
 | `SA8797P_Deployment_Status_Summary.md` | **partly superseded** | the remote team's hardware/GVM characterization (§1, §3.2) is still the best there is. Its §2–4 carry corrections 6, 7, 8, 9, 12 above. |

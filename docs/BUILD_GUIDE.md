@@ -153,14 +153,20 @@ All graphs in one ctx-bin share weights, so all DLCs must convert against **the
 same encodings file** (the prefill run's). Never recalibrate one graph of a
 set. This is also why `--adopt-encodings` exists (§5.6): a graph-shape-only
 rebuild reuses the old calibration bit-exactly and only reconverts one DLC.
-(History: per-graph encodings mismatches are the class of failure behind the
-remote team's "error 5005".)
+(History: per-graph encodings mismatches were blamed for the remote team's
+"error 5005"; their HTP doc §9 instead ties 5005 to NOT_SUPPORTED triggers —
+`vtcm_mb > 16`, multi-core — so treat that attribution as unconfirmed. The
+mismatch itself is still a hard load failure.)
 
 ### 3.4 Runtime facts that shape decisions
 
 - `vtcm_mb: 16` and `pd_session: "unsigned"` are the device caps (24 MB VTCM
   is rejected on unsigned PD). `O: 3`, 4 HVX threads, perf profile
-  `llm_decode_burst`.
+  `llm_decode_burst`. Two unrun A/Bs on these numbers: the runtime always
+  reports **8** HVX threads in use regardless of `hvx_threads: 4`
+  (REFERENCE §8.9), and the device team's verified build sets
+  `soc_id`/`soc_model: 72` explicitly where ours leaves them unset
+  (REFERENCE §8.4).
 - Cross-graph **weight sharing must be ON** in `configs/htp_config.json` —
   it's what makes a 3-graph bin cost ~1.1 GB instead of 3×.
 - Genie drives our `(128,128)` no-past-KV prefill graph in "bertcache" mode:
@@ -168,7 +174,9 @@ remote team's "error 5005".)
   whole-window reprocess) until the KV passes 128 positions, then switches to
   the AR-1 decode graph (~155 ms/tok). Quote tok/s numbers per phase.
 - Device-measured (v2, 2026-08-11): decode ~6.5 tok/s, prefill-phase
-  ~23.8 tok/s, init ~0.8 s, RAM ~163 MB.
+  ~23.8 tok/s, init ~0.8 s, RAM ~163 MB. (The device team's own unfused builds
+  measure **7.8 tok/s** with identical runtime configs — the ~20% delta is
+  build-side and unexplained, REFERENCE §8.8.)
 - **Graph selection is numeric best-fit on (AR, CL) — names are cosmetic *to
   Genie*.** Genie picks the smallest CL ≥ current KV, then the smallest AR ≥ the
   batch size (largest smaller AR = chunking fallback). Consequences: two graphs
@@ -257,9 +265,14 @@ Require the baseline (§5.1) as encodings donor:
     $LLMDEPLOY_DATA/work/quant/qwen3-0.6b-w8a16-prefill 128 1024 --fuse-gate-up
 ```
 
-Device verdict so far: fusion showed **no decode tok/s gain at vtcm 16**
-(6.27–6.5 tok/s ≈ baseline). Keep building these only for A/B completeness or
-if signed PD (vtcm 24) becomes available.
+Device verdict — **revised 2026-08-13**: our "no gain at vtcm 16" A/B
+(6.27–6.5 tok/s) compared against a v1-era fused build that was emitting
+garbage output, so it never actually measured fusion. The device team's
+*working* fused build measures **8.98 vs 7.79 unfused (+15%)**, decode DDR
+read 880 vs ~960 MB (REFERENCE §6.6, correction #15). Fusion is back on the
+table: re-A/B on topology B before the next device cycle, and treat it as a
+first-class candidate for the 4B build (each fused-away op also refunds its
+~220 µs dispatch, which compounds at 36 layers).
 
 ### 5.4 Lookahead decoding (`-lade`, 3-graph)
 
@@ -384,11 +397,15 @@ chain (not the §5.6 fast path):
   prefill (763,410,432) and decode (961,130,496) `read_total_bytes` of one
   *non-qh* weight-shared build, two days before `--quant-head` existed. No
   converter DDR summary for a real qh build has been recorded.
-- `--weight-bw 4` (+ optional `--lpbq`, `--seq-mse`): **W4A16 is a dead end at
-  0.6B.** All three recipes — per-channel int4, LPBQ block-64, LPBQ+SeqMSE —
-  scored 0/4 on the `--eval` argmax gate that W8A16 passes 3/4
-  (`max|Δlogits|` 16–25 vs 1.3–1.7). The flags remain for larger models, where
-  4-bit PTQ has room; don't re-run this experiment on 0.6B.
+- `--weight-bw 4` (+ optional `--lpbq`, `--seq-mse`): **W4A16 is a dead end,
+  full stop** (2026-08-13). Two independent kills: (a) accuracy — all three
+  recipes (per-channel int4, LPBQ block-64, LPBQ+SeqMSE) scored 0/4 on the
+  `--eval` argmax gate that W8A16 passes 3/4 (`max|Δlogits|` 16–25 vs 1.3–1.7);
+  (b) kernels — `htp_v2.json` contains **zero** INT4 MatMul/FC entries (SDK
+  2.43 and 2.48 alike) and qairt-converter folds s4 weights back to f16
+  (`Constant folded static tensor ... from s4 to f16` — HTP doc §5.3/§10.1).
+  Even a model that quantized well would not run 4-bit on this SDK. The flags
+  stay in the script only for a future SDK that ships the kernels.
 
 ## 6. Validation gates — run before shipping anything
 
@@ -452,11 +469,20 @@ hangs on CLOSE-WAIT sockets looking alive). Three hard-won rules:
    foreground `HfApi().upload_file` (a 429 surfaces in seconds). Recovery:
    stop all uploaders, wait ~1 h, then commit **one file at a time** with
    `upload_file` — the blobs dedup, so each commit is data-free and instant.
-3. **`hf upload-large-folder` silently flips a private repo to PUBLIC** (it
-   applies its default `private=False`). After any bulk upload, check
-   `HfApi().repo_info(repo).private` and restore with
-   `HfApi().update_repo_settings(repo, private=True)`. Single `upload_file`
+3. **`hf upload-large-folder` silently resets repo visibility and overwrites
+   the hub README.** After any bulk upload, check
+   `HfApi().repo_info(repo).private` and diff the README — then **report what
+   changed; do not "restore" a setting from assumption.**
+   Repo visibility is switched often and deliberately by the user, so no doc
+   here records it. Read `HfApi().repo_info(repo).private` live when it
+   matters, change it only when asked in that message, and if a bulk upload
+   flipped it as a side effect, report it and stop. Acting on a remembered
+   value has caused four incidents, in both directions. Single `upload_file`
    commits do not touch repo settings — prefer them once blobs are staged.
+4. **Long single-file uploads need `setsid`.** Backgrounded from a shell that
+   then exits, the uploader is killed and its log simply stops mid-progress-bar
+   with no error — indistinguishable from a proxy drop at a glance. Use
+   `setsid nohup … & disown`; a 1.08 GB blob then lands in under a minute.
 
 Device smoke test:
 
@@ -490,6 +516,7 @@ environment.
 | WSL2 C: drive filling up | Call `disk_guard <need_gb>` (in `env.sh`) before every multi-GB step, **sized to that step**: 6 GB is the converter floor, a 4B export writes 8.6 GB and should ask 20. A flat 6 GB check passes and then still runs C: dry mid-step. No compaction step is needed to recover: the vhdx is sparse and `/` is mounted `discard`, so deleting in-guest returns the space to C:. (`ls` always reports the ~448 GB virtual size; `du -h <vhdx>` without `--apparent-size` is the real consumption.) |
 | WSL2 VM hard-crashes, no OOM line anywhere | C: ran dry and the vhdx grow failed. This is **not** ENOSPC — the guest still reports free space, the host write fails, and every mmap'd page takes SIGBUS; PID 1 dies and the VM dies with it (3× on 2026-08-12 during VL-4B stage 2). Dumps land in `%LOCALAPPDATA%\Temp\wsl-crashes`; the `-N` filename suffix is the signal, `-7` = SIGBUS. Prevention is `disk_guard`, above. |
 | `--quant-head` build looks identical to a normal one | `--keep-head-weight` missing → the encodings filter stripped the head encoding and the converter emitted `Float_16`. Check with `qairt-dlc-info \| grep lm_head.weight` (§5.7). |
+| Device output loops until `Context Size was exceeded` | The shipped `genie_dialog*.json` is the **greedy parity config** (temp 0, no `max-num-tokens`) — right for validation, a footgun for demos; the device team hit exactly this (HTP doc §8.2). For interactive runs add `max-num-tokens` and sampling (temp 0.85 / top-k 50 / top-p 0.9 verified on device), and apply the Qwen3 chat template with the empty `<think>\n\n</think>` block so thinking mode stays off. |
 | Ctx-bin much larger than one DLC in a multi-graph build | Weight sharing not effective. A 3-graph 0.6B bin should be ~1.09 GB, not 1.8–2.2 GB — check `context.weight_sharing_enabled` in `configs/htp_config.json`. |
 
 ## 9. Map of the repo
@@ -511,8 +538,11 @@ environment.
 | `scripts/validate/parity_onnx.py`, `parity_qualla_read.py`, `parity_ladekv_read.py`, `parity_verify.py` | validation gates (§6) |
 | `scripts/util/hf_upload_watchdog.sh` | supervised HF upload |
 | `docs/REFERENCE.md` | **consolidated, corrected reference — start here** |
+| `docs/MAX_TPS_QWEN3_0.6B.md` | the max-throughput 0.6B build path (proven 10.8 tok/s + fused candidate + A/Bs) |
 | `docs/NOTES-genie-io.md` | the Genie contract with SDK source citations — read before touching graph I/O |
 | `docs/NOTES-vit-htp-config.md` | why graph names must appear in the backend config (§3.4) |
+| `docs/NOTES-genie-splits.md` | multi-ctx-bin (split) contract — required for any graph over the 3.5 GiB serialization limit (every text tower ≳2B) |
+| `docs/SA8797P_HTP_v81_Hardware_and_Deployment_Quantization_Reference_EN.md` | device team's measured hardware/runtime reference (2026-08-12), annotated — the hardware ground truth |
 | `docs/LOCAL_ENV.md` | environment provenance + progress log |
 | `reports/` | device test reports (v1 failure analysis, v2 validation, ladekv, qh) |
 | `SA8797P_Deployment_Status_Summary.md` | inherited remote-team status, 2026-08-09 — **partly superseded**, see its banner and `docs/REFERENCE.md` |
