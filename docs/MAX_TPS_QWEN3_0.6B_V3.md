@@ -301,6 +301,46 @@ attention while adopting grouped encodings — the build succeeds, parity passes
 the bin loads, and only the device is slow. That is what the new gate exists to
 catch.
 
+### Phase 3 — a new, unplanned finding: weight sharing breaks with bertcache prefill
+
+Building the leaves surfaced something V3 did not anticipate. **Any ctx-bin
+containing the CL=128 bertcache prefill graph, under grouped attention, loses
+weight sharing**; bins without that graph share perfectly.
+
+| ctx-bin | graphs | sharedWeightsSize | constSize/graph | file |
+|---|---|---:|---:|---:|
+| baseline 2-graph | bertcache + decode | 1,063 MB | 4 MB | 1.087 GB |
+| gqafix decode-only | decode | — | — | 1.072 GB |
+| **gqafix 2-graph** | **bertcache** + decode | **623 MB** | **444 MB** | **1.523 GB** |
+| **gqafix lade** | **bertcache** + decode + verify32 | — | — | **1.529 GB** |
+| **gqafix dlbc** | **bertcache** + decode | — | — | **1.523 GB** |
+| gqafix ladekv | past-KV prefill + decode + verify32 | 1,067 MB | 0 | 1.087 GB |
+
+The weight *bytes* are unchanged — 623 shared + 444 const ≈ the original
+1,067 MB — so ~444 MB of INT8 decoder weights simply moved from the shared pool
+into per-graph constants and are therefore stored twice. Graph count is not the
+variable (the 3-graph ladekv shares; the 2-graph gqafix does not), `dlbc` is not
+the variable, and the topology gates clean, so this lives in the ctx-bin
+generator's layout/sharing decision rather than in the exported graph.
+
+Consequences, in order of importance:
+
+1. **The decisive measurement is unaffected.** The B7a profiling bin is
+   single-graph, so there is nothing to share and no confound.
+2. **The cleanest A/B is unaffected.** `gqafix_ladekv` basic-mode versus
+   pre-fix `ladekv` basic-mode (A1) is same topology, same graph count, same
+   1.087 GB — only the attention differs. The kit's decision table now names
+   that pair as primary evidence and demotes `gqafix_local` to corroboration.
+3. `gqafix_local` is +436 MB against a device whose `/data` runs 98–99% full,
+   and it is not size-matched to the 11.72 tok/s baseline it exists to compare
+   against. Per-step traffic should not change — each graph still streams the
+   same weights — but init time may.
+4. The C3 hybrid bin contains a bertcache prefill by construction, so it will
+   carry the same cost. That is a real product trade-off for the 186 → 40 ms
+   TTFT win, not a free one.
+
+Root cause is an open question, recorded as #10 below.
+
 ### Operational
 
 C: fell from 67 GB to ~50 GB during the first two quantization stages
@@ -315,3 +355,10 @@ and regenerable but not disposable without asking.
    is a desk experiment and the projection ladder de-risks without any device time)
 9. Post-B, where do the bytes actually bind — weights, KV, or the unexplained 64 ms term?
    (decision table rows 1–2/4 resolve this in one session)
+10. **Why does the CL=128 bertcache prefill lose weight sharing under grouped
+    attention?** ~444 MB of INT8 decoder weights fall out of the shared pool
+    into per-graph constants (§10b). Not graph count, not `dlbc`, not the
+    topology — it is in the generator's layout decision. Worth resolving before
+    shipping any bertcache-prefill product (which includes the C3 hybrid), and
+    it may indicate the compiler is choosing a *different, possibly better*
+    weight layout for the grouped prefill that decode cannot match.
