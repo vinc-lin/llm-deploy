@@ -114,18 +114,46 @@ every demo run of those died. Fixed and re-uploaded to HF as of 2026-08-14; the
 combination is now refused by a linter that runs during bundling. If you pulled
 those three bundles before today, re-pull them.
 
-## 6. What is coming next
+## 6. Everything is on HF now — `vinccniv/sa8797p-qwen3-w8a16-bundles`
 
-We are building a set of bundles that eliminate the GQA replication, plus
-contingency variants (W8 head on a clean 2-graph bin; a CL=512 context; a
-`dlbc` variant; a hybrid bertcache+past-KV prefill for fast TTFT). They will
-arrive on HF as a **self-contained test kit**: a runner script, a
-priority-ordered runsheet, fixed prompts, expected outputs for quality checking,
-and a decision table that maps every possible outcome to a pre-agreed
-conclusion — so the session needs no round-trip with us.
+Eight bundles that eliminate the GQA replication, the profiling bin for the
+decisive measurement, and a **self-contained test kit**. Start at
+`kit/runsheet.md`; every outcome already has a pre-agreed meaning in
+`kit/decision_table.md`, so **the session should need no round-trip with us**.
 
-The single decisive measurement will be the decode-only cycle profile on the
-fixed graph: **we expect ~350M → ~90M aggregate cycles.** We attempted to
-pre-answer this without hardware using the x86 HTP emulation backend, but
-`libQnnHtpQemu.so` rejects v81 ctx-bins outright (`Request feature arch with
-value 81 unsupported`), so it has to be measured on the device.
+| Path | What |
+|---|---|
+| `kit/runsheet.md` | priority-ordered arms, protocol, what to send back |
+| `kit/decision_table.md` | what each result means, agreed in advance |
+| `kit/run_all.sh` | runs priorities 2–7 unattended; skips absent bundles |
+| `kit/prompts/`, `kit/expected/` | 3 prompt classes + greedy HF references |
+| `profiling/qwen3-0.6b-w8a16-gqafix-decodeonly_ctx.bin` | priority 1 (B7a) |
+| `qwen3_06b_w8a16_gqafix_*.tar.gz` | the eight bundles |
+
+**Priority 1 is the decisive one:** the decode-only cycle profile on the fixed
+graph. We expect **350.3M → ~90M aggregate cycles**. We tried to pre-answer it
+without hardware using the x86 HTP emulation backend, but `libQnnHtpQemu.so`
+rejects v81 ctx-bins outright (`Request feature arch with value 81
+unsupported`), so it has to be measured on the device.
+
+**Priority 3 is the cheapest high-value run** and needs nothing new from us:
+basic mode on the plain `qwen3_06b_w8a16_ladekv` bundle you already have (§3).
+
+Two things to know before you interpret anything:
+
+- **`gqafix_local`, `gqafix_qh`, `gqafix_cl512`, `gqafix_dlbc`, `gqafix_udma`
+  and `gqafix_hybrid` are ~1.32 GB, not 1.09 GB.** Any bin containing the
+  CL=128 bertcache prefill graph carries one private ~444 MB copy of the
+  decoder weights under the new attention. Weight *bytes* per step are
+  unchanged, so this should not move decode traffic, but it costs disk on a
+  device whose `/data` runs 98–99% full and may affect init time. Root cause
+  not yet established; it is in the ctx-bin generator, not the graph topology.
+  `gqafix_ladekv` and `gqafix_pastkv2g` are unaffected at 0.93 GB, and so is
+  the single-graph profiling bin — **the decisive measurement has no confound.**
+- Because of that, **the cleanest A/B is `gqafix_ladekv` basic mode versus the
+  pre-fix `ladekv` basic mode** — same topology, same graph count, same size,
+  only the attention differs. Treat `gqafix_local` vs the 11.72 tok/s baseline
+  as corroboration rather than primary evidence.
+
+If you pulled `fuseqkvgu` / `socmodel72` / `hvx8` before 2026-08-14, re-pull —
+their demo config was the SIGSEGV one (§5).
