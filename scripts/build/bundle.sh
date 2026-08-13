@@ -41,6 +41,12 @@ d["dialog"]["engine"]["model"]["binary"]["ctx-bins"] = [bin_name]
 json.dump(d, open(p, "w"), indent=2)
 PYEOF
 
+# Gate: a "lade" dialog carrying "max-num-tokens" SIGSEGVs on device (exit 139).
+# That pair shipped in three bundles because the demo/basic dialogs are added by
+# hand AFTER this script runs (BUILD_GUIDE.md) -- so re-run this linter over the
+# bundle directory after adding them, not just here.
+python3 "$LLMDEPLOY_ROOT/scripts/validate/lint_bundle_dialogs.py" "$OUT"
+
 ls -lh "$OUT"
 tar -C "$LLMDEPLOY_DATA/bundles" -czf "$LLMDEPLOY_DATA/bundles/$NAME.tar.gz" "$NAME"
 ls -lh "$LLMDEPLOY_DATA/bundles/$NAME.tar.gz"

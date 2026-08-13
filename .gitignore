@@ -6,3 +6,10 @@ work/
 bundles/
 *.log
 __pycache__/
+
+# P0.6 decision (2026-08-14): supplier-IP analysis stays OUT of this repo, the
+# same way the ASR-package analysis lives outside it. These are untracked on
+# purpose -- this history has been scrubbed twice for leaks of exactly this
+# class, and the photos carry full terminal chrome.
+reports/0813/
+reports/sharegpt-onestep-1.7b-intent-ext-build-analysis.md

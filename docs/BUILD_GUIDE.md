@@ -441,6 +441,13 @@ d = json.load(open("/mnt/x/code/llm-deploy/configs/genie_dialog_qwen3_0.6b.json"
 d["dialog"]["engine"]["model"]["binary"]["ctx-bins"] = ["qwen3-0.6b-w8a16-ladekv_ctx.bin"]
 json.dump(d, open("genie_dialog_basic.json", "w"), indent=2)
 EOF
+
+# MANDATORY after hand-adding dialogs -- bundle.sh's own gate ran before they
+# existed. A "lade" dialog carrying "max-num-tokens" SIGSEGVs on device (139);
+# that pair reached three shipped bundles through exactly this ungated step.
+python3 $LLMDEPLOY_ROOT/scripts/validate/lint_bundle_dialogs.py \
+    $LLMDEPLOY_DATA/bundles/qwen3_06b_w8a16_ladekv
+
 cd $LLMDEPLOY_DATA/bundles && tar -czf qwen3_06b_w8a16_ladekv.tar.gz qwen3_06b_w8a16_ladekv
 ```
 

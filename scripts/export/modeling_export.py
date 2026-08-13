@@ -58,12 +58,13 @@ def apply_rope(x, cos_h, sin_h):
 
 
 class ExportAttention(nn.Module):
-    def __init__(self, cfg, fuse_qkv: bool):
+    def __init__(self, cfg, fuse_qkv: bool, grouped_gqa: bool = False):
         super().__init__()
         self.n_heads = cfg.num_attention_heads
         self.n_kv = cfg.num_key_value_heads
         self.head_dim = cfg.head_dim
         self.fuse_qkv = fuse_qkv
+        self.grouped_gqa = grouped_gqa
         hidden = cfg.hidden_size
         q_out = self.n_heads * self.head_dim
         kv_out = self.n_kv * self.head_dim
@@ -108,15 +109,43 @@ class ExportAttention(nn.Module):
             k_t, v_full = new_k_t, new_v
         T = k_t.shape[-1]
 
-        # GQA: expand kv heads to q heads (no repeat_interleave: keep ops simple)
         rep = self.n_heads // self.n_kv
-        k_t = k_t.unsqueeze(2).expand(B, self.n_kv, rep, self.head_dim, T).reshape(B, self.n_heads, self.head_dim, T)
-        v_full = v_full.unsqueeze(2).expand(B, self.n_kv, rep, T, self.head_dim).reshape(B, self.n_heads, T, self.head_dim)
+        if self.grouped_gqa:
+            # Batch the attention MatMuls over the 8 KV heads instead of
+            # materialising 16 replicated ones.
+            #
+            # WHY: the replicating form below costs 74.7% of every decode step's
+            # DSP cycles (261.8M of 350.3M, device profile 2026-08-13). The
+            # converter lowers each `expand` into an FP16 broadcast MULTIPLY
+            # (QNN Eltwise_Binary operation 13) whose output is 4.72 MB; at 2 per
+            # layer x 28 layers that is 264 MB written and 264 MB re-read by the
+            # MatMuls, every step, purely to hand the MatMul a tensor whose 16
+            # heads are 8 duplicated pairs.
+            #
+            # HOW: HF groups Q heads contiguously per KV head (kv head i serves q
+            # heads [i*rep, (i+1)*rep)), so H factorises as (n_kv, rep) in that
+            # order. Every reshape below is therefore a pure view -- no data
+            # moves, and the mask/softmax/output paths stay structurally
+            # identical to the replicating form, keeping the change to exactly
+            # the two MatMuls' batch dimension.
+            q_g = q.reshape(B, self.n_kv, rep * S, self.head_dim)
+            attn = torch.matmul(q_g, k_t) * self.scale         # [B, n_kv, rep*S, T]
+            attn = attn.reshape(B, self.n_heads, S, T)         # view: (n_kv, rep) == H
+            attn = attn + mask.unsqueeze(1)
+            attn = torch.softmax(attn, dim=-1)
+            attn = attn.reshape(B, self.n_kv, rep * S, T)      # view, back to grouped
+            out = torch.matmul(attn, v_full)                   # [B, n_kv, rep*S, D]
+            out = out.reshape(B, self.n_heads, S, self.head_dim)
+        else:
+            # GQA: expand kv heads to q heads (no repeat_interleave: keep ops simple)
+            k_t = k_t.unsqueeze(2).expand(B, self.n_kv, rep, self.head_dim, T).reshape(B, self.n_heads, self.head_dim, T)
+            v_full = v_full.unsqueeze(2).expand(B, self.n_kv, rep, T, self.head_dim).reshape(B, self.n_heads, T, self.head_dim)
 
-        attn = torch.matmul(q, k_t) * self.scale  # [B, H, S, T]
-        attn = attn + mask.unsqueeze(1)  # mask [1, S, T] additive -> broadcast heads
-        attn = torch.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v_full)  # [B, H, S, D]
+            attn = torch.matmul(q, k_t) * self.scale  # [B, H, S, T]
+            attn = attn + mask.unsqueeze(1)  # mask [1, S, T] additive -> broadcast heads
+            attn = torch.softmax(attn, dim=-1)
+            out = torch.matmul(attn, v_full)  # [B, H, S, D]
+
         out = out.transpose(1, 2).reshape(B, S, self.n_heads * self.head_dim)
         return self.o_proj(out), new_k_t, new_v
 
@@ -143,10 +172,10 @@ class ExportMLP(nn.Module):
 
 
 class ExportLayer(nn.Module):
-    def __init__(self, cfg, fuse_gate_up: bool, fuse_qkv: bool):
+    def __init__(self, cfg, fuse_gate_up: bool, fuse_qkv: bool, grouped_gqa: bool = False):
         super().__init__()
         self.input_layernorm = ExportRMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-        self.self_attn = ExportAttention(cfg, fuse_qkv)
+        self.self_attn = ExportAttention(cfg, fuse_qkv, grouped_gqa)
         self.post_attention_layernorm = ExportRMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = ExportMLP(cfg, fuse_gate_up)
 
@@ -180,7 +209,8 @@ class ExportQwen3(nn.Module):
     """
 
     def __init__(self, cfg, fuse_gate_up=False, fuse_qkv=False, use_past=True, logits_last_only=False,
-                 input_embeds=False, n_deepstack=0, n_layers=None, is_first=True, is_last=True):
+                 input_embeds=False, n_deepstack=0, n_layers=None, is_first=True, is_last=True,
+                 grouped_gqa=False):
         super().__init__()
         self.cfg = cfg
         self.use_past = use_past
@@ -202,7 +232,7 @@ class ExportQwen3(nn.Module):
             if (is_first and not input_embeds) else None
         )
         self.layers = nn.ModuleList(
-            [ExportLayer(cfg, fuse_gate_up, fuse_qkv) for _ in range(n_layers)]
+            [ExportLayer(cfg, fuse_gate_up, fuse_qkv, grouped_gqa) for _ in range(n_layers)]
         )
         # Weights the chunk does not own must not exist, or they land in its
         # ctx-bin as dead payload -- lm_head alone is 389 M params.
@@ -288,9 +318,11 @@ class ExportQwen3(nn.Module):
         return dst
 
     @staticmethod
-    def from_hf(hf_model, fuse_gate_up=False, fuse_qkv=False, use_past=True, logits_last_only=False):
+    def from_hf(hf_model, fuse_gate_up=False, fuse_qkv=False, use_past=True, logits_last_only=False,
+                grouped_gqa=False):
         cfg = hf_model.config
-        m = ExportQwen3(cfg, fuse_gate_up, fuse_qkv, use_past, logits_last_only)
+        m = ExportQwen3(cfg, fuse_gate_up, fuse_qkv, use_past, logits_last_only,
+                        grouped_gqa=grouped_gqa)
         src = hf_model.state_dict()
         dst = {}
         dst["embed_tokens.weight"] = src["model.embed_tokens.weight"]
