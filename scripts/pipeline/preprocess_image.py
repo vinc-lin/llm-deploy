@@ -73,7 +73,14 @@ def load_encoding(path):
                 assert dt == "QNN_DATATYPE_UFIXED_POINT_16", (
                     f"{TENSOR} is {dt}, not UFIXED_POINT_16 -- a stock Genie "
                     "pipeline cannot drive this graph (NOTES-genie-pipeline D)")
-                q = c["quantizeParams"]["scaleOffsetEncoding"]
+                # qnn-context-binary-utility 2.48.40 names this member
+                # "scaleOffset"; other releases have emitted
+                # "scaleOffsetEncoding". Accept either -- but never fall through
+                # to a default, because a silently wrong pixel scale is
+                # indistinguishable from a bad image until it reaches silicon.
+                qp = c["quantizeParams"]
+                q = qp.get("scaleOffset") or qp.get("scaleOffsetEncoding")
+                assert q, f"{TENSOR}: no scale/offset in quantizeParams {qp!r}"
                 return float(q["scale"]), int(q["offset"]), 16
         raise SystemExit(f"{TENSOR} not found among graph inputs in {path}")
 
