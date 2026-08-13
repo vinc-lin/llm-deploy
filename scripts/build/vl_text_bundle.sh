@@ -44,14 +44,28 @@ cp "$LLMDEPLOY_ROOT/configs/genie_dialog_qwen3vl_4b.json" "$OUT/genie_dialog.jso
 cp "$LLMDEPLOY_ROOT/configs/htp_backend_ext_config_vltext.json" "$OUT/"
 cp "$MODEL/tokenizer.json" "$OUT/"
 
-for f in libGenie.so libQnnHtp.so libQnnHtpV81Stub.so libQnnHtpPrepare.so \
-         libQnnSystem.so libQnnHtpV81Skel.so libQnnHtpNetRunExtensions.so; do
-    src=$(find "$QAIRT_SDK/lib" -name "$f" -path "*aarch64-android*" | head -1)
-    [ -n "$src" ] || { echo "MISSING SDK lib: $f"; exit 1; }
-    cp "$src" "$OUT/"
-done
-for b in genie-t2t-run genie-app; do
-    cp "$QAIRT_SDK/bin/aarch64-android/$b" "$OUT/" || { echo "MISSING $b"; exit 1; }
+# Two roots, and the split matters: six libraries are aarch64-android (host
+# side), but the Skel is DSP-side and lives under hexagon-v81/unsigned. A glob
+# restricted to aarch64-android silently misses it.
+A=$QAIRT_SDK/lib/aarch64-android
+H=$QAIRT_SDK/lib/hexagon-v81/unsigned
+SRCS=(
+  "$A/libGenie.so"
+  "$A/libQnnHtp.so"
+  "$A/libQnnSystem.so"
+  "$A/libQnnHtpPrepare.so"
+  "$A/libQnnHtpNetRunExtensions.so"
+  "$A/libQnnHtpV81Stub.so"
+  "$H/libQnnHtpV81Skel.so"
+  # genie-t2t-run drives this text dialog. genie-app ships too because Stage 3
+  # needs it: it is the only prebuilt binary exposing GenieNode_*/GeniePipeline_*
+  # and the image-encoder roles, and this tower is one half of that pipeline.
+  "$QAIRT_SDK/bin/aarch64-android/genie-t2t-run"
+  "$QAIRT_SDK/bin/aarch64-android/genie-app"
+)
+for f in "${SRCS[@]}"; do
+    [ -f "$f" ] || { echo "MISSING SDK file: $f"; exit 1; }
+    cp "$f" "$OUT/"
 done
 
 # A config naming a file that is not in the bundle is a silent runtime failure,
