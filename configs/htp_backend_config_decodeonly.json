@@ -1,0 +1,37 @@
+{
+  "graphs": [
+    {
+      "graph_names": [
+        "decode"
+      ],
+      "O": 3,
+      "vtcm_mb": 16,
+      "hvx_threads": 4,
+      "fp16_relaxed_precision": 0
+    }
+  ],
+  "devices": [
+    {
+      "dsp_arch": "v81",
+      "soc_model": 0,
+      "pd_session": "unsigned",
+      "cores": [
+        {
+          "core_id": 0,
+          "perf_profile": "burst",
+          "rpc_control_latency": 100,
+          "rpc_polling_time": 9999
+        }
+      ]
+    }
+  ],
+  "context": {
+    "weight_sharing_enabled": true
+  },
+  "memory": {
+    "extended_udma": true
+  },
+  "graph_configs_extra": {
+    "sparse_weights_compression": 1
+  }
+}
