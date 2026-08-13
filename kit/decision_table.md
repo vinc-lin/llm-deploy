@@ -75,8 +75,10 @@ pool is full at 1,067 MB *and* the bertcache graph additionally carries 444 MB
 of constants, while its two sibling graphs carry none. Every affected bin lands
 at ≈1.51 GB however the accounting falls out.
 
-Bins carrying the bertcache prefill, and therefore this cost:
-`gqafix_local`, `gqafix_dlbc`, `gqafix_udma`, `gqafix_hybrid`, `gqafix_qh`.
+Bins carrying the bertcache prefill, and therefore this cost (1.32–1.36 GB
+tarballs): `gqafix_local`, `gqafix_qh`, `gqafix_cl512`, `gqafix_dlbc`,
+`gqafix_udma`, `gqafix_hybrid`. Bins without it are 0.93 GB:
+`gqafix_ladekv`, `gqafix_pastkv2g`. The rule held across all seven bins built.
 
 **This changes what to expect from the W8-head arm.** In `gqafix_qh` the head
 lands in the duplicated pool (shared = 313 MB embed only; const = 599 MB =
