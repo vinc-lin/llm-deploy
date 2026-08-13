@@ -44,7 +44,6 @@
           "mmap-budget": 0,
           "poll": false,
           "cpu-mask": "0xe0",
-          "pos-id-dim": 64,
           "kv-dim": 128,
           "allow-async-init": false
         },
