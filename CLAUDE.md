@@ -30,6 +30,11 @@ Cross-graph rule: decode/verify/prefill DLCs must convert against the SAME
 encodings lineage (`--export-decode` / `--adopt-encodings`); mixed encodings
 are a fatal Genie load error (KV quant params must be byte-identical).
 
+**Qwen3-VL (multimodal)** is a separate chain, two towers built independently:
+`export_qwen3vl_vit.py` → `quantize_vit_aimet.py` → `vit_build_quant.sh` (vision)
+and `vl_text_build.sh` → `vl_text_ctxbin_split.sh` (text, 2-split ctx-bin),
+joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
+
 ## Hard contracts (violations = silent device garbage or SIGSEGV)
 
 - Prefill graphs MUST emit all-position logits `[1,AR,vocab]`.
@@ -44,12 +49,27 @@ are a fatal Genie load error (KV quant params must be byte-identical).
   speculation step. Always convert straight to the final filename, and verify with
   `qnn-context-binary-utility --json_file` before bundling.
 - Read `docs/NOTES-genie-io.md` before touching graph topology or configs.
+- **A stock Genie pipeline cannot drive an FP16 image encoder.** `setupInputFP16`
+  is an empty stub that discards the pixel blob and returns success, and the
+  requantize table has no `Float16` entries either way. The vision tower must
+  ship W8A16 with `UFIXED_POINT_16` IO.
+- `pos-id-dim` (backend block) alongside `positional-encoding` is a **hard
+  load-time schema error**, not a warning. Declare one. Same for `rope-theta`.
+- A prefill graph whose `attention_mask` is `[1,AR,AR]` registers `ctx_size ==
+  AR` (bertcache) and is **never selected** for prompts longer than AR — the
+  whole prompt goes through the AR=1 decode graph, silently and slowly.
+- Image-encoder configs need `vision-param: {height, width}` in **patch units**
+  (pre-merge), or MRoPE never engages and image rows fall back to plain rope.
 
 ## Validation gates (run before shipping any bundle)
 
 - `scripts/validate/parity_ladekv_read.py` (qualla feed pattern incl. chunking)
   and/or `parity_qualla_read.py` — argmax must match HF on all prompts.
 - `quantize_aimet.py --eval` reference is 3/4 last-token argmax agreement.
+- Qwen3-VL: `scripts/validate/parity_e2e_vl.py` — full path (image → ViT →
+  splice → text tower) vs `hf.generate`, token-for-token. `lint_pipeline_bundle.py`
+  for bundle contracts. Run the gate with no `--chains` filter; a subset skips
+  the mutation checks.
 
 ## Gotchas
 
@@ -80,6 +100,13 @@ are a fatal Genie load error (KV quant params must be byte-identical).
   DDR win does not survive spec-decode amortization. It also needs
   `--keep-head-weight` or the filter strips the encoding and you silently get an
   FP16 head — verify with `qairt-dlc-info | grep lm_head.weight` → `sFxp_8`.
+- `genie-app` script strings **never unescape**: `"\n"` in a quoted `node set
+  text` argument yields the two characters `\` and `n`. Use `node set textFile`
+  (read via `rdbuf()`) whenever the prompt needs a real newline. The SDK's own
+  GLM-4v example gets this wrong.
+- `clip_weights_to_7f7f` assumes a symmetric grid. Guard on symmetry before
+  clamping — it silently halved every asymmetric LayerNorm gain in the ViT
+  (cos 0.758 → 0.997 once fixed). RMSNorm models are unaffected.
 
 ## Docs
 
@@ -87,6 +114,7 @@ are a fatal Genie load error (KV quant params must be byte-identical).
 numbers, dead ends, open questions) · `docs/BUILD_GUIDE.md` (full recipes) ·
 `docs/LOCAL_ENV.md` (provenance, aimet workarounds) · `docs/NOTES-genie-io.md`
 (Genie/qualla runtime contract, cited) · `docs/NOTES-genie-splits.md`
-(multi-ctx-bin contract — mandatory ≳2B) ·
+(multi-ctx-bin contract — mandatory ≳2B) · `docs/NOTES-genie-pipeline.md`
+(multimodal pipeline contract: image-encoder dtype, MRoPE, deepstack-by-zeros) ·
 `docs/SA8797P_HTP_v81_Hardware_and_Deployment_Quantization_Reference_EN.md`
 (device team's measured hardware truth, annotated).
