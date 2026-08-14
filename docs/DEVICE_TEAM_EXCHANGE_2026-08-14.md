@@ -121,14 +121,21 @@ decisive measurement, and a **self-contained test kit**. Start at
 `kit/runsheet.md`; every outcome already has a pre-agreed meaning in
 `kit/decision_table.md`, so **the session should need no round-trip with us**.
 
+**It is all under one folder: `2026-08-14-gqafix/`.**
+
 | Path | What |
 |---|---|
-| `kit/runsheet.md` | priority-ordered arms, protocol, what to send back |
-| `kit/decision_table.md` | what each result means, agreed in advance |
-| `kit/run_all.sh` | runs priorities 2–7 unattended; skips absent bundles |
-| `kit/prompts/`, `kit/expected/` | 3 prompt classes + greedy HF references |
-| `profiling/qwen3-0.6b-w8a16-gqafix-decodeonly_ctx.bin` | priority 1 (B7a) |
-| `qwen3_06b_w8a16_gqafix_*.tar.gz` | the eight bundles |
+| `2026-08-14-gqafix/README.md` | the drop's own landing page — read first |
+| `2026-08-14-gqafix/kit/runsheet.md` | priority-ordered arms, protocol, what to send back |
+| `2026-08-14-gqafix/kit/decision_table.md` | what each result means, agreed in advance |
+| `2026-08-14-gqafix/kit/run_all.sh` | runs priorities 2–7 unattended; skips absent bundles |
+| `2026-08-14-gqafix/kit/prompts/`, `.../expected/` | 3 prompt classes + greedy HF references |
+| `2026-08-14-gqafix/profiling/` | priority 1 (B7a): the decode-only bin, its configs, and the AR-1 inputs |
+| `2026-08-14-gqafix/bundles/*.tar.gz` | the eight bundles |
+
+The two pre-fix bundles you need for the control arms — `qwen3_06b_w8a16_ladekv`
+and `qwen3_06b_w8a16_fuseqkvgu_ladekv` — stay at the repo root, where they
+already were.
 
 **Priority 1 is the decisive one:** the decode-only cycle profile on the fixed
 graph. We expect **350.3M → ~90M aggregate cycles**. We tried to pre-answer it
