@@ -1,7 +1,8 @@
 {
-  "dialog": {
+  "text-generator": {
     "version": 1,
     "type": "basic",
+    "accumulator-size": 64000000,
     "context": {
       "version": 1,
       "size": 2048,

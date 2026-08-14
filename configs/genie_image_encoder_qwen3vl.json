@@ -21,8 +21,12 @@
         "binary": {
           "version": 1,
           "ctx-bins": [
-            "qwen3vl-4b-vit-fp16_ctx.bin"
+            "qwen3vl-4b-vit-w8a16_ctx.bin"
           ]
+        },
+        "vision-param": {
+          "height": 32,
+          "width": 32
         }
       }
     }

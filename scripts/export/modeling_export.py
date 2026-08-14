@@ -390,6 +390,25 @@ def rope_tables(positions, head_dim, theta):
     return ang.cos()[None], ang.sin()[None]
 
 
+def mrope_tables(pos3, head_dim, theta, mrope_section=(24, 20, 20)):
+    """Qwen3-VL interleaved MRoPE half-tables: pos3 [3, S] (t,h,w) ->
+    ([1, S, D/2], [1, S, D/2]).
+
+    Layout per HF Qwen3VLTextRotaryEmbedding.apply_interleaved_mrope
+    (modeling_qwen3_vl.py): half-dim k takes t/h/w as [THWTHW...TT] -- h owns
+    dims 1,4,..,3*sec[1]-2, w owns 2,5,..,3*sec[2]-1, t owns the rest
+    including the tail. All three rows equal -> identical to rope_tables().
+    """
+    half = head_dim // 2
+    inv_freq = 1.0 / (theta ** (torch.arange(0, half, dtype=torch.float32) / half))
+    ang = pos3.to(torch.float32)[:, :, None] * inv_freq[None, None, :]  # [3,S,half]
+    out = ang[0].clone()
+    for dim, off in ((1, 1), (2, 2)):
+        idx = slice(off, mrope_section[dim] * 3, 3)
+        out[:, idx] = ang[dim][:, idx]
+    return out.cos()[None], out.sin()[None]
+
+
 def causal_mask(seq, total):
     """Additive rank-3 [1, seq, total] causal mask; current tokens right-aligned."""
     m = torch.full((seq, total), MASK_VALUE, dtype=torch.float32)

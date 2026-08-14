@@ -192,12 +192,28 @@ def clip_weights_to_7f7f(sim):
     """Clamp each quantized weight so no value maps to the asymmetric extreme
     (-128 for INT8): restrict to symmetric ±127 steps.  Reconstructed from the
     function name in the summary doc — semantics flagged for review.
-    aimet-torch 2.x (v2) API: quantizers are affine QuantizeDequantize modules."""
+    aimet-torch 2.x (v2) API: quantizers are affine QuantizeDequantize modules.
+
+    SYMMETRIC QUANTIZERS ONLY. ±127*scale is the clamp for a symmetric grid; on
+    an ASYMMETRIC one the representable range is (offset..offset+255)*scale and
+    127*scale is an arbitrary point inside it, so the "clip" silently rewrites
+    the weights. Measured on the Qwen3-VL ViT, whose nn.LayerNorm weights the
+    v81 config makes asymmetric (LayerNormalization.params.weight.is_symmetric
+    = False): every all-ones LayerNorm gain was clamped 1.0 -> 0.498, dropping
+    quantsim-vs-FP32 cosine from 0.99993 to 0.983.
+    Provably a no-op for the text tower — its ExportRMSNorm is a custom module
+    the config's RMSNormalization rule does not match, so it stays symmetric:
+    all five shipped work/quant/*/model.encodings report 0 asymmetric params."""
     n = 0
     for name, m in _quantized_modules(sim):
         pq = getattr(m, "param_quantizers", None)  # torch ModuleDict — no .get()
         q = pq["weight"] if (pq is not None and "weight" in pq) else None
         if q is None or not hasattr(m, "weight"):
+            continue
+        # default False = skip: if a future aimet renames this attribute, not
+        # clipping is a near-no-op (only the extreme element ever moves),
+        # whereas clipping an asymmetric grid rewrites the whole tensor.
+        if not getattr(q, "symmetric", False):
             continue
         if "Block" in type(q).__name__:   # LPBQ/blockwise: per-block scale shape
             continue                       # doesn't broadcast; clip is N/A

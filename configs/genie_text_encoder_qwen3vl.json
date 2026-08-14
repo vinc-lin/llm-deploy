@@ -1,0 +1,16 @@
+{
+  "text-encoder": {
+    "version": 1,
+    "type": "lut",
+    "lut": {
+      "version": 1,
+      "lut-path": "embedding_float32_lut.bin",
+      "size": 2560,
+      "datatype": "float32"
+    },
+    "tokenizer": {
+      "version": 1,
+      "path": "tokenizer.json"
+    }
+  }
+}
