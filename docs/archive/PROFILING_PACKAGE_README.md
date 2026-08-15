@@ -1,3 +1,26 @@
+> # ⛔ ARCHIVED — superseded pre-GQA-fix package (2026-08-16)
+>
+> Kept for provenance. Three cautions:
+>
+> 1. **Its inputs are the known-defective ones.** `decode_profile_inputs.tar.gz`
+>    was generated against the **pre-fix** decode graph (128-dim KV, 128-byte
+>    `position_ids`) and was re-shipped unchanged inside the 2026-08-14 gqafix
+>    drop, where it broke the P1 cycle profile — the graph is 64-dim. Regenerate
+>    with `scripts/util/gen_decode_profile_inputs.py` against the target graph.
+> 2. **Its ctx-bin is not the gqafix one.** `qwen3-0.6b-w8a16-decodeonly_ctx.bin`
+>    and `qwen3-0.6b-w8a16-**gqafix**-decodeonly_ctx.bin` differ by one token in
+>    the filename. Conflating them is how P1 was lost.
+> 3. **`read_total_bytes = 961,130,496` here is pre-fix**, and its gloss "the
+>    ~961 MB/token that makes decode DDR-bound" is a hypothesis that predicted
+>    ~18 tok/s where 44.707 was measured (`REFERENCE.md` §6.9, correction #22).
+>
+> Its unique caveat about the `−100` vs `−1000` mask constant was migrated to
+> `REFERENCE.md` §3.5 before archiving. Its live content is otherwise duplicated
+> by `DEVICE_MEASUREMENT_REQUEST_2026-08-13.md`.
+>
+> **If a post-fix profiling package is ever shipped, write a fresh README rather
+> than editing this one.**
+
 # Decode profiling package — Qwen3-0.6B W8A16 (Test 2)
 
 *Shipped 2026-08-13 for `docs/DEVICE_MEASUREMENT_REQUEST_2026-08-13.md` Test 2

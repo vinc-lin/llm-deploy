@@ -1,3 +1,24 @@
+> # ⛔ ARCHIVED — do not build, ship, or follow this (2026-08-16)
+>
+> Kept for provenance only. Four independent reasons:
+>
+> 1. **It predates the GQA fix.** Its projected 11.5–12.4 tok/s is roughly a
+>    quarter of the measured 44.707 tok/s baseline (`REFERENCE.md` §6.8).
+> 2. **It is built for LADE, which is parked** — post-fix LADE is a 30%
+>    regression (31.3 vs 44.7 basic).
+> 3. **⚠ Its recommended interactive config crashes.** This file presents
+>    `genie_dialog_demo.json` — `type: "lade"` **+** `max-num-tokens: 256` — as
+>    the config to use. That exact pair SIGSEGVs (exit 139) on the first
+>    speculation step; every demo run of the three bundles shipping it died.
+>    `scripts/validate/lint_bundle_dialogs.py` now refuses the combination at
+>    build time. **Do not copy any config from this document.**
+> 4. **It names a pre-fix LADE bundle as the fallback ship config.** The ship
+>    config is `gqafix_ladekv` in **basic** mode.
+>
+> Its two facts that existed nowhere else — the DLC-mtime staleness gate and the
+> no-weight-sharing counterfactual — were migrated to `REFERENCE.md` §5 and §8.2
+> before archiving. Current build recipes: `docs/BUILD_GUIDE.md` §5.
+
 # qwen3_06b_w8a16_fuseqkvgu_ladekv — Qwen3-0.6B W8A16, QKV+Gate-Up fused, LADE
 
 Built 2026-08-13 from `docs/MAX_TPS_QWEN3_0.6B.md` Phase B (that plan doc is now

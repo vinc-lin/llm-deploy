@@ -75,6 +75,35 @@ bundles (fuseqkvgu, socmodel72, hvx8). Fixed 2026-08-14; the pair is now refused
 by `scripts/validate/lint_bundle_dialogs.py`, which runs in `bundle.sh` and in
 the documented hand-add recipe.
 
+### 0.4 Outcome, and two things later readers got wrong (added 2026-08-16)
+
+**This report's headline finding was correct and acting on it worked.** Removing
+the 56 replication ops took decode from 6.836 → **44.707 tok/s**, +6.5%×, measured
+2026-08-15 (`DEVICE_MEASUREMENT_REPORT_2026-08-15.md`). Test 2 is the most
+valuable measurement in this project's history.
+
+Two cautions for anyone quoting it:
+
+1. **The step time is internally inconsistent.** §Test 2's preamble motivates the
+   investigation against "approximately 155 ms per decode step", while the Note
+   on Wall-Clock Time cites Genie at "~85 ms" and Test 1 measures 11.72 tok/s =
+   85.3 ms. 155 ms corresponds to the *superseded* 6.45 tok/s baseline. So the
+   "roughly 100 ms of previously unexplained decode time" in the Executive
+   Summary is computed against a step time this same report invalidates —
+   against 85.3 ms the residue is ~65 ms. This does not affect the cycle
+   percentages, which are what the recommendations rest on.
+2. **Test 5 was read backwards downstream.** Its own conclusion is right and is
+   stated correctly in the Executive Summary — `hvx_threads` is a **build-time**
+   knob, and changing the runtime config did nothing. Later planning documents
+   nonetheless cited "hvx 4 vs 8: −0.1%, no effect" as though the build-time A/B
+   had been run. It has not been, on any lineage. Every shipping ctx-bin is
+   compiled `numHvxThreads=4` against 8 available HVX units — see `REFERENCE.md`
+   §8.9 and correction #24.
+
+Test 4's −43% W8-head result carries its own confound section in the body
+(different ctx-bins, different lineages) and should not be quoted as a clean
+measurement of the head.
+
 ---
 
 ## Executive Summary

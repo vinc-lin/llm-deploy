@@ -18,15 +18,22 @@ cycles** — 261.8M of 350.3M — in 56 ops the report labelled "attention-mask
 broadcast". Direct inspection of the shipped `decode.dlc` showed the label was
 wrong: the mask is never expanded. Those 56 ops (2 per layer × 28 layers) are
 **GQA KV-head replication**, materialising 8 KV heads into 16 so a 16-head
-MatMul can consume them — 264 MB written and re-read every single step.
+MatMul can consume them. That is ~264 MB of intermediate tensor per step, but
+it **never reached DDR** — the decode graph's `write_total_bytes` is 419,840 B.
+The cost was cycles, not bytes (`REFERENCE.md` §6.9).
 
 This bundle removes them. The attention MatMuls now batch over the 8 KV heads
 directly (`1x8x2x1152` instead of `1x16x1x1152`). The KV I/O contract is
 untouched, so the Genie feed pattern is identical to the pre-fix bundle.
 
-**The open question is what the device does with the freed cycles.** Either
-decode was compute-bound and throughput rises, or a weight/KV streaming floor
-binds and it barely moves. This bundle answers that.
+**Answered on device, 2026-08-15: quadrant A.** 44.707 ± 0.030 tok/s in basic
+mode against 6.836 pre-fix on the same topology — **+6.5×**, TTFT 186 → 103 ms.
+Decode was compute-bound and the freed cycles converted. This bundle is the
+current 0.6B baseline and ship configuration.
+
+**Run it in basic mode.** LADE on this same binary measures 31.342 tok/s — a 30%
+regression — because acceptance is only 1.61 tok/iter and there is no longer a
+slow step for speculation to amortise.
 
 ## 2. Contents
 
@@ -189,7 +196,8 @@ encodings recipe — **only the attention differs**, so any delta is attributabl
 evidence*, because that bin is 1.52 GB rather than 1.09 GB and therefore not
 size-matched.
 
-Baselines to beat — all 2026-08-13, warm, greedy, 56-token technical prompt:
+Baselines this bundle was built to beat — all 2026-08-13, **pre-fix**, warm,
+greedy, 56-token technical prompt. It beat them all; see §5.4:
 
 | Baseline | Value |
 |---|---|
@@ -210,12 +218,19 @@ decisive; together they separate the two competing models of the machine.
 | **cycles fall** (≈ 90M) | **A. Compute-bound, fix works.** `gqafix` becomes the ship base; proceed to priority 4, then re-tune LADE on the new base. | **B. Byte floor is real.** The DSP got 4× cheaper and the step did not — decode is bound by streaming 883 MB (751 weights + 132 KV). Priority 4 becomes the lead workstream; stop optimising compute. |
 | **cycles flat** (≈ 350M) | **C. Impossible — investigate.** Check you ran the gqafix bundle, and check graph names against the ctx-bin. Report before concluding. | **D. The fix did not reach the device.** Verify the decode graph's attention MatMuls are `1x8x2x1152`. Report as a **build defect**, not as "the GQA fix does not help". |
 
-**Converter-side bound on box B:** `read_total_bytes` is **961,130,496 for the
-gqafix decode graph — unchanged from pre-fix**. That is expected: replication
-cost was intermediate-tensor traffic, not weight reads. Pre-fix the step moved
-≈961 MB + ≈530 MB ≈ 1.49 GB; post-fix ≈961 MB. Purely bandwidth-bound at an
-unchanged rate, 85 ms would become ≈55 ms, i.e. **≈18 tok/s**. A result far
-below that, with cycles confirmed down, is box B.
+> **RESOLVED 2026-08-15 → quadrant A.** 44.707 tok/s. The matrix above is kept
+> as the pre-commitment record that makes that result credible; the cycle half
+> was **not** measured (the shipped profiling inputs were pre-fix format), so
+> quadrant A rests on the throughput delta alone.
+>
+> ⚠ **The byte arithmetic that used to sit here is withdrawn.** It read
+> `read_total_bytes = 961,130,496` as "the gqafix decode graph, unchanged from
+> pre-fix" and derived a ≈530 MB removed-traffic figure and an ≈18 tok/s
+> ceiling from it. Three errors: that figure is from `ctxbin-ws.log` dated
+> **2026-08-10**, i.e. pre-fix, and **no post-fix `read_total_bytes` has ever
+> been recorded**; the replication ops never wrote to DDR at all
+> (`write_total_bytes` = 419,840 B); and the ≈18 tok/s ceiling was exceeded by
+> **2.5×**. See `REFERENCE.md` §6.9 and corrections #22–#25.
 
 **Sanity check before trusting any of the above:** the fixed decode graph must
 contain **zero** `Eltwise_Binary` ops with `operation: 13` whose output is
@@ -342,5 +357,5 @@ Gates passed before shipping — all device-free:
 | [`../kit/runsheet.md`](../kit/runsheet.md) | all seven priorities, in order |
 | [`../kit/decision_table.md`](../kit/decision_table.md) | every outcome's pre-agreed meaning |
 | [`../profiling/`](../profiling) | priority 1 — the decisive decode-only cycle profile |
-| `docs/DEVICE_TEAM_EXCHANGE_2026-08-14.md` | why the 74.7% attribution changed |
+| `docs/archive/DEVICE_TEAM_EXCHANGE_2026-08-14.md` | why the 74.7% attribution changed |
 | `docs/NOTES-htp-config-keys.md` | which HTP backend keys are real |

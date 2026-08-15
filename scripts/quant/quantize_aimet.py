@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """AIMET PTQ W8A16 for the export-friendly Qwen3 wrapper.
 
-Reconstructed from SA8797P_Deployment_Status_Summary.md §2.2:
+Reconstructed from docs/archive/SA8797P_Deployment_Status_Summary.md §2.2:
 - default_param_bw=8 (per-channel symmetric via config json), default_output_bw=16
 - quant_scheme = post_training_tf_enhanced
 - calibration: ~10 mixed zh/en/code/math prompts

@@ -115,4 +115,4 @@ The two corrections above are **not** folded into the GQA-fix trunk build. Doing
 so would confound the one measurement the whole plan turns on: if the post-fix
 bundle changed attention topology *and* gained UDMA *and* gained weight
 sparsity, a tok/s delta could not be attributed. They get their own ctx-bin-only
-variant, the same discipline `MAX_TPS_QWEN3_0.6B_V3.md` applies to `dlbc` (E1).
+variant, the same discipline `docs/archive/MAX_TPS_QWEN3_0.6B_V3.md` applied to `dlbc` (E1).

@@ -4,9 +4,12 @@
 variant for the Qualcomm SA8797P (Hexagon v81 HTP, Android GVM) — from a clean
 Linux machine to a push-ready device bundle, entirely without device access.*
 
-*Last validated end-to-end: 2026-08-11 (v2 bundles, device-confirmed correct
-output). Assumes no prior knowledge of this project. ~30 min setup reading,
-~1–2 h wall-clock per model build.*
+*Last validated end-to-end: 2026-08-15 (gqafix bundles, device-measured at
+44.707 tok/s). Assumes no prior knowledge of this project. ~30 min setup
+reading, ~1–2 h wall-clock per model build.*
+
+> **Recipes in §5 require `--grouped-gqa`.** See the banner at the top of §5 —
+> omitting it silently builds the pre-fix model.
 
 ---
 
@@ -36,8 +39,8 @@ exist — pick by whether you need lookahead decoding:
 | `prefill` | AR=128, CL=128, **no** past-KV | prompt ingestion (+ first ~117 generated tokens, see §3.4) |
 | `decode` | AR=1, CTX=1152, past-KV | steady-state generation |
 
-**B. All-past-KV topology** (`-ladekv`, §5.4 — the reference build for anything
-using `dialog.type: "lade"`):
+**B. All-past-KV topology** (`-ladekv`, §5.4b) — **the reference build for
+everything**, including basic mode. It carries the ship configuration:
 
 | Graph | Shape | Role |
 |---|---|---|
@@ -45,8 +48,12 @@ using `dialog.type: "lade"`):
 | `decode` | AR=1, CTX=1152, past-KV | steady-state generation |
 | `verify32` | AR=32, CTX=1152, past-KV | lade verification batches; also serves prompts ≤32 tokens |
 
-Topology B is what makes lade work at all (§3.5) and additionally enables
-prompts >128 tokens. It gives up the bertcache early-token burst (§3.4).
+Topology B enables prompts >128 tokens, and is what makes lade *possible* —
+though lade is parked as a 30% regression post-GQA-fix (REFERENCE §6.8), so
+`verify32` is retained for optionality, not for use. It has no bertcache
+early-token burst: generation runs at true decode speed from token 1, which
+post-fix is ~44.7 tok/s — roughly **double** the ~23.8 tok/s burst it forgoes.
+That trade no longer exists; topology B simply wins.
 
 **Pipeline stages** (each has a script; §5 gives per-variant recipes):
 
@@ -162,22 +169,24 @@ mismatch itself is still a hard load failure.)
 
 - `vtcm_mb: 16` and `pd_session: "unsigned"` are the device caps (24 MB VTCM
   is rejected on unsigned PD). `O: 3`, 4 HVX threads, perf profile
-  `llm_decode_burst`. Two unrun A/Bs on these numbers: the runtime always
-  reports **8** HVX threads in use regardless of `hvx_threads: 4`
-  (REFERENCE §8.9), and the device team's verified build sets
-  `soc_id`/`soc_model: 72` explicitly where ours leaves them unset
-  (REFERENCE §8.4).
+  `llm_decode_burst`. Two unrun A/Bs on these numbers: **`hvx_threads` is a
+  *build-time* parameter** — our ctx-bins are compiled `numHvxThreads=4` while
+  8 HVX units exist, and the runtime `htp_backend_ext_config.json` value is
+  ignored (the 2026-08-13 Test 5 changed only that and measured −0.1%), so
+  **no compile-time 4-vs-8 A/B has ever been run** (REFERENCE §8.9); and the
+  device team's verified build sets `soc_id`/`soc_model: 72` explicitly where
+  ours leaves them unset (REFERENCE §8.4). Both are open levers.
 - Cross-graph **weight sharing must be ON** in `configs/htp_config.json` —
   it's what makes a 3-graph bin cost ~1.1 GB instead of 3×.
 - Genie drives our `(128,128)` no-past-KV prefill graph in "bertcache" mode:
   after the prompt it keeps generating through the prefill graph (~42 ms/tok,
   whole-window reprocess) until the KV passes 128 positions, then switches to
   the AR-1 decode graph (~155 ms/tok). Quote tok/s numbers per phase.
-- Device-measured (v2, 2026-08-11): decode ~6.5 tok/s, prefill-phase
-  ~23.8 tok/s, init ~0.8 s, RAM ~163 MB. (A later run measured
-  `qwen3_06b_w8a16_local` at **11.72 tok/s** AR-1 — *faster* than the device
-  team's 7.79, inverting the old "their builds are ~20% faster" premise. See
-  REFERENCE §8.8, now marked resolved-backwards.)
+- **Current device baseline (2026-08-15): 44.707 tok/s** basic AR-1 on
+  `gqafix_ladekv`, TTFT 103 ms, init ~796 ms. Historical points on the same
+  device, all pre-GQA-fix: 11.72 (`local`, 2026-08-13), 6.836 (`ladekv` basic —
+  the same-topology predecessor of the 44.707 build), 6.5 (v2, 2026-08-11),
+  ~23.8 bertcache early phase. Full table and provenance: REFERENCE §6.8.
 - **Graph selection is numeric best-fit on (AR, CL) — names are cosmetic *to
   Genie*.** Genie picks the smallest CL ≥ current KV, then the smallest AR ≥ the
   batch size (largest smaller AR = chunking fallback). Consequences: two graphs
@@ -239,10 +248,27 @@ the donor q_proj INT16 encoding onto the Q split (K/V splits FP16) — done by
 All commands assume `source scripts/env.sh` first. Names below are the
 canonical ones; artifacts land in `$LLMDEPLOY_DATA/work/…/<name>/`.
 
+> ### ⚠ `--grouped-gqa` is mandatory on every 0.6B build (added 2026-08-16)
+>
+> Without it you build the **pre-GQA-fix** model: 56 KV-replication ops that are
+> 74.7% of decode DSP cycles, and **6.836 tok/s instead of 44.707** — see
+> `REFERENCE.md` §6.8. Until this banner was added, every recipe below omitted
+> the flag, so following the guide verbatim produced the slow model.
+>
+> - `full_build.sh <name> <cl> <ctx> …` — flags after the positional args pass
+>   through to `quantize_aimet.py`, so append `--grouped-gqa` directly.
+> - `lade_build.sh` / `ladekv_build.sh` — pass it via **`FUSE_FLAGS`**, which is
+>   appended verbatim to every `quantize_aimet.py` call. **This is load-bearing:
+>   both scripts re-export `verify32` and the past-KV prefill, so omitting it
+>   silently ships old attention in those graphs** while the decode graph looks
+>   correct.
+> - Gate it: `scripts/validate/lint_gqa_ops.py` must report **0** replication
+>   ops (`Eltwise_Binary` with `operation: 13`) in every graph.
+
 ### 5.1 Baseline 0.6B (`qwen3-0.6b-w8a16`) — build this FIRST
 
 ```bash
-./scripts/build/full_build.sh qwen3-0.6b-w8a16 128 1024
+./scripts/build/full_build.sh qwen3-0.6b-w8a16 128 1024 --grouped-gqa
 ```
 
 Runs quantize → decode export (adopting prefill encodings) → filter → rename →
@@ -281,7 +307,8 @@ Adds an AR=32 verification graph to the baseline and packs a 3-graph ctx-bin.
 Requires §5.1 complete:
 
 ```bash
-./scripts/build/lade_build.sh qwen3-0.6b-w8a16 128 1024 32   # AR=16 variant: last arg 16
+FUSE_FLAGS="--grouped-gqa" \
+  ./scripts/build/lade_build.sh qwen3-0.6b-w8a16 128 1024 32   # AR=16 variant: last arg 16
 ```
 
 Config guardrail: `(ngram−1)×(window+gcap)` must stay ≤ the verify graph's AR,
@@ -292,18 +319,25 @@ config window 8 / ngram 3 / gcap 8 = exactly 32.
 `type:"lade"` SIGSEGV on device (§3.5). It is now only an intermediate step:
 `ladekv_build.sh` reuses its `verify32.dlc`. Continue to §5.4b.
 
-### 5.4b Lookahead decoding, fixed (`-ladekv`) — the reference lade build
+### 5.4b Past-KV prefill, 3-graph (`-ladekv`) — the reference build
 
-**This is the recipe to copy for any new lade-capable model.** It replaces the
-bertcache prefill with a past-KV prefill (§3.5) and packs the 3-graph ctx-bin.
+**This is the recipe to copy for any new model**, not just lade-capable ones: it
+carries the ship configuration. Post-GQA-fix, **basic mode on this topology is
+the fastest thing we have** (44.707 tok/s), and lade is parked as a 30%
+regression (`REFERENCE.md` §6.8). `verify32` stays in the bin because it is
+weight-shared and costs ~0, preserving the option — not because lade is used.
+
+It replaces the bertcache prefill with a past-KV prefill (§3.5) and packs the
+3-graph ctx-bin.
 
 Prerequisites: §5.1 (`full_build.sh`) and §5.4 (`lade_build.sh`) complete for
 the same `<name>` — this build reuses their `decode.dlc`, `verify32.dlc`, and
 the prefill quant dir's encodings.
 
 ```bash
-./scripts/build/ladekv_build.sh qwen3-0.6b-w8a16 128 1024 128
-#                               <name>            CL  CTX AR_prefill
+FUSE_FLAGS="--grouped-gqa" \
+  ./scripts/build/ladekv_build.sh qwen3-0.6b-w8a16 128 1024 128
+#                                 <name>            CL  CTX AR_prefill
 # VERIFY_AR=16 ./scripts/build/ladekv_build.sh …   if you built a 16-wide verify graph
 ```
 
@@ -363,9 +397,9 @@ Flags go to `quantize_aimet.py`, so they pass through `full_build.sh <name> <cl>
 chain (not the §5.6 fast path):
 
 ```bash
-./scripts/build/full_build.sh   qwen3-0.6b-w8a16qh 128 1024 --quant-head
-./scripts/build/lade_build.sh   qwen3-0.6b-w8a16qh 128 1024 32
-./scripts/build/ladekv_build.sh qwen3-0.6b-w8a16qh 128 1024 128
+./scripts/build/full_build.sh   qwen3-0.6b-w8a16qh 128 1024 --quant-head --grouped-gqa
+FUSE_FLAGS="--grouped-gqa" ./scripts/build/lade_build.sh   qwen3-0.6b-w8a16qh 128 1024 32
+FUSE_FLAGS="--grouped-gqa" ./scripts/build/ladekv_build.sh qwen3-0.6b-w8a16qh 128 1024 128
 ```
 
 - `--quant-head`: quantizes the `lm_head` **weight** to INT8 per-channel while
@@ -424,6 +458,9 @@ Device-free gates, in order; each has a known-good reference value:
 | **Graph names** | `qnn-context-binary-utility --json_file info.json` → `info.graphs[].info.graphName` | exactly the names in **both** `htp_config.json` and `htp_backend_ext_config.json` — a mismatch silently reverts that graph to backend defaults (§3.4) |
 | Ctx-bin | `qnn-context-binary-utility --json_file info.json` | all graphs listed; logits dims per §3.1; ~1.09 GB for 0.6B (2- or 3-graph, weight-shared) |
 | Quantized head | `qairt-dlc-info -i prefill.dlc \| grep lm_head.weight` | `sFxp_8` if `--quant-head` was used, else `Float_16` (§5.7) |
+| **GQA replication removed** | `scripts/validate/lint_gqa_ops.py` | **0** `Eltwise_Binary` ops with `operation: 13` in **every** graph. Non-zero means `--grouped-gqa` was missed somewhere — most often in `verify32` or the past-KV prefill, which `lade_build.sh`/`ladekv_build.sh` re-export (§5 banner) |
+| **HVX threads compiled in** | `qnn-context-binary-utility --json_file` → `numHvxThreads` | matches the build config. Build-time only; the runtime config cannot change it (REFERENCE §8.9) |
+| **Byte accounting** | build log → `====== DDR bandwidth summary ======` | record `read_total_bytes` / `write_total_bytes` per graph, **with the log name and date**. Reusing an undated figure has put two documents wrong (REFERENCE §6.9) |
 
 ## 7. Bundle and ship
 
@@ -546,11 +583,11 @@ environment.
 | `scripts/validate/parity_onnx.py`, `parity_qualla_read.py`, `parity_ladekv_read.py`, `parity_verify.py` | validation gates (§6) |
 | `scripts/util/hf_upload_watchdog.sh` | supervised HF upload |
 | `docs/REFERENCE.md` | **consolidated, corrected reference — start here** |
-| `docs/MAX_TPS_QWEN3_0.6B.md` | the max-throughput 0.6B build path (proven 10.8 tok/s + fused candidate + A/Bs) |
+| `docs/PLAN_0.6B_max_tps.md` | the current 0.6B speed plan (post-GQA-fix, 44.707 baseline). The V1–V4 ladder is in `docs/archive/` |
 | `docs/NOTES-genie-io.md` | the Genie contract with SDK source citations — read before touching graph I/O |
 | `docs/NOTES-vit-htp-config.md` | why graph names must appear in the backend config (§3.4) |
 | `docs/NOTES-genie-splits.md` | multi-ctx-bin (split) contract — required for any graph over the 3.5 GiB serialization limit (every text tower ≳2B) |
 | `docs/SA8797P_HTP_v81_Hardware_and_Deployment_Quantization_Reference_EN.md` | device team's measured hardware/runtime reference (2026-08-12), annotated — the hardware ground truth |
 | `docs/LOCAL_ENV.md` | environment provenance + progress log |
 | `reports/` | device test reports (v1 failure analysis, v2 validation, ladekv, qh) |
-| `SA8797P_Deployment_Status_Summary.md` | inherited remote-team status, 2026-08-09 — **partly superseded**, see its banner and `docs/REFERENCE.md` |
+| `docs/archive/` | superseded documents, with an index of what each got wrong. Never a source for a number |

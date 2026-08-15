@@ -1,6 +1,6 @@
 """Export-friendly Qwen3 for QNN HTP / Genie deployment.
 
-Reconstructed from SA8797P_Deployment_Status_Summary.md (the original remote
+Reconstructed from docs/archive/SA8797P_Deployment_Status_Summary.md (the original remote
 scripts are unavailable). Encodes the validated export constraints:
 
 - RoPE cos/sin are graph INPUTS of half-head-dim (pos-id-dim = 64), split into

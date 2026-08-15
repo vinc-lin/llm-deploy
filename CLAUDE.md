@@ -124,11 +124,29 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
 - `clip_weights_to_7f7f` assumes a symmetric grid. Guard on symmetry before
   clamping — it silently halved every asymmetric LayerNorm gain in the ViT
   (cos 0.758 → 0.997 once fixed). RMSNorm models are unaffected.
+- **The SDK's `examples/Genie/.../src/qualla` tree is NOT the source of the
+  shipped `libGenie.so`.** The device rejects unknown `QnnHtp` config keys and no
+  such validation exists anywhere in that tree — a fallback derived from it
+  failed on device. Use the source for runtime *contracts*; caveat any claim
+  about what the binary actually does.
+- **`hvx_threads` is baked in at ctx-bin build time, not read at runtime.**
+  Changing it in `htp_backend_ext_config.json` does nothing (measured: −0.1%).
+  Set it in `scripts/build/ctxbin_variant.sh` / `configs/htp_backend_config.json`
+  and verify with `numHvxThreads` from `qnn-context-binary-utility --json_file`.
+  Every shipping bin is currently **4 of the 8 available HVX units**.
+- **Never quote a `read_total_bytes` without its build log and date.** The
+  decode-graph figure 961,130,496 is *pre*-GQA-fix (`ctxbin-ws.log`, 2026-08-10);
+  reusing it as a current number has now put two documents wrong. The converter's
+  `====== DDR bandwidth summary ======` block is the source, and it is emitted
+  even for builds that cannot run on device.
 
 ## Docs
 
 **`docs/REFERENCE.md` first** (consolidated current truth: contracts, measured
-numbers, dead ends, open questions) · `docs/BUILD_GUIDE.md` (full recipes) ·
+numbers, dead ends, open questions) · `docs/PLAN_0.6B_max_tps.md` (the current
+0.6B speed plan — unversioned and living; the old V1–V4 ladder is in
+`docs/archive/`, which is never a source for a number) ·
+`docs/BUILD_GUIDE.md` (full recipes) ·
 `docs/LOCAL_ENV.md` (provenance, aimet workarounds) · `docs/NOTES-genie-io.md`
 (Genie/qualla runtime contract, cited) · `docs/NOTES-genie-splits.md`
 (multi-ctx-bin contract — mandatory ≳2B) · `docs/NOTES-genie-pipeline.md`

@@ -63,38 +63,49 @@ sh kit/run_all.sh results
 Priority 1 is **not** in `run_all.sh` — it uses `qnn-net-run`. Commands are in
 the runsheet.
 
-### If you only have time for one thing
+> **This drop has been run — results in `DEVICE_MEASUREMENT_REPORT_2026-08-15.md`.**
+> The fix worked: **44.707 tok/s** basic, +6.5× (`REFERENCE.md` §6.8). The two
+> "if you only have time for one thing" sections below are kept as the record of
+> what was asked; both are now answered or blocked. Current priorities are in
+> `docs/PLAN_0.6B_max_tps.md`.
+
+### If you only have time for one thing — ⚠ BLOCKED, could not run
 
 Profile `profiling/qwen3-0.6b-w8a16-gqafix-decodeonly_ctx.bin` against the known
-**350,302,972**-cycle baseline. **Expect ~90M.** That one number says whether
-the fix did what it was built to do, independent of whether the device converts
-freed cycles into throughput. It is a single-graph bin, so it carries none of
-the caveats below.
+**350,302,972**-cycle baseline. **Expect ~90M.**
 
-### If you only have time for one *Genie* run
+**This did not run on 2026-08-15.** The `decode_profile_inputs.tar.gz` shipped
+alongside it was generated 2026-08-13 against the **pre-fix** decode graph
+(128-dim KV, 128-byte `position_ids`) and is incompatible with the gqafix
+graph's 64-dim layout. The ctx-bin is fine; the inputs are not. Build-side
+packaging defect — regenerate with `scripts/util/gen_decode_profile_inputs.py`
+before re-shipping, and add "regenerate profiling inputs whenever graph I/O
+changes" to the drop checklist. The ~90M expectation stands, untested.
 
-`p3_a1_ladekv_basic` — basic mode on the plain `qwen3_06b_w8a16_ladekv` bundle
-at the repo root, which you already have. It has never been measured, and it
-retroactively de-confounds every 3-graph number taken so far: the 6.70 tok/s in
-Test 4 was measured on the **qh** bundle and therefore conflates W8 head, graph
-count and build lineage.
+### If you only have time for one *Genie* run — ✅ answered
+
+`p3_a1_ladekv_basic` — basic mode on the plain `qwen3_06b_w8a16_ladekv` bundle.
+**Measured 6.836 ± 0.000 tok/s.** It did what it was for: it de-confounded the
+3-graph numbers (the 6.70 tok/s in Test 4 came from the **qh** bundle and
+conflated W8 head, graph count and build lineage), and it is the same-topology
+predecessor against which the fix measures **+6.5×**.
 
 ## The bundles
 
-Measured baselines to beat, 2026-08-13, warm, greedy, 56-token technical prompt:
-**basic AR-1 `local` = 11.72 tok/s**, **LADE `ladekv` = 9.18 tok/s on that
-prompt**.
+Baselines this drop was measured against (2026-08-13, warm, greedy, 56-token
+technical prompt): basic AR-1 `local` = 11.72 tok/s, LADE `ladekv` = 9.18 tok/s.
+**Both are pre-fix. The current baseline is 44.707 tok/s** (`REFERENCE.md` §6.8).
 
-| `bundles/…` | ctx-bin | Prefill | What it decides |
+| `bundles/…` | ctx-bin | Prefill | Outcome |
 |---|---:|---|---|
-| `qwen3_06b_w8a16_gqafix_ladekv.tar.gz` | 1.087 GB | past-KV ×3 | **the primary artifact** — see below |
-| `qwen3_06b_w8a16_gqafix_pastkv2g.tar.gz` | 1.080 GB | past-KV ×2 | separates graph count from which prefill graph |
-| `qwen3_06b_w8a16_gqafix_local.tar.gz` | 1.523 GB | bertcache | direct comparison to the 11.72 baseline |
-| `qwen3_06b_w8a16_gqafix_qh.tar.gz` | 1.525 GB | bertcache | W8 `lm_head`, the first clean comparison |
-| `qwen3_06b_w8a16_gqafix_cl512.tar.gz` | 1.523 GB | bertcache | context 512: `read_total_bytes` 961 → 873 MB |
-| `qwen3_06b_w8a16_gqafix_dlbc.tar.gz` | 1.523 GB | bertcache | `dlbc: 1` |
-| `qwen3_06b_w8a16_gqafix_udma.tar.gz` | 1.524 GB | bertcache | `context.extended_udma` — its first real test |
-| `qwen3_06b_w8a16_gqafix_hybrid.tar.gz` | 1.532 GB | bertcache + past-KV | TTFT: targets ~40 ms instead of 186 ms |
+| `qwen3_06b_w8a16_gqafix_ladekv.tar.gz` | 1.087 GB | past-KV ×3 | ✅ **the artifact that shipped — 44.707 tok/s basic, the current baseline** |
+| `qwen3_06b_w8a16_gqafix_pastkv2g.tar.gz` | 1.080 GB | past-KV ×2 | ✅ **a wash.** Best rep 44.54 matches 3-graph; reps 1/3 were 23.43 / 29.34 — the rep-variance finding that forced the 5-rep protocol. 3-graph stays the safe choice |
+| `qwen3_06b_w8a16_gqafix_local.tar.gz` | 1.523 GB | bertcache | ⚠ **not size-matched** to the 11.72 baseline — carries the 444 MB bertcache weight duplication (§6.10) |
+| `qwen3_06b_w8a16_gqafix_qh.tar.gz` | 1.525 GB | bertcache | ⏳ **not run** — skipped as "unnecessary" on a byte-bound inference that was wrong. Still open (`REFERENCE.md` §8.3). Note it is a bertcache 2-graph bin, so it answers the science but cannot ship |
+| `qwen3_06b_w8a16_gqafix_cl512.tar.gz` | 1.523 GB | bertcache | ⏳ not run. Context 512: `read_total_bytes` 961 → 873 MB — both figures **pre-fix-derived**; the −9.2% ratio survives, the absolute base does not (§6.9) |
+| `qwen3_06b_w8a16_gqafix_dlbc.tar.gz` | 1.523 GB | bertcache | ⏳ not run. `dlbc: 1` — note DLBC is defined as *inter-layer* (activation) compression, so it likely does not touch the weight stream |
+| `qwen3_06b_w8a16_gqafix_udma.tar.gz` | 1.524 GB | bertcache | ⏳ not run. `context.extended_udma` |
+| `qwen3_06b_w8a16_gqafix_hybrid.tar.gz` | 1.532 GB | bertcache + past-KV | ⛔ **DEGENERATE OUTPUT — do not ship, do not recommend.** Infinite loop on `"and parallel, and parallel, …"` after the first few tokens. A quality failure, so its TTFT numbers are invalid. Suspected prefill-graph wiring bug; reproducible device-free (`PLAN_0.6B_max_tps.md` A4) |
 
 ## Two things to know before interpreting anything
 

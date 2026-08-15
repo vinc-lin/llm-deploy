@@ -18,7 +18,7 @@
 # Usage: lade_build.sh <name> [cl_prefill] [ctx] [ar]
 #   e.g. lade_build.sh qwen3-0.6b-w8a16 128 1024 32
 #
-# Fused variants (docs/MAX_TPS_QWEN3_0.6B.md §3) need two overrides, both
+# Fused variants (see docs/PLAN_0.6B_max_tps.md) need two overrides, both
 # no-ops when unset:
 #   FUSE_FLAGS  appended verbatim to every quantize_aimet.py call. The export
 #               wrapper's structure comes from --fuse-qkv/--fuse-gate-up, so

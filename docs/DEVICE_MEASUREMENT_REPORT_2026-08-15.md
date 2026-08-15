@@ -23,30 +23,49 @@ history has been scrubbed twice for that class of leak, and both the HF repo and
 the GitHub mirror are currently **public**. Nothing else in the body has been
 altered; §1–§7 below are a faithful transcription.
 
-### 0.2 The result overshoots the pre-agreed bandwidth ceiling by 2.5×
+### 0.2 The result overshoots the pre-agreed bandwidth ceiling by 2.5× — because the ceiling was built on a misused number
 
-The kit's decision table derived a ceiling from the converter's own accounting:
-`read_total_bytes` = 961,130,496 per decode step, and *"if the step were purely
-bandwidth-bound at an unchanged effective rate, 85 ms would become ≈55 ms, i.e.
-**≈18 tok/s**"* — described there as the top of the projected range.
+> **Revised 2026-08-16.** The first version of this annotation argued the fix
+> "destroyed and then restored the effective bandwidth of the whole step",
+> reasoning from a pre-fix byte count and a derived pre-fix total. Both inputs
+> were wrong. The original text is preserved in git history; what follows
+> replaces it. See `REFERENCE.md` §6.9 and corrections #22–#25.
 
-The measured 44.707 tok/s is **2.5× beyond that ceiling**:
+The kit's decision table derived its ceiling from `read_total_bytes` =
+961,130,496 per decode step and projected **≈18 tok/s** as the top of the range.
+The measured 44.707 tok/s is 2.5× beyond it. The projection failed because the
+byte model it rests on does not describe this workload:
 
-| | step time | bytes/step | effective rate |
-|---|---:|---:|---:|
-| pre-fix `local` basic, 11.72 tok/s | 85.3 ms | ~1.49 GB | ~17.5 GB/s |
-| **post-fix `gqafix_ladekv` basic, 44.707 tok/s** | **22.4 ms** | ~0.961 GB | **~43 GB/s** |
+1. **961,130,496 is a pre-fix figure.** It comes from `ctxbin-ws.log` dated
+   2026-08-10, four days before `--grouped-gqa` existed. It was used here as if
+   it were the post-fix byte count. **No post-fix `read_total_bytes` has ever
+   been recorded** — the gqafix build directories retain the ctx-bins and
+   `info.json` but no build logs. Capturing it is a ~20-minute device-free job
+   and it is the single measurement that would settle this section.
+2. **The replication ops never wrote to DDR.** The same converter summary reports
+   the decode graph writing **419,840 bytes** per step — 420 KB, not the 264 MB
+   the "destroyed bandwidth" story assumed. That traffic was VTCM-resident, and
+   `spill_bytes`/`fill_bytes` are both 0.
 
-~43 GB/s sits inside the 49–67 GB/s the device team measured for contiguous
-reads; ~17.5 GB/s is nowhere near it. So the replication ops were not merely
-adding 264 MB of traffic — they were **destroying the effective bandwidth of the
-whole step**. The fix bought both fewer bytes and a better access pattern, which
-is why the outcome beats the byte-bound projection rather than landing under it.
+So the fix removed ~262M of 350.3M DSP cycles and **approximately zero DDR
+bytes**, and throughput rose 6.5×. A change that moves no DDR bytes cannot
+produce a 6.5× speedup in a DDR-bound regime — which is why the byte-bound
+projection undershot by 2.5× rather than bounding the result.
 
-This is an inference from the report's own numbers, not a claim the report makes.
-It is also the strongest remaining argument for completing the P1 cycle profile
-(§6 rec 6): the cycle count would separate "compute freed" from "streaming
-improved" directly.
+Note also that "effective bandwidth rose from ~17.5 to ~43 GB/s" is **circular**
+if the byte count did not change: with bytes constant it is a restatement of
+"the step got 6.5× faster", not an explanation of why.
+
+The competing reading — that decode was **compute-bound** — predicted this
+measurement out-of-sample: `88.5M remaining cycles ÷ 4 HVX threads @ ~1 GHz ≈
+22.1 ms` against **22.37 ms measured**, written before the fix shipped. Its
+divisor of 4 is now confirmed by reading `numHvxThreads` out of the shipped
+ctx-bin.
+
+This remains the strongest argument for completing the P1 cycle profile (§6 rec
+6), which would separate "compute freed" from "streaming improved" directly.
+`REFERENCE.md` §8.11 tracks the adjudication and names the two device-free
+experiments that decide it.
 
 ### 0.3 The P1 blocker is a build-side packaging defect, not a device-side failure
 

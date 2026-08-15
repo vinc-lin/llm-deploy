@@ -21,7 +21,7 @@
 # Usage: ladekv_build.sh <name> [cl_prefill] [ctx] [ar_prefill]
 #   e.g. ladekv_build.sh qwen3-0.6b-w8a16 128 1024 128
 #
-# Fused variants (docs/MAX_TPS_QWEN3_0.6B.md §3): FUSE_FLAGS and ENC_SRC, same
+# Fused variants (see docs/PLAN_0.6B_max_tps.md): FUSE_FLAGS and ENC_SRC, same
 # contract as lade_build.sh — FUSE_FLAGS is appended to the quantize_aimet.py
 # export (the wrapper's structure depends on it) and ENC_SRC replaces the
 # encodings used for rename + conversion with the fused build's

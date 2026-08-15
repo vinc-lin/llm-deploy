@@ -30,15 +30,26 @@ These remove **GQA KV-head replication**, which an op-level profile on
 (261.8M of 350.3M). That profile labelled the ops "attention-mask broadcast";
 inspecting the shipped `decode.dlc` showed the mask is never expanded and the
 56 ops are `repeat_kv`, materialising 8 KV heads into 16 so a 16-head MatMul
-can consume them — 264 MB written and re-read every step. The attention
+can consume them. That is ~264 MB of intermediate tensor per step, but it never
+reached DDR (decode `write_total_bytes` = 419,840 B) — the cost was cycles, not
+bytes. The attention
 MatMuls now batch over the 8 KV heads directly (`1x8x2x1152` instead of
 `1x16x1x1152`).
 
-Measured baselines to beat, all from 2026-08-13 (warm, greedy, 56-token
-technical prompt): **basic AR-1 `local` = 11.72 tok/s**, **LADE `ladekv` =
-9.18 tok/s on that prompt** (LADE was a regression there; it won on an earlier
-simpler prompt at 10.8). Everything else in the table below is history kept for
-provenance.
+## Current baseline: 44.707 tok/s
+
+**Device-measured 2026-08-15**: `2026-08-14-gqafix/qwen3_06b_w8a16_gqafix_ladekv`
+in **basic** mode — **44.707 ± 0.030 tok/s**, TTFT 103 ms, init 796 ms. That is
+**+6.5×** over the same topology pre-fix (6.836 tok/s), and it is the ship
+configuration.
+
+**Run it in basic mode, not LADE.** On the same binary LADE measures 31.342
+tok/s — a 30% regression. Post-fix the decode step is 22.4 ms, so there is no
+longer a slow call for speculation to amortise.
+
+Every other number below is **pre-fix history**, kept for provenance. The
+earlier baselines were 11.72 tok/s (basic `local`) and 9.18 (LADE), both
+2026-08-13.
 
 Rows marked *measured* are device numbers. Rows marked *projection* are not —
 and two projections in this table have already been falsified on device, so
@@ -46,13 +57,13 @@ please treat the remaining ones as hypotheses.
 
 | File | Variant | Status |
 |---|---|---|
-| **[`2026-08-14-gqafix/`](2026-08-14-gqafix)** | **GQA replication fix (2026-08-14) — 8 bundles + kit + profiling** | **current work.** Removes the 56 ops that were 74.7% of decode DSP cycles. See that folder's README; start at `2026-08-14-gqafix/kit/runsheet.md` |
-| `qwen3_06b_w8a16_fuseqkvgu_ladekv.tar.gz` | **ladekv + QKV + Gate-Up fusion (2026-08-13)** — 3 past-KV graphs, fused | **current max-TPS candidate, unmeasured.** Projection ~11.5–12.4 tok/s; fusion measured +15% in *basic* mode, never yet combined with lade |
+| **[`2026-08-14-gqafix/`](2026-08-14-gqafix)** | **GQA replication fix — 8 bundles + kit + profiling** | ✅ **shipped and measured: 44.707 tok/s basic, the current baseline.** Use `qwen3_06b_w8a16_gqafix_ladekv` with `genie_dialog_basic.json`. ⛔ Do not use `gqafix_hybrid` — it emits degenerate output |
+| `qwen3_06b_w8a16_fuseqkvgu_ladekv.tar.gz` | ladekv + QKV + Gate-Up fusion (2026-08-13) | **superseded — pre-GQA-fix.** Its ~11.5–12.4 tok/s projection is about a quarter of the measured baseline. Fusion remains an open lever, but must be rebuilt on the gqafix base to mean anything |
 | `qwen3_06b_w8a16_fuseqkvgu_ladekv_socmodel72.tar.gz` | config A/B **C1**: `soc_model 0 → 72` at build time | same weights/DLCs as the row above, ctx-bin recompiled — isolates one variable |
-| `qwen3_06b_w8a16_fuseqkvgu_ladekv_hvx8.tar.gz` | config A/B **C2**: `hvx_threads 4 → 8`, build **and** runtime config | ditto — tests whether the *compiler* schedules better when told 8 |
-| `qwen3_06b_w8a16_ladekv.tar.gz` | **0.6B lade-fix (2026-08-11)**: past-KV prefill AR=128 CL=1152 + decode AR=1 + verify AR=32 | **10.8 tok/s — measured, the best confirmed number.** The lade-mode crash fix; also enables >128-token prompts (chunked, up to ~1024) |
+| `qwen3_06b_w8a16_fuseqkvgu_ladekv_hvx8.tar.gz` | config A/B **C2**: `hvx_threads 4 → 8`, build **and** runtime | Pre-fix base, **never measured**. Note every other bin here is compiled `numHvxThreads=4` against 8 available HVX units, and `hvx_threads` is build-time only — so this A/B, rebuilt on gqafix, is now the top open experiment |
+| `qwen3_06b_w8a16_ladekv.tar.gz` | 0.6B lade-fix (2026-08-11): past-KV prefill AR=128 CL=1152 + decode AR=1 + verify AR=32 | Pre-fix reference. 10.8 tok/s LADE on a simple prompt; its **basic** rate was later measured at **6.836 tok/s**, which is the number the 44.707 baseline improves on |
 | `qwen3_06b_w8a16qh_ladekv.tar.gz` | **ladekv + W8 lm_head (2026-08-11)**: same 3 past-KV graphs, lm_head weight INT8 | **9.3 tok/s — measured: −14% vs `ladekv`, a REGRESSION.** It buys ~155 MB/token of DDR but costs ~10% n-gram acceptance, and acceptance dominates. Kept only as evidence; do not ship. (This row previously read "est. +19%" — that projection was wrong.) |
-| `qwen3_06b_w8a16_local.tar.gz` | Qwen3-0.6B W8A16 baseline (2-graph, bertcache prefill) | reference; ~6.5–7.8 tok/s basic mode |
+| `qwen3_06b_w8a16_local.tar.gz` | Qwen3-0.6B W8A16 baseline (2-graph, bertcache prefill) | Pre-fix reference; 11.72 tok/s basic (2026-08-13). Note topology-A rates blend a fast bertcache phase with slow AR-1 — quote the phase |
 | `qwen3_06b_w8a16_fusegu_local.tar.gz` | + Gate-Up fusion | projection: ~8–9 tok/s + TTFT gain |
 | `qwen3_06b_w8a16_fuseqkv_local.tar.gz` | + QKV fusion (encodings surgery) | isolates QKV effect |
 | `qwen3_06b_w8a16_fuseqkvgu_local.tar.gz` | + QKV + Gate-Up, basic mode | fusion measured **+15%** (8.98 vs 7.79 tok/s) on an equivalent working build. The older "~12–16 tok/s if BW scales" projection in this row was wrong — fusion does not reduce bytes/token, it improves access pattern |
