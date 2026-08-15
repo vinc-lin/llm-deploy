@@ -135,6 +135,15 @@ cp "$VIT_BUNDLE/htp_backend_ext_config_vit.json" "$OUT/"
 for f in "${CONFIGS[@]}"; do cp "$LLMDEPLOY_ROOT/configs/$f" "$OUT/"; done
 # Docs ship WITH the bundle and are tracked in the repo, so what the device
 # team reads is version-controlled rather than hand-written into a build dir.
+#
+# BUNDLE_README must start at its H1 with NO YAML front matter. Hugging Face
+# reads card metadata from the ROOT README.md only; its subfolder markdown
+# viewer does not strip front matter, so a `---\nlicense: ...\n---` block
+# renders as a horizontal rule, a stray "license: ... tags:" paragraph and a
+# bullet list ABOVE the title. (Verified: shipped once, caught on review.)
+# An HTML comment is not a safe substitute either -- HF sanitises HTML, so the
+# note itself can become visible. Licence/base-model tags belong in the root
+# README (docs/HF_HUB_README_qwen3vl.md), which is where they are.
 cp "$LLMDEPLOY_ROOT/docs/BUNDLE_README_qwen3vl_4b_e2e.md" "$OUT/README.md"
 cp "$LLMDEPLOY_ROOT/docs/DEVICE_TEST_qwen3vl_e2e.md" "$OUT/DEVICE_TEST.md"
 if [ -d "$KIT" ] && compgen -G "$KIT/wx_*.raw" >/dev/null; then

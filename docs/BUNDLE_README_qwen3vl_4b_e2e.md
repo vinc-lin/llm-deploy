@@ -1,14 +1,3 @@
----
-license: apache-2.0
-base_model: Qwen/Qwen3-VL-4B-Instruct
-tags:
-  - qualcomm
-  - qnn
-  - genie
-  - sa8797p
-  - multimodal
----
-
 # Qwen3-VL-4B on SA8797P — deployment and test guide
 
 Image + text in, description out, as one flat `genie-app` bundle for the
