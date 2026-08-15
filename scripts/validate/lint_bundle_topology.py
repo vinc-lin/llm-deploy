@@ -51,18 +51,29 @@ from pathlib import Path
 
 
 def load_info(path: Path) -> dict:
-    """Accept a .bin (dump it) or an already-dumped .info.json."""
+    """Accept a .bin (dump it) or an already-dumped JSON.
+
+    The build scripts are not consistent about the dump's name:
+    ctxbin_variant.sh writes `<binname>.info.json`, ladekv_build.sh writes a
+    plain `info.json` beside the bin. Check both before shelling out, so this
+    gate does not fail closed on a perfectly good bin just because the SDK is
+    not on PATH in the caller's environment.
+    """
     if path.suffix == ".json":
         return json.load(open(path))
+    for cand in (path.with_suffix(".info.json"), path.parent / "info.json"):
+        if cand.exists():
+            return json.load(open(cand))
     out = path.with_suffix(".info.json")
-    if not out.exists():
-        r = subprocess.run(
-            ["qnn-context-binary-utility", "--context_binary", str(path),
-             "--json_file", str(out)],
-            capture_output=True, text=True)
-        if r.returncode != 0:
-            raise SystemExit(f"qnn-context-binary-utility failed on {path}:\n"
-                             f"{r.stderr[:2000]}")
+    r = subprocess.run(
+        ["qnn-context-binary-utility", "--context_binary", str(path),
+         "--json_file", str(out)],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(
+            f"no dump found beside {path.name} and qnn-context-binary-utility "
+            f"failed (is the SDK on PATH? `source scripts/env.sh`):\n"
+            f"{r.stderr[:1500]}")
     return json.load(open(out))
 
 
