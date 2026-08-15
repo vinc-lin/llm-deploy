@@ -18,22 +18,36 @@ out of that reconciliation.*
 
 | | |
 |---|---|
-| **Best sustained decode, 0.6B** | **prompt-dependent — no single winner.** 11.72 tok/s basic AR-1 (`qwen3_06b_w8a16_local`) vs 9.18 LADE on the *same* technical prompt (2026-08-13, `DEVICE_MEASUREMENT_REPORT_2026-08-13.md`); 10.8 LADE on the 2026-08-11 prompt. LADE's win is not universal — it was −22% here |
-| Non-speculative AR-1 decode | 6.3–6.5 tok/s (~155 ms/step) on the 2026-08-11 v2 bundle, but **11.72 tok/s** on `qwen3_06b_w8a16_local` (2026-08-13) — **faster than the device team's 7.79**, not slower (§8.8, premise now inverted) |
-| Bertcache early phase (topology A only) | ~23.8 tok/s for the first ~117 tokens, then falls to AR-1 |
+| **Best sustained decode, 0.6B** | **44.707 ± 0.030 tok/s** (22.37 ms/step), basic mode, `qwen3_06b_w8a16_gqafix_ladekv`, 2026-08-15 (`DEVICE_MEASUREMENT_REPORT_2026-08-15.md`). Basic beats LADE post-fix (31.342); **LADE is parked** (§6.8) |
+| Non-speculative AR-1 decode, pre-fix | **6.84 tok/s** (146.3 ms/step) — the honest like-for-like baseline, measured 2026-08-15 on the pre-fix `ladekv` bin. The GQA fix is therefore **6.54×** |
+| ⚠️ **11.72 tok/s is NOT an AR-1 rate** | It is a **phase blend** on a bertcache bundle — see correction #22 and §6.9. Every comparison that used it as a decode rate produced a phantom finding (#23, #24, #25). Gate: `scripts/validate/lint_bundle_topology.py` |
+| Bertcache early phase (topology A only) | ~23.8 tok/s for the first ~117 tokens, then falls to AR-1. **This is the other half of the blend** |
 | Output correctness | ✅ since v2 (2026-08-10) |
 | Quantization | W8A16 (INT8 per-channel weights, FP16 activations) — the only recipe that works |
 | Ctx-bin, 0.6B | ~1.09 GB, 2 or 3 weight-shared graphs |
 | Device access | none from this machine — build + numerics only; device runs are done by a remote tester |
 | Blocked on hardware | tok/s, DDR bandwidth, VTCM behavior, perf profiles, anything GVM |
 
-**What moves the needle next:** multi-token decoding. Decode is 100% DDR-bound,
-so the only lever that *divides* bytes/token is emitting more than one token per
-weight-streaming pass. LADE already bought 1.7×; a learned draft head (`eaglet`,
-`spd`) is the next step up, and acceptance rate — not per-call latency — is the
-thing to optimize (§6.3). Two levers reopened 2026-08-13: **QKV+Gate-Up fusion**
-(+15% on the device team's working fused build — correction #15) and the **~20%
-build-side gap** between their unfused builds and ours (§8.8).
+**What moves the needle next (revised 2026-08-16).** The GQA replication fix
+shipped and measured 6.54× (6.84 → 44.707 tok/s), so the picture has changed
+twice over:
+
+- **"Decode is 100% DDR-bound" is no longer established.** At the post-fix
+  operating point the byte and compute models are *numerically degenerate*:
+  961 MB ÷ 22.37 ms = 43.0 GB/s (88% of the 49 GB/s streaming ceiling), **and**
+  88.2M residual cycles ÷ 4 HVX ≈ 22.06 ms (1.4% off). Neither is confirmed.
+  The discriminating experiment is a pair of arms whose predicted orderings
+  differ — W8 head (+19.3% byte / +3.6% compute) versus CL=512 (+8.3% / +34.7%)
+  — plus `hvx_threads: 8`, which changes zero bytes by construction. See
+  `docs/MAX_TPS_QWEN3_0.6B_V4.md` §2.
+- **LADE is parked** (§6.8). Post-fix break-even rose to 2.30 accepted
+  tokens/call against ~1.6 measured, because the fix sped decode 6.54× but
+  verify32 only 3.50×.
+- **Multi-token decoding is still the right long-run lever** if the regime turns
+  out to be byte-bound, and a learned draft head (`eaglet`, `spd`) now has a
+  concrete bar to clear: **+43% acceptance just to reach parity** (§6.8).
+- **QKV+Gate-Up fusion** remains untested *in combination with* the GQA fix —
+  every fused build predates it (correction #15).
 
 ---
 
@@ -52,7 +66,8 @@ picture (correction #14).
 | Runtime | QAIRT 2.48.40.260702 · QNN API v2.37.0 · libGenie 1.19.0 |
 | DVFS | works via Genie `backend.extensions` JSON, 4 tiers, 1.95× swing. `qnn-net-run --perf_profile` is a no-op. Always use `llm_decode_burst`. |
 | Burst BW, one large contiguous matmul | 49–67 GB/s depending on timing definition (33.6 MB weight in 500–684 µs, excl-wait vs total) |
-| Effective BW, real LLM decode | **~6–7 GB/s** — confirmed two independent ways: our converter DDR estimate (~957 MB/token) and the device team's back-calculation (~924 MB/token × 7.4 tok/s) |
+| Effective BW, real LLM decode — **pre-GQA-fix** | **~6–10 GB/s** — three ways: our converter DDR estimate (~957 MB/token), the device team's back-calculation (~924 MB/token × 7.4 tok/s), and the corrected 08-15 baseline (~1,489 MB ÷ 146.3 ms = **10.2 GB/s**) |
+| Effective BW, real LLM decode — **post-GQA-fix** | **~43 GB/s** (961 MB ÷ 22.37 ms) — **88% of the 49 GB/s excl-wait ceiling.** The fix bought both fewer bytes and a far better access pattern |
 | Peak FP16 compute (M ≥ 512 matmul) | ~2.7–2.8 TOPS — far below nominal; why is an open FAE question |
 | FastRPC per-call | ~220 µs round-trip (hypervisor-mediated `hfastrpc`), ~50–60 µs fixed submit/sync, 30–60 µs steady-state inter-op wait |
 | Graph-switch latency | 79–93 ms (prefill ↔ decode) |
@@ -60,15 +75,25 @@ picture (correction #14).
 | Init | cold (first run after reconnect) 1.8–2.0 s · warm 786–820 ms |
 | Not available | zero-copy sharedbuf · DSP hardware queue · clock visibility · multi-HTP under Genie · KV quantization via config (§4.1) |
 
-**The central performance fact:** the ~7–10× collapse from 49–67 → 7 GB/s is
-*access-pattern fragmentation* (28 layers of small MatMuls + KV traffic + per-op
-sync, now quantified: ~220 µs per RPC dispatch, 30–60 µs steady-state inter-op
-wait), not a clock cap. Decode is per-token weight streaming over DDR. Compute
-is not the bottleneck and neither is DVFS — both are already at ceiling. A
-corollary: fewer, larger ops help twice — big contiguous reads stream closer to
-the 49–67 GB/s figure, and every fused-away op refunds its dispatch overhead.
-That is presumably where fusion's +15% comes from (§6.6), and it should matter
-*more* at 4B (bigger per-op weights, more layers).
+**The central performance fact — largely resolved 2026-08-15.** The ~7–10×
+collapse from 49–67 → 7 GB/s was attributed here to *access-pattern
+fragmentation* (28 layers of small MatMuls + KV traffic + per-op sync: ~220 µs
+per RPC dispatch, 30–60 µs steady-state inter-op wait). **The dominant term was
+in fact the GQA KV replication**, and removing it recovered the effective rate
+from 10.2 to 43.0 GB/s — 88% of the contiguous-read ceiling — without touching
+op count or dispatch. So fragmentation was real but second-order; the 56
+replication ops were moving 528 MB/step *and* thrashing the stream.
+
+What survives: fewer, larger ops still help twice (contiguous reads stream
+nearer the ceiling, and every fused-away op refunds its dispatch), so fusion is
+still worth testing — but note fusion's +15% was measured *pre-fix* at ~10 GB/s
+effective, so it may have been recovering the same access-pattern loss the GQA
+fix has now collected. That is an open A/B, not an inherited result.
+
+**Compute is no longer known to be off the critical path.** See §0 — at 22.37
+ms/step the byte and compute models both fit, and the pre-fix step is where they
+diverge (the compute model under-predicts it by 1.67×, which is the signal that
+the replication ops specifically were the memory-bound part).
 
 Reference point for how much the hypervisor costs: the same class of model on a
 QNX-native EVB with 4 cores runs **129.7 tok/s** (Qwen3-VL 4B, official Qualcomm
@@ -238,7 +263,7 @@ Quantizers **disabled (kept FP16)** on:
 | `embed_tokens` | HTP v81 rejects `Gather` on INT16 weights (error `0xc26`) |
 | final `norm` | quality |
 | `lm_head` | default; see §6.4 — the *reason* usually given for this is wrong, but the default is still right |
-| all K/V-projection outputs | cross-graph FP16 requirement (§3.2) |
+| all K/V-projection outputs | **a build choice, not a contract.** §3.2 requires KV quant params be *byte-identical across graphs*, not that they be FP16. Quantizing them is reachable — see the note after §4.1 |
 
 Weight encodings are clipped to the ±0x7f7f-safe range. **HTP packed-pair
 saturation is not modeled by quantsim**, so "passes quantsim, garbage on silicon"
@@ -270,13 +295,37 @@ quantsim that was measured.
 | Approach | Result | Real reason |
 |---|---|---|
 | **W8A8** | garbage, all variants (v15–v19; v19 also slow — 4.32 tok/s, 730 MB spill) | v81 MatMul supports only per-tensor UINT8 asymmetric activations, which clip heavy-tailed LLM activations. Per-channel activations unsupported. |
-| **W4A16, any size** | **0/4** on the argmax gate at 0.6B — and INT4 cannot execute anyway | Two independent kills. Accuracy: all three recipes fail at 0.6B (per-channel INT4, LPBQ block-64, LPBQ+SeqMSE; `max\|Δlogits\|` 16–25 vs W8A16's 1.3–1.7). Kernels: `htp_v2.json` has **zero** INT4 MatMul/FC entries (SDK 2.43 & 2.48) and qairt-converter folds s4 weights back to f16 (HTP doc §5.3/§10.1). `--lpbq`/`--seq-mse` stay in the script only for a future SDK that ships the kernels. |
-| **KV INT8 via Genie `kv-quantization: true`** | no effect on HTP | The flag exists only in the QnnGenAiTransformer **CPU** backend (HTP doc §5.4). Native KV INT8 needs ONNX-level graph changes plus an unconfirmed kernel path — FAE question. |
+| **W4A16, any size** | **0/4** on the argmax gate at 0.6B — and INT4 cannot execute anyway | Two independent kills. Accuracy: all three recipes fail at 0.6B (per-channel INT4, LPBQ block-64, LPBQ+SeqMSE; `max\|Δlogits\|` 16–25 vs W8A16's 1.3–1.7). Kernels: `htp_v2.json` has **zero INT4 input *datatypes*** for MatMul/FC (SDK 2.43 & 2.48) and qairt-converter folds s4 weights back to f16 (HTP doc §5.3/§10.1). ⚠️ It *does* declare 4-bit and 2-bit **block-quantization encodings** (`BW_AXIS_SCALE_OFFSET`) — see correction #26 and `NOTES-htp-kernel-table.md` before concluding this was mis-diagnosed. `--lpbq`/`--seq-mse` stay in the script only for a future SDK that ships the kernels. |
+| **KV INT8 via Genie `kv-quantization: true`** | no effect on HTP | The flag exists only in the QnnGenAiTransformer **CPU** backend (HTP doc §5.4). **The *config* route is dead; the native route is not** — see the note below this table. |
 | **`--quant-head` (W8 lm_head) under LADE** | **−14% tok/s** | Costs ~10% n-gram acceptance; the DDR saving does not survive spec-decode amortization (§6.3). |
 | **`sparse_weights_compression=1`** | 0 bytes saved | model isn't sparse |
 | **2-core ctx-bin** | error 5005, or 3.96 tok/s — slower | Genie 1.19 creates a single-core device internally, no JSON override |
 | **Multiple Genie instances** | 2 × 4.0 tok/s = 8 total | linear BW split — confirms decode is 100% DDR-bound |
 | **Executing any W8A16 graph on x86 (as a device-free numerics gate)** | impossible on this SDK | `libQnnCpu` has no 16-bit fixed-point kernels: a 4×8 single-Gemm probe composes with `uFxp_8` activations (per-tensor *and* per-channel weights) and fails `OpConfig validation … for FullyConnected` with `uFxp_16`, regardless of `--target_backend`. `libQnnGpu` refuses to initialise off-target ("TuningMode must be enabled on x86_64-linux-clang"); `libQnnHtpQemu` cannot create a context; a ctx-bin is backend-final, so `--retrieve_context` on CPU gives "Context de-serialization failed". Device-free gates must therefore run an **FP32 sibling** DLC (`parity_vit_dlc.py`, `parity_vit_quant.py`). |
+
+**Native KV quantization is reachable — audited 2026-08-16.** The kernel table
+(`docs/NOTES-htp-kernel-table.md`, read out of the converter's own
+`htp_v2.json`) settles what was previously an FAE question:
+
+- v81 has **exactly one** mixed float×fixed MatMul kernel: **`f16 × sfxp8 →
+  f16`**, and its `input_quant_params` are *unconstrained* on input 1, so a
+  per-tensor-quantized **dynamic** tensor — which is what a KV cache is — is
+  legal there.
+- Therefore the KV cache must be **signed** INT8. There is no `f16 × ufxp8`
+  kernel, and AIMET defaults activations to *unsigned*, so this needs a
+  symmetric signed 8-bit quantizer on the K/V-projection outputs specifically.
+- **An INT16 KV cache is NOT reachable** while Q and the softmax output stay
+  FP16 — there is no `f16 × ufxp16` or `f16 × sfxp16` kernel. This is the same
+  gap that broke the Qwen3-VL ViT's V path (`FLOAT_16 x UFIXED_16 ->
+  FLOAT_16`, §4 above), and it means "INT16 first as the safe fallback" is
+  **backwards**: INT16 is the harder path, not the easier one.
+- Supporting signal that the runtime anticipates this: `validateModel` Check 4
+  already compares `(scale, offset)` byte-for-byte on KV tensors across graphs,
+  and `checkShape` carries a per-tensor `bitwidth` — neither would exist for a
+  KV cache that could only ever be FP16.
+
+Remaining risk is accuracy and whether the converter *selects* the mixed kernel
+rather than inserting a dequantize. Not yet built.
 
 **Removed from this table 2026-08-13: QKV/Gate-Up fusion.** Our "no tok/s gain
 (6.27–6.5 ≈ baseline)" verdict compared against a v1-era fused build that was
@@ -302,6 +351,7 @@ shipping anything.
 | Quant quality | `quantize_aimet.py … --eval` | last-token argmax ≥ 3/4 prompts |
 | DLC shape | `qairt-dlc-info -i prefill.dlc \| grep logits` | `1,128,151936` — never `1,1,…` |
 | **Graph names** | `qnn-context-binary-utility --json_file` → `graphName` | exactly matches both HTP configs (§3.3) |
+| **Decode topology** | `lint_bundle_topology.py <ctxbin>` | `pure` for anything whose tok/s will be compared against another bundle; `BLENDED` bins carry an AR==CL graph and report a two-phase rate (§6.9) |
 | Quantized head | `qairt-dlc-info \| grep lm_head.weight` | `sFxp_8` with `--quant-head`, else `Float_16` |
 | Ctx-bin | `qnn-context-binary-utility --json_file` | all graphs listed, logits dims per §3.1, ~1.09 GB for 0.6B |
 | **ViT fixed-point I/O** | `vit_build_quant.sh` step 3 (fails the build itself) | `pixel_values` + all 4 outputs `QNN_DATATYPE_UFIXED_POINT_16`, scale/offset byte-equal to `model.encodings`, one graph named `vit`, O=3 / vtcm 16 / 4 HVX read back out of the binary |
@@ -460,6 +510,61 @@ Two things do not reconcile with our measurements and stay open:
   "fused" data point was a v1-era garbage-output build, so theirs is the only
   valid fused-vs-unfused measurement in existence (correction #15).
 
+### 6.8 Post-fix decode, and why LADE is parked (2026-08-15)
+
+Measured on `qwen3_06b_w8a16_gqafix_ladekv`, warm, greedy, 56-token technical
+prompt — all three arms on **one binary**, so these are directly comparable:
+
+| Arm | tok/s | per-step / per-call | Notes |
+|---|---:|---:|---|
+| basic (AR-1 decode) | **44.707 ± 0.030** | 22.37 ms | the baseline |
+| LADE | 31.342 ± 0.090 | 51.4 ms/call | acceptance 1.61 tok/iter |
+| pre-fix basic, same topology | 6.836 ± 0.000 | 146.3 ms | the honest 6.54× control |
+
+The GQA fix sped **decode 6.54×** but **verify32 only 3.50×** (180 → 51.4 ms),
+because replication cost is AR-independent and therefore dominated the AR-1
+graph far more than the AR-32 one. So speculation's break-even moved:
+
+```
+break-even acceptance = verify call latency / decode step = 51.4 / 22.37 = 2.30 tokens/call
+measured acceptance                                                      ≈ 1.61 (technical prompt)
+                                                                         ≈ 1.94 (2026-08-11 simple prompt)
+```
+
+**LADE did not get worse; decode got better faster.** Keep `verify32` in the
+bins (weight-shared, ~0 marginal cost, preserves optionality) and park the
+workstream. A learned draft head (`eaglet`/`spd`, §6.3) needs **+43% acceptance
+to reach parity** — that is the bar, and it is a much sharper target than
+"optimize acceptance".
+
+### 6.9 Topology A blends two decode rates — read this before quoting any tok/s
+
+In topology A (bertcache, AR==CL=128) Genie keeps generating **through the
+prefill graph**, re-processing the whole 128-wide window once per token, until
+the KV cache passes 128 (`kvmanager.cpp:421-429`). Only then does AR-1 take
+over. A tok/s figure measured over a fixed token budget on such a bundle is a
+**time-weighted blend of two rates**, and it flatters itself because bertcache
+steps attend over AR positions rather than CL.
+
+Worked, from the 2026-08-13 Test 1 basic arm (`qwen3_06b_w8a16_local`, 56-token
+prompt, 128 generated tokens, 10,837 ms):
+
+```
+bertcache phase: generated tokens 1..72   (KV 56 -> 128), 40.1 ms each  = 2,887 ms
+AR-1 phase     : generated tokens 73..128 (56 tokens)                   = 7,950 ms
+                                                    7,950 / 56          =   142.0 ms/step
+```
+
+**142.0 ms against 146.3 ms measured independently on 2026-08-15** on the
+pre-fix `ladekv` bin — two numbers from different days, different bundles,
+different methods, agreeing to 3%. The blend model closes.
+
+`scripts/validate/lint_bundle_topology.py` classifies any ctx-bin as **pure** or
+**blended** from its own graph shapes and derives the same 72/56 split. Run it
+before comparing any two decode rates. Six of the eight 2026-08-14 `gqafix_*`
+bundles are blended, which is why every variant in that drop had to be rebuilt
+on the past-KV topology before it could be measured.
+
 ---
 
 ## 7. Corrections ledger
@@ -491,6 +596,11 @@ the index of what changed.
 | 19 | An oversized ctx-bin means **weight sharing is disabled** (check `weight_sharing_enabled`) | this file §8.2; MAX_TPS §2 A.4 as originally written | Incomplete. Weight sharing can be **on and working** and the bin still inflate, because dedup needs the graphs' exported **weights to be byte-identical**, and a *calibrated* export is not byte-identical to an `--export-decode` export of the same model — see §6.7. Check which export path each graph came from before touching the config. |
 | 20 | An AR==CL prefill graph is **harmless dead weight — silently skipped, correctness unaffected** | `NOTES-genie-pipeline.md` probe C; §2.2/§3.3 as read until 2026-08-14 | True **unsplit** only. In a split tower shard 0's prefill has no logits, classifies `DECODER_PREFILL`, and its expected CL is rewritten to the cache-group max — the graph then **fails validation and the node never loads** (§3.6). Probe C also mis-stated that our prefill classifies `DEFAULT`: that holds for `prefill_1`, not `prefill_0`. |
 | 21 | The Qwen3-VL e2e gate's **20/20 token-identical** describes what the shipped bundle does | 2026-08-14 status report §3–§4 | The three gated chains run *real* deepstack; the configuration that ships (`tierA-zero-deep`) is explicitly **not gated**. On device the bar is semantic, not token-exact (§5). The report's own "HF exactness drops 0→20/20" is the same point, written backwards. |
+| **22** | **11.72 tok/s is the best sustained AR-1 decode rate** | this file §0 (twice) and §6.1; `MAX_TPS_V2` §0; 08-13 report Test 1/Test 3 | **It is a phase blend**, not a decode rate: ~72 bertcache steps at ~40 ms plus ~56 AR-1 steps at ~142 ms (§6.9). The honest pre-fix AR-1 rate is **6.84 tok/s**, measured 2026-08-15. §6.1's own rule — "any tok/s number for topology A is meaningless without saying which phase" — is what this violated. Gated now by `lint_bundle_topology.py`. |
+| **23** | **LADE is −22% vs basic on the technical prompt** | 08-13 report Test 1 + §6.2; this file §0 | Compares LADE on `ladekv` against **blended** basic on `local`. Like-for-like on one bin and one prompt, **pre-fix LADE was 9.18 vs 6.84 = +34%**. LADE's loss is real but is a *post-fix* phenomenon (44.707 vs 31.342), first measurable 2026-08-15, and its cause is the break-even shift in §6.8 — not prompt-dependence. |
+| **24** | **A ~75% build gap / 3-graph penalty exists between `local` and `ladekv`** | 08-13 report §6.3 + rec 2; `MAX_TPS_V2` §2.2; `MAX_TPS_V3` §7 item 4 ("64 ms unexplained term") | Same artifact as #22. The two decode graphs are structurally identical (CL=1152, spill 0, same vtcm/O/hvx) and share weights within 4 MB. **No graph-count or graph-switching penalty is in evidence, and the 64 ms term does not exist.** |
+| **25** | **Our builds are +51% faster than the device team's 7.79 ("RESOLVED BACKWARDS")** | this file §8.8 | Blended-vs-AR-1 again. Corrected, our pre-fix AR-1 is **6.84** — roughly 12% *slower* than their 7.79, i.e. closer to the original premise than to its "resolution". Their build's provenance was never audited, so §8.8 is **reopened as an open question**, not resolved in either direction. |
+| **26** | W4A16 is dead partly because there are **zero INT4 MatMul/FC entries** in `htp_v2.json` | this file §4.1 and correction #8 | Imprecise, though the conclusion holds. There are zero INT4 **input datatypes** (every entry is ≥8-bit) — that is the load-bearing half. But **31 MatMul / 21 FullyConnected `input_quant_params` entries declare `Bitwidth: "4"`** (and 15/13 declare `"2"`) under `BW_AXIS_SCALE_OFFSET`, i.e. LPBQ block-quantized sub-byte weights in an 8-bit container. Restated so nobody greps the file, finds `"4"`, and wrongly reopens the dead end. W4A16 stays dead on s4→f16 folding **and** 0/4 accuracy. See `docs/NOTES-htp-kernel-table.md`. |
 
 ---
 
@@ -551,10 +661,16 @@ unshared signature: `qwen3-0.6b-w8a16qh_ctx.bin` is **1.84 GB** for 2 graphs and
 sharing works. Worth confirming, because it means a silently-unshared build is
 still possible today and the only symptom is file size.
 
-### 8.3 Does `qh` help in AR-1 basic mode?
-The one configuration where the acceptance penalty does not apply. Cheap to test —
-the bundle ships `genie_dialog_basic.json` against the same ctx-bin. Contingent on
-§8.1: if the saving never reaches the device, the answer is no.
+### 8.3 Does `qh` help in AR-1 basic mode? — now the **primary discriminating experiment**
+The one configuration where the acceptance penalty does not apply. Post-fix this
+question got much more load-bearing: it is one of the two arms that separates the
+byte model from the compute model, which predict **+19.3%** and **+3.6%**
+respectively (`MAX_TPS_QWEN3_0.6B_V4.md` §2.3). Still contingent on §8.1 — if the
+151 MB never reaches the device, the answer is no, and *that is itself the byte
+model's refutation on this arm*.
+⚠️ The existing HF `gqafix_qh` bundle **cannot answer this**: it is a bertcache
+2-graph bin, so its basic-mode rate is blended (§6.9). It must be rebuilt on the
+3-graph past-KV topology first.
 
 ### 8.4 `soc_model: 0` at `O=3`
 We build with `soc_model` unspecified. The SDK maps SA8797 → `soc_id 72`, and
@@ -598,28 +714,51 @@ Downstream of export, the 4B text tower **must** ship as ≥2 ctx-bins:
 and the 36-layer graph estimates 4.18 GiB (weights only — context length does
 not move it). The split contract is in `docs/NOTES-genie-splits.md`.
 
-### 8.8 ~~Why are the device team's builds ~20% faster?~~ — RESOLVED BACKWARDS (2026-08-13)
+### 8.8 Why are the device team's builds faster? — REOPENED (2026-08-16)
 
-**The premise was wrong: our builds are faster, not slower.** Measured on the
-same device, same prompt: `qwen3_06b_w8a16_local` **11.72 tok/s** AR-1 vs the
-device team's reported **7.79** — **+51% in our favour**
-(`DEVICE_MEASUREMENT_REPORT_2026-08-13.md:362-368`, and its §Test 3).
+*Was "RESOLVED BACKWARDS (2026-08-13)". That resolution rested on the blended
+11.72 figure and is withdrawn — see correction #25.*
 
-The original 6.5-vs-7.79 comparison stood on our *2026-08-11 v2* bundle only;
-it was never a build-quality gap, it was a bundle-to-bundle difference on our
-own side. Do not spend effort chasing their converter flags on this basis.
+The 2026-08-13 claim was: `qwen3_06b_w8a16_local` **11.72 tok/s** AR-1 vs the
+device team's **7.79**, "+51% in our favour". But 11.72 is a phase blend (§6.9),
+not an AR-1 rate. **Our pre-fix AR-1 rate is 6.84 tok/s** (measured 2026-08-15),
+which is ~12% *slower* than their 7.79 — so the original premise was closer to
+right than its retraction was.
+
+Two caveats keep this genuinely open rather than merely re-inverted:
+
+- Their 7.79 run reports PPR 7.45 tok/s on a 6-token prompt and TTFT 805 ms,
+  which is decode-speed prefill — unlike anything we measure. Their bundle's
+  topology, and therefore whether *their* number is itself blended, is unknown.
+- Their ctx-bin is 1.01 GB against our 1.087 GB, so the artifacts differ.
+
+Resolving it needs their binary, converter command lines, build-time HTP config,
+`qnn-context-binary-utility` dump and dialog JSON — requested 2026-08-14
+(`DEVICE_TEAM_EXCHANGE_2026-08-14.md` §4.2), still outstanding. **Do not quote a
+direction for this gap until those land.**
+
+The same 2026-08-13 measurement surfaced the real lead, which did pay out: 74.7%
+of decode DSP cycles in GQA replication `Expand` ops → the `--grouped-gqa` fix →
+**6.54× measured** (`DEVICE_MEASUREMENT_REPORT_2026-08-15.md`).
 
 What the same measurement DID surface is the real lead: 74.7% of decode DSP
 cycles in unreplicated-KV `Expand` ops — see the GQA replication fix
 (`DROP_README_2026-08-14-gqafix.md`, `MAX_TPS_QWEN3_0.6B_V3.md`,
 `--grouped-gqa` in `quantize_aimet.py`).
 
-### 8.9 `hvx_threads`: 4 or 8?
+### 8.9 `hvx_threads`: 4 or 8? — promoted; it is now a model-falsification test
 The runtime always reports **8 HVX threads in use**, on every workload size,
 yet both teams build and configure with `hvx_threads: 4` (HTP doc open
-question 7). Whether 8 at build/config time changes scheduling is an unrun,
-cheap A/B — set it in both `configs/htp_config.json` and
-`htp_backend_ext_config.json`.
+question 7; 08-13 Test 5 showed only that the *runtime* knob is inert — it is
+build-time only, `NOTES-htp-config-keys.md`).
+
+Post-fix this is no longer a trimming knob. It **changes zero bytes by
+construction**, so the byte model predicts exactly 0.0% while the compute model
+allows up to 2× if the build-time 4 is binding. Any result above the rep spread
+falsifies the byte model outright, and it costs one ctx-bin regenerate from
+existing DLCs. It also resolves enough of the thread ambiguity to make the
+per-op cycle profile interpretable — at 4 threads that profile reads
+compute-bound and at 8 it reads byte-bound, so on its own it cannot adjudicate.
 
 ### 8.10 n-gram acceptance at 4B
 Everything LADE buys at 4B hinges on acceptance holding near 0.6B's ~1.94
@@ -687,7 +826,10 @@ cross-variant `load_encodings`).
 | **`docs/REFERENCE.md`** (this file) | **current truth** | start here |
 | `CLAUDE.md` | current | terse operating rules for agents |
 | `docs/BUILD_GUIDE.md` | current | step-by-step recipes, per-variant commands, troubleshooting |
-| `docs/MAX_TPS_QWEN3_0.6B_V3.md` | **current** | the 0.6B speed plan. Supersedes V2 §3–§5 (sequencing); V2 §0–§2 remain the analytical basis. **Start here, not at V1.** |
+| **`docs/MAX_TPS_QWEN3_0.6B_V4.md`** | **current — the 0.6B speed plan** | rev 2, 2026-08-16. The blend correction (§1), the byte-vs-compute degeneracy (§2), and the device session. **Start here.** Supersedes V3 §3–§7 and retires V3 §7 item 4 |
+| `docs/DEVICE_MEASUREMENT_REPORT_2026-08-15.md` | current device truth | the GQA-fix result: 44.707 tok/s basic, 6.54× over the pre-fix control, LADE parked |
+| `docs/NOTES-htp-kernel-table.md` | current, SDK-cited | every MatMul/FC dtype combination v81 supports. Read before any quantization-dtype decision — it answers KV INT8 and retro-explains the ViT V-path failure |
+| `docs/MAX_TPS_QWEN3_0.6B_V3.md` | **superseded by V4** for §3–§7 | §0 (the inversion principle) and its build discipline still current. Its §10b execution log is the record of the gqafix build |
 | `docs/MAX_TPS_QWEN3_0.6B_V2.md` | current for §0–§2 only | measured baselines, revised performance model, ctx-bin forensics |
 | `docs/MAX_TPS_QWEN3_0.6B.md` (V1) | **superseded** | the original 10.8 tok/s recipe. Its headline predates the 2026-08-13 measurement that showed basic AR-1 at 11.72 on the same device. Historical. |
 | `docs/NOTES-genie-pipeline.md` | current, SDK-cited | the multimodal pipeline contract — image-encoder dtype, MRoPE, deepstack-by-zeros, and the split-prefill load failure (§C1) |

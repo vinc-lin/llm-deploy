@@ -13,6 +13,33 @@ tags:
 
 # SA8797P Qwen3 W8A16 Deployment Bundles
 
+> ## 📌 Current baseline: **44.707 tok/s** — updated 2026-08-16
+>
+> The GQA KV-replication fix shipped and was measured on device on 2026-08-15.
+>
+> | | tok/s | |
+> |---|---:|---|
+> | **`qwen3_06b_w8a16_gqafix_ladekv`, basic mode** | **44.707 ± 0.030** | ✅ **the ship configuration** |
+> | same bundle, LADE mode | 31.342 | ❌ parked — post-fix break-even rose to 2.30 accepted tok/call |
+> | pre-fix `ladekv`, basic mode | 6.836 | the like-for-like control → the fix is **6.54×** |
+>
+> **⚠️ Two older numbers in this README are wrong and are being corrected.**
+> **11.72 tok/s was never an AR-1 decode rate** — it is a *phase blend* measured
+> on a bertcache bundle, where Genie generates through the CL=128 prefill graph
+> for the first ~72 tokens before switching to AR-1. The honest pre-fix AR-1
+> rate is 6.84. Three previously-reported findings were artifacts of quoting the
+> blend as a decode rate: the "~75% build gap", the "LADE is −22%" result, and
+> "our builds are +51% faster than the device team's".
+>
+> **Practical rule:** only compare decode rates between bundles that are
+> *topologically pure* (no AR==CL graph). Of the 2026-08-14 `gqafix_*` bundles,
+> only **`gqafix_ladekv`** and **`gqafix_pastkv2g`** are pure — the other six
+> carry a bertcache prefill and will report a flatteringly fast blended number.
+> The build-side gate is `scripts/validate/lint_bundle_topology.py`.
+>
+> Full analysis: `docs/MAX_TPS_QWEN3_0.6B_V4.md` §1–§2 and `docs/REFERENCE.md`
+> §6.8–§6.9 in the source repo.
+
 Push-ready Genie T2T device bundles for the Qualcomm **SA8797P** (nordy / Gen5,
 Hexagon v81) automotive SoC, Android GVM, built **entirely off-device** on
 2026-08-10 with **QAIRT 2.48.40.260702** (exact match to the target runtime,

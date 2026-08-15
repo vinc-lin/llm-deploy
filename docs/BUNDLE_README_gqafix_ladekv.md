@@ -28,6 +28,31 @@ untouched, so the Genie feed pattern is identical to the pre-fix bundle.
 decode was compute-bound and throughput rises, or a weight/KV streaming floor
 binds and it barely moves. This bundle answers that.
 
+> ## ✅ ANSWERED on device, 2026-08-15 — and this README's baselines are superseded
+>
+> | Arm (this bundle, one binary) | tok/s | |
+> |---|---:|---|
+> | **basic mode** | **44.707 ± 0.030** (22.37 ms/step) | ✅ **ship this** |
+> | LADE mode | 31.342, acceptance 1.61 tok/iter | ❌ parked |
+> | pre-fix `ladekv`, basic | 6.836 (146.3 ms/step) | the control → **6.54×** |
+>
+> **§5.4's decision matrix is closed: quadrant A.** Do not run it as an open
+> question.
+>
+> **⚠️ Every "11.72 tok/s" and "9.18 tok/s" baseline below is superseded, and
+> 11.72 was never an AR-1 rate to begin with.** It is a phase blend measured on
+> the bertcache `local` bundle — Genie generates through the CL=128 prefill
+> graph for the first ~72 tokens, then switches to AR-1 at ~142 ms/step. The
+> correct pre-fix control is **6.836**, and against it this bundle is 6.54×, not
+> 3.8×. §7's comparison table and the §5 kit arms inherit that error.
+>
+> **What is still live in this document:** §2 (contents and the verified ctx-bin
+> dump), §3 (deploy/run), §4 (the seven rules), §6 (sending results back) and §8
+> (build provenance and gates) are all unaffected and remain accurate.
+>
+> Successor: `docs/MAX_TPS_QWEN3_0.6B_V4.md` (rev 2) and the kit v2 runsheet.
+> Reasoning: `docs/REFERENCE.md` §6.8–§6.9, corrections #22–25.
+
 ## 2. Contents
 
 Flat layout — no `lib/` subdir, no `ADSP_LIBRARY_PATH` needed for Genie runs.

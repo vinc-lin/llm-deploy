@@ -1,5 +1,32 @@
 # 2026-08-14 — GQA replication fix
 
+> ## ✅ MEASURED 2026-08-15 — the fix landed at 6.54×. Two corrections before you use this drop.
+>
+> **Result:** `gqafix_ladekv` basic = **44.707 ± 0.030 tok/s** against a
+> like-for-like pre-fix control of **6.836**. Basic beats LADE (31.342), so
+> **basic is the ship configuration** and LADE is parked.
+>
+> **Correction 1 — the 11.72 baseline quoted below is a phase blend, not a
+> decode rate.** It was measured on the bertcache `local` bundle, where Genie
+> generates *through* the CL=128 prefill graph for the first ~72 tokens (~40 ms
+> each) before switching to AR-1 (~142 ms each). The honest pre-fix AR-1 rate is
+> 6.84. So the fix is 6.54×, not the 3.8× a comparison against 11.72 implies.
+>
+> **Correction 2 — six of the eight bundles in this drop cannot be measured as
+> shipped.** `gqafix_local`, `gqafix_qh`, `gqafix_cl512`, `gqafix_dlbc`,
+> `gqafix_udma` and `gqafix_hybrid` all carry the CL=128 bertcache prefill (they
+> are the ~1.32 GB ones), so their basic-mode tok/s is blended and **not
+> comparable to 44.707** — and the blend runs *fast*, so the failure mode is a
+> confident wrong number. **Priorities 4 and 5 in `kit/runsheet.md` should not be
+> run against these bundles.** They are being rebuilt on the 3-graph past-KV
+> topology; a kit v2 will supersede the runsheet.
+>
+> Only **`gqafix_ladekv`** and **`gqafix_pastkv2g`** are topologically pure.
+> Priority 1 (the decode-only cycle profile) is also unaffected — it is a
+> single-graph bin with no graph selection.
+>
+> Reasoning: `docs/MAX_TPS_QWEN3_0.6B_V4.md` §1, `docs/REFERENCE.md` §6.9.
+
 Everything from this drop lives in this folder. Nothing here depends on the
 files at the repo root except the two pre-fix bundles named below, which you
 almost certainly already have on the device.
