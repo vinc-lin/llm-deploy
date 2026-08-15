@@ -183,12 +183,20 @@ measured delta against a re-baselined control (B0).
 | **`hvx_threads: 8`** at build time | zero bytes change → **0.0%** | up to +100% if the build-time 4 is binding; sub-linear in practice | ✅ **null test** |
 | QKV + Gate-Up fusion | −80 MB measured by the device team (880 vs 960) → **+9.1%** | ~10% of cycles (V2 §1.3) → **+11%** | ❌ — ship candidate, not evidence |
 | KV signed-INT8 | −66.0 MB → **+7.4%** | GEMV byte-side only; small | weakly — but the kernel is confirmed to exist (A1.3), so it is now a build, not a question |
-| `soc_model: 72`, `extended_udma`, DLBC, `weights_packing` | unknown, plausibly 0 | unknown, plausibly 0 | ❌ — cheap lottery tickets |
+| `soc_model: 72`, `extended_udma`, DLBC, `weights_packing` | **0.0%, measured** | unknown | ❌ — cheap lottery tickets |
 
-**The W8-head and `cl512` arms predict opposite orderings** (+19 vs +4, and +7 vs
-+26). Running both settles the regime with no assumption about clock or thread
+**The W8-head and `cl512` arms predict opposite orderings** (+18 vs +4, and +10
+vs +26). Running both settles the regime with no assumption about clock or thread
 count, which is exactly what the cycle profile cannot do alone. That pair is
 priority 1 in Part B, and building them is priority 1 in Part A.
+
+⚠️ **Caveat on the qh arm, added after building it.** Its ctx-bin shrank only
+8.4 MB although the converter credits −146.1 MB — reproducing `REFERENCE.md`
+§8.1 on an independent build. If the head really is re-materialized to 16 bits at
+prepare time, qh measures **≈0%** and the byte model is untestable on that arm.
+That is a *third* distinguishable outcome, not a spoiled experiment, but it makes
+**`cl512` the more trustworthy half of the pair** — its saving is activation
+traffic, which cannot be re-materialized away. See `VARIANT_PREDICTIONS.md` §2b.
 
 **`hvx_threads: 8` is the cheapest experiment in the plan** — a ctx-bin regenerate
 from existing DLCs, no re-export, no requantization — and its byte-model prediction
