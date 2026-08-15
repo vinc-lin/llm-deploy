@@ -487,6 +487,77 @@ to build, free to run, and a positive result falsifies half the plan on its own.
   — reopened by §1.2. Their number is AR-1; ours, correctly stated, is 6.84. Needs
   their binary and build config (the 2026-08-14 request, still outstanding).
 
+## 6b. Execution log — 2026-08-16
+
+Recorded as Part A was executed. Device-free facts only, so nothing here is
+gated on Part B.
+
+### Desk work — three items done, two of them overturned their own premise
+
+| Item | Result |
+|---|---|
+| **A1.1** | Blend correction propagated: `REFERENCE.md` §0/§1/§6.8/§6.9/§8.3/§8.8/§8.9 + corrections #22–26; a §0.4 annotation on the 08-13 report (body unedited per convention); banners on the HF hub, drop and bundle READMEs |
+| **A1.2** | `lint_bundle_topology.py` written and validated against three bins with known classifications. It derives the same 72/56 phase split for the 08-13 Test 1 arm **from the ctx-bin's graph shapes alone**, independently of the timing residual that produced §1.1 |
+| **A1.3** | ✅ **Answered, and it inverted the plan.** `f16 × sfxp8 -> f16` exists with unconstrained input-1 quant params, so quantized KV is reachable — but **signed INT8 only**, and **the INT16 "safe fallback" does not exist**. `docs/NOTES-htp-kernel-table.md` |
+| **A1.5** | ❌ **The premise was false.** The pre- and post-fix decode graphs have byte-identical input contracts and the shipped profiling package scores **60/60** against the gqafix bin, so the 08-15 "pre-fix format inputs" diagnosis was impossible. P1 is still blocked, cause unknown; `verify_profile_inputs.py` now ships so the next attempt names it |
+
+### A3a — five ctx-bin variants, and a control that mattered
+
+Built via `ctxbin_variant.sh` from the existing gqafix DLCs. ~2.5 min each, far
+under the 16–20 min the HTP doc quotes — these are regenerates, not builds.
+
+| Build | ctx-bin bytes | Δ vs control | decode `read_total_bytes` | knob consumed? |
+|---|---:|---:|---:|---|
+| `ctrl` | 1,086,570,496 | — | 961,130,496 | — |
+| **`hvx8`** | 1,088,847,872 | **+2,277,376** | 961,130,496 | ✅ yes |
+| **`udma`** | 1,086,783,488 | **+212,992** | 961,130,496 | ✅ yes |
+| `dlbc` | 1,086,570,496 | 0 | 961,130,496 | ⚠️ unproven |
+| `wpack` | 1,086,570,496 | 0 | 961,130,496 | ⚠️ unproven |
+
+**Including a control was the right call.** `ctxbin_variant.sh` builds its own
+backend config (`perf_profile: burst`, `rpc_control_latency: 100`) rather than
+using `configs/`, so without it any delta could have been the config path. The
+control's decode byte count reproduces the established baseline exactly.
+
+Three findings:
+
+1. **`hvx_threads: 8` is genuinely consumed at build time.** It was known inert
+   at *runtime* (08-13 Test 5); this is the first evidence the build-time value
+   reaches the artifact, which is what qualifies §2.3's null test as a real
+   experiment rather than a no-op.
+2. **`extended_udma` applied for the first time in this project's history** — it
+   had sat in the `"memory"` section (`extra="forbid"`, one field) in every prior
+   build.
+3. **All five move zero DDR bytes**, measured. So the byte model's 0.0%
+   prediction for these arms is now a measurement, not an assumption.
+
+`dlbc` and `wpack` produce byte-identical binaries. That does not prove a no-op
+— some keys are runtime hints — but it ranks them last.
+
+Still to build in A3a: `socmodel72` (`ctxbin_variant.sh` gained a `__devices`
+override for it; `soc_model` was hardcoded to 0) and `sparse`, which is deferred
+because `finalize_config` is an undocumented free-form dict and a wrong shape is
+silently ignored — the exact failure class this repo has hit three times.
+
+### A3.7 — `gqafix_qh_ladekv` is much cheaper than rev 1 assumed
+
+The expensive stage (AIMET quantsim + calibration with `--quant-head`) ran on
+2026-08-14 and its quant dir was **archived, not deleted**
+(`/mnt/x/llm-archive/quant-consumed-2026-08-14/`). So this is two graph exports
+adopting those encodings — `lade_build.sh` for `verify32`, `ladekv_build.sh` for
+the past-KV prefill — not a requantization.
+
+Verified before starting, because the `--keep-head-weight` trap has bitten once:
+both `model_filtered.encodings` and `model_filtered_renamed.encodings` carry
+`lm_head.weight` at **bitwidth 8, INT, PER_CHANNEL**, and neither build script
+re-runs `filter_aimet_w8a16.py` — they pass the already-filtered encodings
+straight to `--quantization_overrides`. Note the export log still lists
+`lm_head.params` among its disabled quantizers (that is the default W8A16
+recipe); the INT8 head arrives via the adopted encodings, so **all three DLCs
+must be dtype-checked after the build**, not just assumed.
+
+---
+
 ## 7. Corrections this plan hands to `REFERENCE.md` §7
 
 Drafted here, to be applied by A1.1 rather than asserted from this document.
