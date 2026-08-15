@@ -56,6 +56,13 @@ UTIL=$QAIRT_SDK/bin/x86_64-linux-clang/qnn-context-binary-utility
 VIT_BIN=qwen3vl-4b-vit-w8a16_ctx.bin
 TEXT_BINS=(qwen3vl-4b-w8a16_1_of_2.bin qwen3vl-4b-w8a16_2_of_2.bin)
 
+# Where the two TEXT ctx-bins come from. Defaults to the gated Stage 2 text
+# bundle; point it at a variant build (the past-KV prefill rebuild lands in
+# work/ctxbin/<name>-splitkv/{1,2}_of_2/) to swap only the text tower while
+# every other byte still comes from its own gated source. The FILENAMES do not
+# change -- the node config references them.
+TEXT_CTX=${TEXT_CTX:-$TEXT}
+
 # Everything taken from the gated text bundle: ctx-bins, LUT, tokenizer, the
 # text tower's htp extensions, both genie drivers and the 7 runtime libraries.
 # genie-app is the driver for THIS bundle (it is the only prebuilt binary
@@ -74,11 +81,30 @@ CONFIGS=(
   genie_text_encoder_qwen3vl.json
   genie_text_generator_qwen3vl_4b.json
   genie_pipeline_qwen3vl.script
+  # Fallback: one file swap if the primary somehow still fails at load. It
+  # filters the prefill graphs out before they become variants, at the cost of
+  # all prefill (~30 s TTFT instead of ~3-4 s). lint check 10 proves it differs
+  # from the primary by exactly the two select-graphs keys.
+  genie_text_generator_qwen3vl_4b_decodeonly.json
+  genie_pipeline_qwen3vl_decodeonly.script
 )
+
+# Weather/road test kit: per-image blob + sidecar + jpg + its own script, all
+# FLAT like the rest of the bundle. Built by scripts/pipeline/build_test_kit.py.
+KIT=${KIT:-$LLMDEPLOY_DATA/work/kit}
+
+# src_of <file> -> the directory that file is taken from
+src_of() {
+    for b in "${TEXT_BINS[@]}"; do
+        [ "$1" = "$b" ] && { echo "$TEXT_CTX"; return; }
+    done
+    echo "$TEXT"
+}
 
 MISSING=0
 for f in "${TEXT_FILES[@]}"; do
-    [ -f "$TEXT/$f" ] || { echo "ERROR: missing $TEXT/$f" >&2; MISSING=1; }
+    s=$(src_of "$f")
+    [ -f "$s/$f" ] || { echo "ERROR: missing $s/$f" >&2; MISSING=1; }
 done
 for f in "${CONFIGS[@]}"; do
     [ -f "$LLMDEPLOY_ROOT/configs/$f" ] || {
@@ -102,10 +128,30 @@ disk_guard 16
 rm -rf "$OUT"; mkdir -p "$OUT"    # stale binaries must never leak into a bundle
 
 echo "== [1/5] copy gated artifacts =="
-for f in "${TEXT_FILES[@]}"; do cp "$TEXT/$f" "$OUT/"; done
+[ "$TEXT_CTX" = "$TEXT" ] || echo "   text ctx-bins from $TEXT_CTX"
+for f in "${TEXT_FILES[@]}"; do cp "$(src_of "$f")/$f" "$OUT/"; done
 cp "$VIT_CTXDIR/$VIT_BIN" "$OUT/"
 cp "$VIT_BUNDLE/htp_backend_ext_config_vit.json" "$OUT/"
 for f in "${CONFIGS[@]}"; do cp "$LLMDEPLOY_ROOT/configs/$f" "$OUT/"; done
+# Docs ship WITH the bundle and are tracked in the repo, so what the device
+# team reads is version-controlled rather than hand-written into a build dir.
+#
+# BUNDLE_README must start at its H1 with NO YAML front matter. Hugging Face
+# reads card metadata from the ROOT README.md only; its subfolder markdown
+# viewer does not strip front matter, so a `---\nlicense: ...\n---` block
+# renders as a horizontal rule, a stray "license: ... tags:" paragraph and a
+# bullet list ABOVE the title. (Verified: shipped once, caught on review.)
+# An HTML comment is not a safe substitute either -- HF sanitises HTML, so the
+# note itself can become visible. Licence/base-model tags belong in the root
+# README (docs/HF_HUB_README_qwen3vl.md), which is where they are.
+cp "$LLMDEPLOY_ROOT/docs/BUNDLE_README_qwen3vl_4b_e2e.md" "$OUT/README.md"
+cp "$LLMDEPLOY_ROOT/docs/DEVICE_TEST_qwen3vl_e2e.md" "$OUT/DEVICE_TEST.md"
+if [ -d "$KIT" ] && compgen -G "$KIT/wx_*.raw" >/dev/null; then
+    cp "$KIT"/wx_*.{raw,json,jpg,script} "$KIT/TEST_IMAGES.md" "$OUT/"
+    echo "   test kit: $(ls "$KIT"/wx_*.raw | wc -l) image(s) from $KIT"
+else
+    echo "   WARNING: no test kit at $KIT -- lint check 11 will fail" >&2
+fi
 
 echo "== [2/5] re-read graph names from the final ctx-bins =="
 for b in "$VIT_BIN" "${TEXT_BINS[@]}"; do

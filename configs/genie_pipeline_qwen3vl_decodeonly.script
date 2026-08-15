@@ -1,0 +1,89 @@
+# ============================ FALLBACK SCRIPT ============================
+# Use this ONLY if the primary script fails at load. It swaps the text
+# generator for a config carrying execute-select-graphs/load-select-graphs,
+# which filters the prefill graphs out before they ever become variants
+# (nsp-model.cpp:314-318), so nothing shape-validates them.
+#
+# Cost: no prefill. Every prompt token goes through the AR=1 decode graph,
+# so TTFT for a 273-token prompt is ~30 s instead of ~3-4 s. Output should
+# be unchanged -- the e2e gate's chain0-alldecode is exactly this path and
+# is token-identical to HF.
+#
+# UNTESTED ON DEVICE, and it carries one unverified risk: the same graph
+# name list is handed to BOTH contexts, and whether HTP tolerates an
+# enable-graphs name that is absent from a given binary is sealed inside
+# libQnnHtp. If this ALSO fails, report the error text -- do not keep
+# swapping configs.
+# =========================================================================
+# genie-app pipeline script -- Qwen3-VL-4B image+text -> description (SA8797P)
+#
+# Run on device:
+#   LD_LIBRARY_PATH=. ./genie-app -s genie_pipeline_qwen3vl.script
+#
+# Modeled on the SDK's own GLM-4v script
+# ($QAIRT_SDK/examples/Genie/genie-app/scripts/glm-4v), the only worked example
+# of an ImageEncoder -> TextGenerator pipeline on HTP.
+version
+pipeline config create pipelineConfig
+pipeline create GeniePipeline pipelineConfig
+
+# Vision tower. W8A16, NOT fp16: this SDK build cannot drive an fp16 image
+# encoder at all. setupInputFP16 is an empty stub that discards the pixel blob
+# and returns success (nsp-image-model.cpp:526-530), and the requantize table
+# has no Float16 entries either way, so the append into the embedding
+# accumulator throws (Quantization.cpp:163-192). UFixed16 IO closes both gaps.
+# The node config also carries vision-param 32x32 in PATCH units (pre-merge);
+# without it setVisionParam is never called and MRoPE silently degrades to
+# plain rope for the image rows (ImageEncoder.cpp:46-47,136-138).
+# See docs/NOTES-genie-pipeline.md sections B and D.
+node config create imageEncoderConfig genie_image_encoder_qwen3vl.json
+node create imageEncoder imageEncoderConfig
+
+# LUT text encoder. float32 -- a fixed-point LUT silently no-ops against this
+# graph's input (see scripts/export/extract_embed_lut.py).
+node config create lutEncoderConfig genie_text_encoder_qwen3vl.json
+node create lutEncoder lutEncoderConfig
+
+# Text generator: 2-split W8A16 ctx-bins, qwen3vl-mrope computed host-side.
+# Its three deepstack_visual_embed_* graph inputs are unknown to Genie and are
+# explicitly memset to zero at load by initializeUnconnectedInputs
+# (nsp-model.cpp:1442-1489), so this runs as exactly HF-minus-deepstack.
+node config create textGeneratorConfig genie_text_generator_qwen3vl_4b_decodeonly.json
+node create textGenerator textGeneratorConfig
+node set textCallback textGenerator GENIE_NODE_TEXT_GENERATOR_TEXT_OUTPUT
+
+pipeline add GeniePipeline imageEncoder
+pipeline add GeniePipeline lutEncoder
+pipeline add GeniePipeline textGenerator
+
+pipeline connect GeniePipeline imageEncoder GENIE_NODE_IMAGE_ENCODER_EMBEDDING_OUTPUT textGenerator GENIE_NODE_TEXT_GENERATOR_EMBEDDING_INPUT
+pipeline connect GeniePipeline lutEncoder GENIE_NODE_TEXT_ENCODER_EMBEDDING_OUTPUT textGenerator GENIE_NODE_TEXT_GENERATOR_EMBEDDING_INPUT
+
+# Segment order builds the accumulator, so it must reproduce the tokenizer's
+# chat template exactly. Verified token-exact:
+#   tokenize(SEG1) + 256 * <|image_pad|> + tokenize(SEG2)
+#   == processor(text, image).input_ids   (273 tokens, 256 image_pad)
+# lint_pipeline_bundle.py re-derives that equality from the tokenizer.
+#
+# textFile, NOT text: the Qwen chat template needs a REAL newline after
+# "<|im_start|>user", and a quoted `node set text` argument cannot carry one.
+# genie-app's split() handles an escape by pushing the following character
+# verbatim (main.cpp:655-658), so "\n" yields the two characters '\' and 'n',
+# and nothing unescapes later (main.cpp:1140-1142). `node set textFile` reads
+# the file with rdbuf() (main.cpp:1151-1157), so real newlines survive.
+# The segment files must have NO trailing newline -- rdbuf() would include it.
+#
+# sample_image.raw is UFixed16, quantized host-side with the ViT graph's own
+# input encoding: Genie does no preprocessing, it feeds the file as an opaque
+# blob (GenieNode_setData), so the bytes must already be exactly what the
+# graph's pixel_values tensor expects.
+node set textFile lutEncoder GENIE_NODE_TEXT_ENCODER_TEXT_INPUT prompt_seg1.txt
+node set image imageEncoder GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT sample_image.raw
+node set textFile lutEncoder GENIE_NODE_TEXT_ENCODER_TEXT_INPUT prompt_seg2.txt
+
+pipeline execute GeniePipeline
+
+node free imageEncoder
+node free lutEncoder
+node free textGenerator
+pipeline free GeniePipeline

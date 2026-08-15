@@ -279,9 +279,16 @@ final ctx-bins rsync back.
 ### Task 3.1: Extend `parity_e2e_vl.py` with the device-primary chain
 
 - [ ] Add `chain0b-prefillkv`: the rebuilt device feed —
-  prefill chunk 0 (rows 0-127, empty past, mask exposing past=0), prefill
-  chunk 1 (rows 128-255, past=128), then 17 decode steps for rows 256-272,
-  then free-running generation. Mask/position/KV threading pattern:
+  **three** AR=128 prefill calls (`n_process` = 128, 128, 17; the third padded,
+  only 17 valid), then free-running AR=1 generation.
+  > **Corrected by the Task 1.1 probe (2026-08-15).** This task originally said
+  > "2 prefill chunks + 17 decode steps". That is wrong: `variant` is picked
+  > once at `kvmanager.cpp:409` and stays 128 for the whole prompt, so the
+  > 17-token tail runs on the **padded AR=128 graph**, not on decode. See
+  > `NOTES-genie-io.md` § "the device runs THREE prefill calls". A chain built
+  > the old way would not be device-faithful.
+
+  Mask/position/KV threading pattern:
   `parity_ladekv_read.py` is the proven reference (chunked past-KV feed);
   positions from `mrope_tables` as in the existing chains; deepstack fed via
   the RENAMED `_p` inputs for prefill calls, original names for decode.

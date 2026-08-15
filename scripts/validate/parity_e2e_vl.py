@@ -16,21 +16,34 @@ Four chains, all sharing one prompt/image:
   chain0-alldecode  HF visual + real deepstack, EVERY prompt row through
                     decode.onnx from an empty cache -- no prefill call at all.
                     BAR: token-for-token identical to hf.generate.
-                    This is the path the device takes *once it loads*: qualla
-                    derives a graph's ctx_size from the attention_mask trailing
-                    dim (nsp-graph.cpp:146-155), our prefill is [1,128,128] so
-                    its ctx_size == AR == 128, and prepareInferenceStrategy
-                    (kvmanager.cpp:411-416) skips that bucket outright for a
-                    ~290-token prompt. See docs/NOTES-genie-pipeline.md probe C.
-                    CAVEAT (2026-08-14 device attempt): with the SPLIT text
-                    tower it does not get that far -- shard 0's prefill has no
-                    logits, classifies DECODER_PREFILL, and its [1,128,128] mask
-                    fails validateModel, so the node never loads. Chain0 stays
-                    the right emulation of the intended feed, but "the path the
-                    DEVICE actually takes" is unproven until the
-                    execute-select-graphs fix (or a past-KV prefill re-export)
-                    is confirmed on hardware. See docs/NOTES-genie-io.md
-                    "Split prefill is fatal at load" and probe C1.
+                    NOT the device path -- this was believed to be it (qualla
+                    derives ctx_size from the attention_mask trailing dim,
+                    nsp-graph.cpp:146-155, ours is [1,128,128] so ctx_size == AR
+                    == 128, and prepareInferenceStrategy was read as skipping
+                    that bucket). Two 2026-08-14/15 findings retire that reading:
+                      1. The split tower does not even load -- shard 0's prefill
+                         has no logits, classifies DECODER_PREFILL, and its
+                         [1,128,128] mask fails validateModel (node never
+                         created). docs/NOTES-genie-io.md "Split prefill is
+                         fatal at load".
+                      2. The DECODER_PREFILL exclusion is gated on output_all,
+                         which a basic dialog never sets, so a prefill graph IS
+                         selected. A 273-token prompt is three AR=128 prefill
+                         calls, not 273 decodes. docs/NOTES-genie-io.md "A
+                         past-KV prefill IS selected in a basic dialog".
+                    Chain0 remains a valid worst-case all-decode emulation and a
+                    useful cross-check on the KV feed, but do not read it as
+                    "what the device does". See probe C1.
+  chain0b-prefillkv **THE DEVICE PATH.** HF visual + real deepstack through the
+                    REBUILT past-KV prefill, under qualla's real chunk plan:
+                    variant is picked once (kvmanager.cpp:409) so a 273-token
+                    prompt is three AR=128 calls with n_process 128/128/17, the
+                    last PADDED -- not a fallback to AR=1 for the tail. Then the
+                    decode graph is seeded with the accumulated KV and generates
+                    free-running. BAR: token-for-token identical to hf.generate.
+                    Two mutations on chunk 1 (the first with a carried past and
+                    a position offset) keep it honest: zeroing the past KV and
+                    dropping the position offset must each move the logits.
   chain1-hf-vit     HF visual + real deepstack, prefill.onnx for rows 0..AR-1
                     then decode.onnx for the tail. BAR: token-for-token.
                     Validates the prefill graph, which still matters if prefill
@@ -38,10 +51,18 @@ Four chains, all sharing one prompt/image:
   chain2-onnx-vit   ONNX ViT features + real deepstack; the fully-ONNX path,
                     carrying the ViT's own fp32 trace delta. BAR: >= 75% step
                     agreement, text printed for human review.
-  tierA-zero-deep   HF visual + ZERO deepstack. NOT gated. This is the text the
-                    device will actually produce under the deepstack-zeros
-                    degradation (no deepstack path exists in a stock Genie
-                    pipeline); it is printed for the bundle README.
+  tierA-zero-deep   HF visual + ZERO deepstack, through the BERTCACHE prefill
+                    path. NOT gated. Kept as the historical Tier-A reference.
+  tierB-prefillkv-zero-deep
+                    **THE TEXT THE DEVICE ACTUALLY PRODUCES.** chain0b's feed
+                    (past-KV prefill, real chunk plan) with ZERO deepstack --
+                    a stock Genie pipeline has no deepstack path, so this is
+                    the deployed combination. NOT gated against HF: zeroed
+                    deepstack legitimately changes the wording, and that gap
+                    IS the defined degradation. This is what the test kit
+                    records as each image's expected caption, and it is far
+                    cheaper than tierA (three prefill calls instead of 273
+                    decode steps).
 
 Mutations (chain1's prefill feed, row AR-1 logits) prove the gate is not
 vacuous: zeroing deepstack must move the logits, and feeding flat rope instead
@@ -59,6 +80,7 @@ Run:
 """
 import argparse
 import gc
+import json
 import sys
 import time
 from pathlib import Path
@@ -79,9 +101,11 @@ CHAIN2_MIN_AGREE = 0.75
 PREFILL_LOGIT_TOL = 5e-3
 MUTATION_MIN = 1e-3
 
-ALL_CHAINS = ("chain0-alldecode", "chain1-hf-vit", "chain2-onnx-vit",
-              "tierA-zero-deep")
-GATED_EXACT = ("chain0-alldecode", "chain1-hf-vit")
+ALL_CHAINS = ("chain0-alldecode", "chain0b-prefillkv", "chain1-hf-vit",
+              "chain2-onnx-vit", "tierA-zero-deep", "tierB-prefillkv-zero-deep")
+GATED_EXACT = ("chain0-alldecode", "chain0b-prefillkv", "chain1-hf-vit")
+# Chains driven by the past-KV prefill rather than the bertcache one.
+PREFILLKV_CHAINS = ("chain0b-prefillkv", "tierB-prefillkv-zero-deep")
 
 
 def finite(name, arr):
@@ -91,9 +115,18 @@ def finite(name, arr):
     assert not bad.any(), f"{name}: {int(bad.sum())}/{a.size} non-finite values"
 
 
-def make_image():
-    """Deterministic, semantically legible: red circle + blue square."""
+def make_image(path=None):
+    """The gate's scene.
+
+    Default is deterministic and semantically legible (red circle + blue
+    square) so the gate needs no external asset and its Tier-A text is
+    reproducible. `path` swaps in a real photograph, which is how the test
+    kit gets a per-image expected caption from exactly this machinery --
+    same feed, same chains, same zero-deepstack degradation as the device.
+    """
     from PIL import Image, ImageDraw
+    if path:
+        return Image.open(path).convert("RGB").resize((512, 512), Image.BICUBIC)
     img = Image.new("RGB", (512, 512), "white")
     d = ImageDraw.Draw(img)
     d.ellipse((96, 96, 288, 288), fill=(220, 30, 30))
@@ -104,7 +137,7 @@ def make_image():
 # --------------------------------------------------------------------------- #
 # phase A: every HF reference, computed while the 18 GB fp32 model is alive
 # --------------------------------------------------------------------------- #
-def hf_phase(model_dir, steps):
+def hf_phase(model_dir, steps, image=None):
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
     proc = AutoProcessor.from_pretrained(
@@ -117,7 +150,7 @@ def hf_phase(model_dir, steps):
         {"type": "image"}, {"type": "text", "text": PROMPT}]}]
     text = proc.apply_chat_template(messages, tokenize=False,
                                     add_generation_prompt=True)
-    inputs = proc(text=[text], images=[make_image()], return_tensors="pt")
+    inputs = proc(text=[text], images=[make_image(image)], return_tensors="pt")
     ids = inputs.input_ids[0]
     pv, grid = inputs.pixel_values, inputs.image_grid_thw
     assert tuple(pv.shape) == (1024, 1536), tuple(pv.shape)
@@ -259,6 +292,120 @@ def prefill_feeds(emb, deep_all, cos, sin, meta,
     return feeds
 
 
+def qualla_chunks(n, ar):
+    """How qualla actually splits a prompt across prefill calls.
+
+    `variant` is chosen ONCE before the loop (kvmanager.cpp:409) and only
+    re-picked if the cache boundary is hit, after which every iteration takes
+    min(n_remain, variant) (:433). With choices {1, AR} and n > AR, pick()
+    finds nothing >= n and returns the largest choice below it -- AR. So a
+    273-token prompt is [128, 128, 17] on the AR=128 graph, the last call
+    PADDED, and NOT a 17-step fallback to the AR=1 decode graph.
+    """
+    out, rem = [], n
+    while rem > 0:
+        out.append(min(rem, ar))
+        rem -= out[-1]
+    return out
+
+
+class PrefillKV:
+    """The rebuilt past-KV prefill graph under qualla's real chunked feed.
+
+    Mask layout is the concat one proven by parity_ladekv_read.py:56-91 --
+    row i of a chunk sees the valid past span [0, n_valid_kv) plus the causal
+    new span [PAST, PAST+i]. Padding rows past n_process are left fully
+    masked and their KV is never committed.
+    """
+
+    def __init__(self, sess, meta):
+        self.sess, self.meta = sess, meta
+        shapes = {i.name: i.shape for i in sess.get_inputs()}
+        names = set(shapes)
+        L, NKV, D = meta["layers"], meta["n_kv"], meta["head_dim"]
+        self.AR = shapes["attention_mask"][-2]
+        self.PAST = shapes["past_key_0_in"][-1]
+        self.TOTAL = shapes["attention_mask"][-1]
+        assert self.TOTAL == self.PAST + self.AR, (
+            f"prefill mask {self.TOTAL} != past {self.PAST} + AR {self.AR} -- "
+            "this is not a past-KV prefill")
+        assert shapes["past_key_0_in"] == [1, NKV, D, self.PAST], \
+            shapes["past_key_0_in"]
+        assert shapes["past_value_0_in"] == [1, NKV, self.PAST, D], \
+            shapes["past_value_0_in"]
+        # the prefill graph carries its OWN deepstack input names (the _p
+        # rename); resolve them from the session rather than assuming either
+        # spelling, so the gate follows whatever was actually built.
+        self.deep_keys = []
+        for k in range(meta["n_deep"]):
+            cands = sorted(x for x in names
+                           if x.startswith(f"deepstack_visual_embed_{k}"))
+            assert len(cands) == 1, f"deepstack {k}: ambiguous inputs {cands}"
+            self.deep_keys.append(cands[0])
+        self.out_names = ["logits"] + [f"past_{s}_{i}_out"
+                                       for i in range(L) for s in ("key", "value")]
+        self.reset()
+
+    def reset(self):
+        L, NKV, D = (self.meta["layers"], self.meta["n_kv"],
+                     self.meta["head_dim"])
+        self.ck = [np.zeros((1, NKV, D, self.PAST), dtype=np.float32)
+                   for _ in range(L)]
+        self.cv = [np.zeros((1, NKV, self.PAST, D), dtype=np.float32)
+                   for _ in range(L)]
+        self.n_valid_kv = 0
+        gc.collect()
+
+    def feeds(self, emb_rows, deep_rows, cos_blk, sin_blk, n_valid_kv=None):
+        n, H = emb_rows.shape[0], self.meta["hidden"]
+        nv = self.n_valid_kv if n_valid_kv is None else n_valid_kv
+        assert n <= self.AR, f"chunk {n} > AR {self.AR}"
+        emb = np.zeros((1, 1, self.AR, H), dtype=np.float32)
+        emb[0, 0, :n] = emb_rows
+        mask = np.full((1, self.AR, self.TOTAL), MASK_VALUE, dtype=np.float32)
+        for i in range(n):
+            mask[0, i, :nv] = 0.0                          # valid past span
+            mask[0, i, self.PAST:self.PAST + i + 1] = 0.0  # causal new span
+        half = cos_blk.shape[-1]
+        cos = np.zeros((1, self.AR, half), dtype=np.float32)
+        sin = np.zeros((1, self.AR, half), dtype=np.float32)
+        cos[0, :n] = cos_blk[0]
+        sin[0, :n] = sin_blk[0]
+        f = {"inputs_embeds": emb, "attention_mask": mask,
+             "position_ids_cos": cos, "position_ids_sin": sin}
+        for k, key in enumerate(self.deep_keys):
+            z = np.zeros((1, 1, self.AR, H), dtype=np.float32)
+            z[0, 0, :n] = deep_rows[k]
+            f[key] = z
+        for i in range(self.meta["layers"]):
+            f[f"past_key_{i}_in"] = self.ck[i]
+            f[f"past_value_{i}_in"] = self.cv[i]
+        return f
+
+    def chunk(self, emb_rows, deep_rows, cos_blk, sin_blk, commit=True):
+        """One prefill call. Returns logits for the n VALID rows only."""
+        n = emb_rows.shape[0]
+        assert self.n_valid_kv + n <= self.PAST, \
+            f"prefill ran past the {self.PAST}-slot cache"
+        outs = dict(zip(self.out_names, self.sess.run(
+            self.out_names, self.feeds(emb_rows, deep_rows, cos_blk, sin_blk))))
+        if commit:
+            nv = self.n_valid_kv
+            for i in range(self.meta["layers"]):
+                self.ck[i][:, :, :, nv:nv + n] = \
+                    outs[f"past_key_{i}_out"][:, :, :, :n]
+                self.cv[i][:, :, nv:nv + n, :] = \
+                    outs[f"past_value_{i}_out"][:, :, :n, :]
+            self.n_valid_kv += n
+        return outs["logits"][0][:n]
+
+    def seed(self):
+        """Trimmed KV for Decoder.reset (which expects exactly cache_len wide)."""
+        nv = self.n_valid_kv
+        return ([k[:, :, :, :nv].copy() for k in self.ck],
+                [v[:, :, :nv, :].copy() for v in self.cv], nv)
+
+
 class Decoder:
     """decode.onnx driven with the Genie KV contract, one token at a time."""
 
@@ -324,13 +471,20 @@ class Decoder:
         return outs["logits"][0, 0]
 
 
-def run_tail(label, dec, ref, emb, deep_all, cos, sin, start_row):
-    """Prompt rows start_row..n-1 teacher-forced, then free-running generation."""
+def run_tail(label, dec, ref, emb, deep_all, cos, sin, start_row,
+             seed_logits=None):
+    """Prompt rows start_row..n-1 teacher-forced, then free-running generation.
+
+    seed_logits carries the last prompt row's logits when the caller already
+    consumed the whole prompt (chain0b: all n rows go through prefill, so
+    there is no teacher-forced tail at all and the first generated token
+    comes straight off the final prefill call).
+    """
     meta, tok = ref["meta"], ref["tok"]
     n, H, D = ref["n"], meta["hidden"], meta["head_dim"]
     ref_logits, ref_new, mx = ref["ref_logits"], ref["ref_new"], meta["mx"]
 
-    worst, mism, lg = 0.0, [], None
+    worst, mism, lg = 0.0, [], seed_logits
     t0 = time.time()
     for r in range(start_row, n):
         lg = dec.step(emb[r], [d[r] for d in deep_all],
@@ -342,10 +496,14 @@ def run_tail(label, dec, ref, emb, deep_all, cos, sin, start_row):
         if (r - start_row) % 64 == 63:
             print(f"    {label} prompt row {r}/{n - 1} "
                   f"({time.time() - t0:.0f}s)", flush=True)
-    assert lg is not None, f"{label}: no prompt rows fed"
-    print(f"  [{label}] prompt rows {start_row}..{n - 1}: max|dlogits| vs HF "
-          f"= {worst:.3e}, argmax mismatches {len(mism)}"
-          + (f" at rows {mism[:8]}" if mism else ""), flush=True)
+    assert lg is not None, f"{label}: no prompt rows fed and no seed logits"
+    if start_row < n:
+        print(f"  [{label}] prompt rows {start_row}..{n - 1}: max|dlogits| vs HF "
+              f"= {worst:.3e}, argmax mismatches {len(mism)}"
+              + (f" at rows {mism[:8]}" if mism else ""), flush=True)
+    else:
+        print(f"  [{label}] whole prompt consumed by prefill; generating from "
+              "the final prefill logits", flush=True)
 
     zero_row = [np.zeros(H, dtype=np.float32)] * meta["n_deep"]
     got, agree = [int(lg.argmax())], []
@@ -373,7 +531,17 @@ def main():
     ap.add_argument("--vit-onnx", required=True)
     ap.add_argument("--text-onnx", required=True,
                     help="dir holding prefill/prefill.onnx and decode/decode.onnx")
+    ap.add_argument("--prefillkv-onnx", default=None,
+                    help="past-KV prefill onnx for chain0b "
+                         "(default <text-onnx>/prefillkv/prefillkv.onnx)")
     ap.add_argument("--steps", type=int, default=STEPS)
+    ap.add_argument("--caption-out", default=None,
+                    help="write {device_caption, hf_reference} json here "
+                         "(test-kit reference generation)")
+    ap.add_argument("--image", default=None,
+                    help="photograph to caption instead of the built-in "
+                         "synthetic scene (used to build the test kit's "
+                         "per-image expected captions)")
     ap.add_argument("--chains", default=",".join(ALL_CHAINS),
                     help="comma-separated subset of " + ",".join(ALL_CHAINS))
     ap.add_argument("--threads", type=int, default=0, help="0 = ORT default")
@@ -387,6 +555,13 @@ def main():
     decode_path = text_dir / "decode" / "decode.onnx"
     for p in (Path(args.vit_onnx), prefill_path, decode_path):
         assert p.exists(), f"missing {p}"
+    prefillkv_path = Path(args.prefillkv_onnx) if args.prefillkv_onnx else \
+        text_dir / "prefillkv" / "prefillkv.onnx"
+    if any(c in chains for c in PREFILLKV_CHAINS):
+        assert prefillkv_path.exists(), (
+            f"missing {prefillkv_path} -- chain0b needs the past-KV prefill "
+            "export. Pass --prefillkv-onnx, or drop chain0b from --chains "
+            "(which forfeits the only device-faithful chain).")
     so = ort.SessionOptions()
     if args.threads:
         so.intra_op_num_threads = args.threads
@@ -394,7 +569,7 @@ def main():
     failures = []
 
     print("== phase A: HF reference (model alive, no ORT session) ==", flush=True)
-    ref = hf_phase(args.model, args.steps)
+    ref = hf_phase(args.model, args.steps, args.image)
     meta, n, L = ref["meta"], ref["n"], ref["meta"]["layers"]
     print(f"  n={n} image rows [{ref['img_pos'][0]},{ref['img_pos'][-1]}] "
           f"layers={L} hidden={meta['hidden']}  t={time.time() - t0:.0f}s",
@@ -421,18 +596,26 @@ def main():
 
     variants = {
         "chain0-alldecode": (ref["feats_hf"], ref["deep_hf"]),
+        "chain0b-prefillkv": (ref["feats_hf"], ref["deep_hf"]),
         "chain1-hf-vit": (ref["feats_hf"], ref["deep_hf"]),
         "chain2-onnx-vit": (feats_ort, deep_ort),
         "tierA-zero-deep": (ref["feats_hf"],
                             [np.zeros_like(d) for d in ref["deep_hf"]]),
+        "tierB-prefillkv-zero-deep": (ref["feats_hf"],
+                                      [np.zeros_like(d) for d in ref["deep_hf"]]),
     }
     cos, sin = mrope_tables(ref["pos3"], meta["head_dim"], meta["theta"])
     finite("host mrope cos", cos)
     finite("host mrope sin", sin)
+    unmapped = [c for c in chains if c not in variants]
+    assert not unmapped, (
+        f"{unmapped} listed in ALL_CHAINS but absent from `variants` -- add the "
+        "(features, deepstack) pair it should run on")
     feeds_cache = {c: spliced_inputs(ref, *variants[c]) for c in chains}
 
     # ----------------------------------------------------------------- prefill
-    need_prefill = [c for c in chains if c != "chain0-alldecode"]
+    need_prefill = [c for c in chains
+                    if c not in ("chain0-alldecode",) + PREFILLKV_CHAINS]
     seeds = {}
     if need_prefill:
         print("== phase C: prefill.onnx (rows 0..%d) ==" % (AR - 1), flush=True)
@@ -490,6 +673,90 @@ def main():
         gc.collect()
         print(f"  prefill done, t={time.time() - t0:.0f}s", flush=True)
 
+    # ------------------------------------------- phase C2: past-KV prefill feed
+    # THE device-faithful chain. Everything else is either a worst case
+    # (chain0) or a partial path (chain1).
+    kv0b, lg0b = {}, {}
+    kv_chains = [c for c in chains if c in PREFILLKV_CHAINS]
+    if kv_chains:
+        plan = qualla_chunks(n, AR)
+        print(f"== phase C2: past-KV prefill, qualla plan {plan} ==", flush=True)
+        sess = ort.InferenceSession(str(prefillkv_path), so,
+                                    providers=["CPUExecutionProvider"])
+        pk = PrefillKV(sess, meta)
+        assert pk.AR == AR, f"prefillkv AR {pk.AR} != {AR}"
+        print(f"  AR={pk.AR} past={pk.PAST} total={pk.TOTAL}  "
+              f"deepstack {pk.deep_keys}", flush=True)
+        for kvc in kv_chains:
+          print(f"  -- {kvc} --", flush=True)
+          pk.reset()
+          emb, deep_all = feeds_cache[kvc]
+          # Only the real-deepstack chain is compared against HF; tierB zeroes
+          # deepstack on purpose, so a logit delta there is the degradation,
+          # not a defect.
+          gated = kvc == "chain0b-prefillkv"
+
+          lo, worst = 0, 0.0
+          lg = None
+          for ci, take in enumerate(plan):
+            hi = lo + take
+            rows, drows = emb[lo:hi], [d[lo:hi] for d in deep_all]
+            cblk, sblk = cos[:, lo:hi].numpy(), sin[:, lo:hi].numpy()
+
+            # Mutations on the SECOND chunk -- the first one that has a carried
+            # past and a non-zero position offset, i.e. the only place the
+            # chunking contract can actually be wrong.
+            if ci == 1 and gated:
+                base = pk.chunk(rows, drows, cblk, sblk, commit=False)[take - 1]
+                sk = [k.copy() for k in pk.ck]
+                sv = [v.copy() for v in pk.cv]
+                for a in pk.ck:
+                    a.fill(0.0)
+                for a in pk.cv:
+                    a.fill(0.0)
+                zp = pk.chunk(rows, drows, cblk, sblk, commit=False)[take - 1]
+                pk.ck, pk.cv = sk, sv
+                c0, s0 = cos[:, :take].numpy(), sin[:, :take].numpy()
+                mp = pk.chunk(rows, drows, c0, s0, commit=False)[take - 1]
+                for nm, x in (("base", base), ("zeroed-past", zp),
+                              ("no-pos-offset", mp)):
+                    finite(f"chain0b mutation {nm}", x)
+                d_past = float(np.abs(zp - base).max())
+                d_pos = float(np.abs(mp - base).max())
+                print(f"  mutation zeroed-past    chunk1 row{take - 1} delta = "
+                      f"{d_past:.3e} (must be > {MUTATION_MIN:.0e})")
+                print(f"  mutation no-pos-offset  chunk1 row{take - 1} delta = "
+                      f"{d_pos:.3e} (must be > {MUTATION_MIN:.0e})")
+                assert d_past > MUTATION_MIN, \
+                    "chunk 1 ignores the carried past -- the chunked feed is vacuous"
+                assert d_pos > MUTATION_MIN, \
+                    "chunk 1 ignores position continuation -- the feed is vacuous"
+                del base, zp, mp, sk, sv
+                gc.collect()
+
+            lg = pk.chunk(rows, drows, cblk, sblk)
+            finite(f"{kvc} chunk{ci} logits", lg)
+            d = float(np.abs(lg - ref["ref_logits"][lo:hi]).max())
+            m = int((lg.argmax(-1) != ref["ref_logits"][lo:hi].argmax(-1)).sum())
+            worst = max(worst, d)
+            print(f"  chunk{ci}: rows {lo}..{hi - 1} (n_process={take}, "
+                  f"n_past={lo}) max|dlogits| vs HF = {d:.3e}, argmax "
+                  f"mismatches {m}", flush=True)
+            lo = hi
+
+          if gated and worst >= PREFILL_LOGIT_TOL:
+            failures.append(f"{kvc}: prefill logit drift {worst:.3e} "
+                            f">= {PREFILL_LOGIT_TOL:.0e}")
+          lg0b[kvc] = lg[-1].copy()      # last valid row of the final chunk
+          kv0b[kvc] = pk.seed()
+          del lg
+          gc.collect()
+
+        pk.ck = pk.cv = None
+        del sess, pk
+        gc.collect()
+        print(f"  past-KV prefill done, t={time.time() - t0:.0f}s", flush=True)
+
     # ------------------------------------------------------------------ decode
     print("== phase D: decode.onnx (prompt tail + free-running generation) ==",
           flush=True)
@@ -505,16 +772,26 @@ def main():
     for c in chains:
         print(f"  -- {c} (t={time.time() - t0:.0f}s) --", flush=True)
         emb, deep_all = feeds_cache[c]
+        seed_lg = None
         if c == "chain0-alldecode":
             dec.reset()
             start = 0
+        elif c in PREFILLKV_CHAINS:
+            # the whole prompt is already in the cache; generation continues
+            # from the last prefill call's logits, exactly as qualla does
+            ck, cv, nv = kv0b.pop(c)
+            dec.reset(ck, cv, nv)
+            del ck, cv
+            gc.collect()
+            start, seed_lg = nv, lg0b[c]
         else:
             ck, cv = seeds.pop(c)
             dec.reset(ck, cv, AR)
             del ck, cv
             gc.collect()
             start = AR
-        results[c] = run_tail(c, dec, ref, emb, deep_all, cos, sin, start)
+        results[c] = run_tail(c, dec, ref, emb, deep_all, cos, sin, start,
+                              seed_lg)
     dec.ck = dec.cv = None
     del sess, dec
     gc.collect()
@@ -533,6 +810,20 @@ def main():
                             "differ from hf.generate")
         if c == "chain2-onnx-vit" and rate < CHAIN2_MIN_AGREE:
             failures.append(f"{c}: agreement {rate:.2f} < {CHAIN2_MIN_AGREE}")
+    if "tierB-prefillkv-zero-deep" in results:
+        raw = results["tierB-prefillkv-zero-deep"][0]
+        cut = next((i for i, t in enumerate(raw) if t in ref["eos"]), len(raw))
+        print()
+        print("  >>> DEVICE-FAITHFUL (past-KV prefill + zero deepstack) -- what "
+              "the shipped pipeline produces:")
+        print(f"  >>> {tok.decode(raw[:cut])!r}")
+        if args.caption_out:
+            Path(args.caption_out).write_text(
+                json.dumps({"image": args.image,
+                            "device_caption": tok.decode(raw[:cut]),
+                            "hf_reference": tok.decode(ref_new)}, indent=1) + "\n")
+            print(f"  >>> wrote {args.caption_out}")
+        print()
     if "tierA-zero-deep" in results:
         # every chain runs a FIXED len(ref_new) steps so the comparison stays
         # aligned; a real runtime stops at eos, so cut there for the README.
