@@ -19,8 +19,8 @@ ceiling), the other says it is bound by DSP cycles (88.2M ÷ 4 HVX ≈ 22.06 ms 
 imply completely different next years of work.
 
 They stop being indistinguishable the moment you perturb the model. **Priority 4
-runs two arms whose predicted orderings are opposite** — W8 `lm_head` (+19.3%
-byte / +3.6% compute) and CL=512 (+8.3% / +34.7%). Whichever ordering the
+runs two arms whose predicted orderings are opposite** — W8 `lm_head` (+17.9%
+byte / +3.6% compute) and `cl512` (+10.1% / +26.0%). Whichever ordering the
 silicon picks is the answer, and it needs no assumption about clock speed or
 thread count.
 

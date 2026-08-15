@@ -138,8 +138,8 @@ shape ops 3.2%.
 
 | Variant | Byte model | Compute model | Role |
 |---|---:|---:|---|
-| **W8 `lm_head`** (−155,582,464 B; 6.9% of cycles) | **+19.3%** | **+3.6%** — or **0%** if `REFERENCE.md` §8.1 holds and the head is re-materialized to FP16 at prepare time | ⭐ discriminator |
-| **`cl512`** (−58,720,256 B of KV; GEMV+softmax scale with CL) | **+6.5%** | **+26.0%** (−20.6% cycles) | ⭐ discriminator, opposite ordering |
+| **W8 `lm_head`** (measured −146,102,272 B; 6.9% of cycles) | **+17.9%** | **+3.6%** — or **~0%** if `REFERENCE.md` §8.1 holds; §2b says it probably does | ⭐ discriminator |
+| **`cl512`** (measured −88,082,432 B; GEMV+softmax scale with CL) | **+10.1%** | **+26.0%** (−20.6% cycles) | ⭐ discriminator, opposite ordering |
 | **`hvx_threads: 8`** | **0.0%, by construction** (measured, §1) | up to large if build-time 4 was binding | ⭐ null test |
 | QKV + Gate-Up fusion | +9.1% (−80 MB, device-team measured) | ~+11% (~10% of cycles) | ship candidate, not evidence |
 | KV signed-INT8 (−66,002,944 B) | +7.4% | small — GEMV byte side only | build, kernel confirmed |
