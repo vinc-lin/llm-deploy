@@ -81,7 +81,17 @@ CONFIGS=(
   genie_text_encoder_qwen3vl.json
   genie_text_generator_qwen3vl_4b.json
   genie_pipeline_qwen3vl.script
+  # Fallback: one file swap if the primary somehow still fails at load. It
+  # filters the prefill graphs out before they become variants, at the cost of
+  # all prefill (~30 s TTFT instead of ~3-4 s). lint check 10 proves it differs
+  # from the primary by exactly the two select-graphs keys.
+  genie_text_generator_qwen3vl_4b_decodeonly.json
+  genie_pipeline_qwen3vl_decodeonly.script
 )
+
+# Weather/road test kit: per-image blob + sidecar + jpg + its own script, all
+# FLAT like the rest of the bundle. Built by scripts/pipeline/build_test_kit.py.
+KIT=${KIT:-$LLMDEPLOY_DATA/work/kit}
 
 # src_of <file> -> the directory that file is taken from
 src_of() {
@@ -123,6 +133,12 @@ for f in "${TEXT_FILES[@]}"; do cp "$(src_of "$f")/$f" "$OUT/"; done
 cp "$VIT_CTXDIR/$VIT_BIN" "$OUT/"
 cp "$VIT_BUNDLE/htp_backend_ext_config_vit.json" "$OUT/"
 for f in "${CONFIGS[@]}"; do cp "$LLMDEPLOY_ROOT/configs/$f" "$OUT/"; done
+if [ -d "$KIT" ] && compgen -G "$KIT/wx_*.raw" >/dev/null; then
+    cp "$KIT"/wx_*.{raw,json,jpg,script} "$KIT/TEST_IMAGES.md" "$OUT/"
+    echo "   test kit: $(ls "$KIT"/wx_*.raw | wc -l) image(s) from $KIT"
+else
+    echo "   WARNING: no test kit at $KIT -- lint check 11 will fail" >&2
+fi
 
 echo "== [2/5] re-read graph names from the final ctx-bins =="
 for b in "$VIT_BIN" "${TEXT_BINS[@]}"; do
