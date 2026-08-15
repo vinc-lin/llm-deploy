@@ -248,9 +248,14 @@ offline. Run them only if time allows.
 
 ### P7 — Fusion, combined with the GQA fix for the first time
 
+> ⚠️ **Not in this drop.** `gqafix_fuseqkvgu` needs a full rebuild from
+> scratch — no quant dir exists for that flag combination — so it is deferred
+> rather than rushed. `run_all.sh` will log `SKIP p7_fuseqkvgu` and move on.
+> Listed here so the arm is not forgotten, not so it is chased.
+
 | Arm | Bundle | Topology |
 |---|---|---|
-| `p7_fuseqkvgu` | `qwen3_06b_w8a16_gqafix_fuseqkvgu_ladekv` | pure |
+| `p7_fuseqkvgu` | `qwen3_06b_w8a16_gqafix_fuseqkvgu_ladekv` | pure (when built) |
 
 Both models predict ~+10%, so this is a ship candidate rather than evidence.
 Open question: fusion's +15% was measured *pre-fix* at ~10 GB/s effective, so it
