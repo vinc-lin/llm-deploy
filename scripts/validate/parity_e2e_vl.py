@@ -51,10 +51,18 @@ Four chains, all sharing one prompt/image:
   chain2-onnx-vit   ONNX ViT features + real deepstack; the fully-ONNX path,
                     carrying the ViT's own fp32 trace delta. BAR: >= 75% step
                     agreement, text printed for human review.
-  tierA-zero-deep   HF visual + ZERO deepstack. NOT gated. This is the text the
-                    device will actually produce under the deepstack-zeros
-                    degradation (no deepstack path exists in a stock Genie
-                    pipeline); it is printed for the bundle README.
+  tierA-zero-deep   HF visual + ZERO deepstack, through the BERTCACHE prefill
+                    path. NOT gated. Kept as the historical Tier-A reference.
+  tierB-prefillkv-zero-deep
+                    **THE TEXT THE DEVICE ACTUALLY PRODUCES.** chain0b's feed
+                    (past-KV prefill, real chunk plan) with ZERO deepstack --
+                    a stock Genie pipeline has no deepstack path, so this is
+                    the deployed combination. NOT gated against HF: zeroed
+                    deepstack legitimately changes the wording, and that gap
+                    IS the defined degradation. This is what the test kit
+                    records as each image's expected caption, and it is far
+                    cheaper than tierA (three prefill calls instead of 273
+                    decode steps).
 
 Mutations (chain1's prefill feed, row AR-1 logits) prove the gate is not
 vacuous: zeroing deepstack must move the logits, and feeding flat rope instead
@@ -72,6 +80,7 @@ Run:
 """
 import argparse
 import gc
+import json
 import sys
 import time
 from pathlib import Path
@@ -93,8 +102,10 @@ PREFILL_LOGIT_TOL = 5e-3
 MUTATION_MIN = 1e-3
 
 ALL_CHAINS = ("chain0-alldecode", "chain0b-prefillkv", "chain1-hf-vit",
-              "chain2-onnx-vit", "tierA-zero-deep")
+              "chain2-onnx-vit", "tierA-zero-deep", "tierB-prefillkv-zero-deep")
 GATED_EXACT = ("chain0-alldecode", "chain0b-prefillkv", "chain1-hf-vit")
+# Chains driven by the past-KV prefill rather than the bertcache one.
+PREFILLKV_CHAINS = ("chain0b-prefillkv", "tierB-prefillkv-zero-deep")
 
 
 def finite(name, arr):
@@ -524,6 +535,9 @@ def main():
                     help="past-KV prefill onnx for chain0b "
                          "(default <text-onnx>/prefillkv/prefillkv.onnx)")
     ap.add_argument("--steps", type=int, default=STEPS)
+    ap.add_argument("--caption-out", default=None,
+                    help="write {device_caption, hf_reference} json here "
+                         "(test-kit reference generation)")
     ap.add_argument("--image", default=None,
                     help="photograph to caption instead of the built-in "
                          "synthetic scene (used to build the test kit's "
@@ -543,7 +557,7 @@ def main():
         assert p.exists(), f"missing {p}"
     prefillkv_path = Path(args.prefillkv_onnx) if args.prefillkv_onnx else \
         text_dir / "prefillkv" / "prefillkv.onnx"
-    if "chain0b-prefillkv" in chains:
+    if any(c in chains for c in PREFILLKV_CHAINS):
         assert prefillkv_path.exists(), (
             f"missing {prefillkv_path} -- chain0b needs the past-KV prefill "
             "export. Pass --prefillkv-onnx, or drop chain0b from --chains "
@@ -587,6 +601,8 @@ def main():
         "chain2-onnx-vit": (feats_ort, deep_ort),
         "tierA-zero-deep": (ref["feats_hf"],
                             [np.zeros_like(d) for d in ref["deep_hf"]]),
+        "tierB-prefillkv-zero-deep": (ref["feats_hf"],
+                                      [np.zeros_like(d) for d in ref["deep_hf"]]),
     }
     cos, sin = mrope_tables(ref["pos3"], meta["head_dim"], meta["theta"])
     finite("host mrope cos", cos)
@@ -599,7 +615,7 @@ def main():
 
     # ----------------------------------------------------------------- prefill
     need_prefill = [c for c in chains
-                    if c not in ("chain0-alldecode", "chain0b-prefillkv")]
+                    if c not in ("chain0-alldecode",) + PREFILLKV_CHAINS]
     seeds = {}
     if need_prefill:
         print("== phase C: prefill.onnx (rows 0..%d) ==" % (AR - 1), flush=True)
@@ -660,8 +676,9 @@ def main():
     # ------------------------------------------- phase C2: past-KV prefill feed
     # THE device-faithful chain. Everything else is either a worst case
     # (chain0) or a partial path (chain1).
-    kv0b, lg0b = None, None
-    if "chain0b-prefillkv" in chains:
+    kv0b, lg0b = {}, {}
+    kv_chains = [c for c in chains if c in PREFILLKV_CHAINS]
+    if kv_chains:
         plan = qualla_chunks(n, AR)
         print(f"== phase C2: past-KV prefill, qualla plan {plan} ==", flush=True)
         sess = ort.InferenceSession(str(prefillkv_path), so,
@@ -670,11 +687,18 @@ def main():
         assert pk.AR == AR, f"prefillkv AR {pk.AR} != {AR}"
         print(f"  AR={pk.AR} past={pk.PAST} total={pk.TOTAL}  "
               f"deepstack {pk.deep_keys}", flush=True)
-        emb, deep_all = feeds_cache["chain0b-prefillkv"]
+        for kvc in kv_chains:
+          print(f"  -- {kvc} --", flush=True)
+          pk.reset()
+          emb, deep_all = feeds_cache[kvc]
+          # Only the real-deepstack chain is compared against HF; tierB zeroes
+          # deepstack on purpose, so a logit delta there is the degradation,
+          # not a defect.
+          gated = kvc == "chain0b-prefillkv"
 
-        lo, worst = 0, 0.0
-        lg = None
-        for ci, take in enumerate(plan):
+          lo, worst = 0, 0.0
+          lg = None
+          for ci, take in enumerate(plan):
             hi = lo + take
             rows, drows = emb[lo:hi], [d[lo:hi] for d in deep_all]
             cblk, sblk = cos[:, lo:hi].numpy(), sin[:, lo:hi].numpy()
@@ -682,7 +706,7 @@ def main():
             # Mutations on the SECOND chunk -- the first one that has a carried
             # past and a non-zero position offset, i.e. the only place the
             # chunking contract can actually be wrong.
-            if ci == 1:
+            if ci == 1 and gated:
                 base = pk.chunk(rows, drows, cblk, sblk, commit=False)[take - 1]
                 sk = [k.copy() for k in pk.ck]
                 sv = [v.copy() for v in pk.cv]
@@ -711,7 +735,7 @@ def main():
                 gc.collect()
 
             lg = pk.chunk(rows, drows, cblk, sblk)
-            finite(f"chain0b chunk{ci} logits", lg)
+            finite(f"{kvc} chunk{ci} logits", lg)
             d = float(np.abs(lg - ref["ref_logits"][lo:hi]).max())
             m = int((lg.argmax(-1) != ref["ref_logits"][lo:hi].argmax(-1)).sum())
             worst = max(worst, d)
@@ -720,13 +744,16 @@ def main():
                   f"mismatches {m}", flush=True)
             lo = hi
 
-        if worst >= PREFILL_LOGIT_TOL:
-            failures.append(f"chain0b-prefillkv: prefill logit drift {worst:.3e} "
+          if gated and worst >= PREFILL_LOGIT_TOL:
+            failures.append(f"{kvc}: prefill logit drift {worst:.3e} "
                             f">= {PREFILL_LOGIT_TOL:.0e}")
-        lg0b = lg[-1].copy()          # last valid row of the final chunk
-        kv0b = pk.seed()
+          lg0b[kvc] = lg[-1].copy()      # last valid row of the final chunk
+          kv0b[kvc] = pk.seed()
+          del lg
+          gc.collect()
+
         pk.ck = pk.cv = None
-        del sess, pk, lg
+        del sess, pk
         gc.collect()
         print(f"  past-KV prefill done, t={time.time() - t0:.0f}s", flush=True)
 
@@ -749,15 +776,14 @@ def main():
         if c == "chain0-alldecode":
             dec.reset()
             start = 0
-        elif c == "chain0b-prefillkv":
+        elif c in PREFILLKV_CHAINS:
             # the whole prompt is already in the cache; generation continues
             # from the last prefill call's logits, exactly as qualla does
-            ck, cv, nv = kv0b
+            ck, cv, nv = kv0b.pop(c)
             dec.reset(ck, cv, nv)
             del ck, cv
-            kv0b = None
             gc.collect()
-            start, seed_lg = nv, lg0b
+            start, seed_lg = nv, lg0b[c]
         else:
             ck, cv = seeds.pop(c)
             dec.reset(ck, cv, AR)
@@ -784,6 +810,20 @@ def main():
                             "differ from hf.generate")
         if c == "chain2-onnx-vit" and rate < CHAIN2_MIN_AGREE:
             failures.append(f"{c}: agreement {rate:.2f} < {CHAIN2_MIN_AGREE}")
+    if "tierB-prefillkv-zero-deep" in results:
+        raw = results["tierB-prefillkv-zero-deep"][0]
+        cut = next((i for i, t in enumerate(raw) if t in ref["eos"]), len(raw))
+        print()
+        print("  >>> DEVICE-FAITHFUL (past-KV prefill + zero deepstack) -- what "
+              "the shipped pipeline produces:")
+        print(f"  >>> {tok.decode(raw[:cut])!r}")
+        if args.caption_out:
+            Path(args.caption_out).write_text(
+                json.dumps({"image": args.image,
+                            "device_caption": tok.decode(raw[:cut]),
+                            "hf_reference": tok.decode(ref_new)}, indent=1) + "\n")
+            print(f"  >>> wrote {args.caption_out}")
+        print()
     if "tierA-zero-deep" in results:
         # every chain runs a FIXED len(ref_new) steps so the comparison stays
         # aligned; a real runtime stops at eos, so cut there for the README.
