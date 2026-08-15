@@ -57,6 +57,18 @@ orderings, which settles the regime with no assumption about clock or thread
 count. `hvx8` changes zero DDR bytes *by construction*, so any result above the
 rep spread falsifies the byte model outright.
 
+### ⚠️ `htp_backend_ext_config.json` says `hvx_threads: 4` in *every* bundle, including `hvx8`
+
+That is deliberate and correct. `hvx_threads` is a **build-time** parameter —
+your own 2026-08-13 Test 5 established that changing it at runtime does nothing
+(9.17 vs 9.18 tok/s), and the SDK documents the runtime value as ignored. The 8
+lives inside `..._hvx8_ladekv`'s ctx-bin, baked in at generation time, which is
+why that bin is 2,277,376 bytes larger than the control.
+
+Leaving the runtime config at 4 across all bundles is what keeps the arm a
+single-variable test. **Do not "fix" it to 8** — that would change nothing
+functionally and would make the arm look like a two-variable change.
+
 ### Why the control matters
 
 `ctrl` is built from the same DLCs through the same config path as every other
