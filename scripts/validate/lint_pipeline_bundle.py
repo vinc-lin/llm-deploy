@@ -54,6 +54,24 @@ Each check maps to a specific silent-failure mode with a known precedent:
      load with `ShapeError : attention_mask - Expected [ 1, 128, 2176] Found
      [ 1, 128, 128]`, twice, before emitting a token. Failures are printed in
      the device's own vocabulary so they diff against logcat directly.
+ 10. decode-only fallback -- the emergency config must be ONE file swap. The
+     whole document is compared against the primary with the two select-graphs
+     keys removed; anything else differing (context size, sampler, ctx-bins)
+     means "try the fallback" silently changes something else and a failure
+     there proves nothing. Also: no selected name may be absent from the
+     shipped graphs, none may be a prefill graph, and the subset it does load
+     must itself pass the load simulation.
+ 11. test kit closure -- every `wx_*.script` must be runnable as shipped: all
+     referenced files present, each script feeding its OWN blob, each `.raw`
+     exactly 1024*1536*2 bytes, each sidecar's encoding equal to the shipped
+     ViT's `pixel_values` quantizeParams, and no orphan blobs.
+
+Checks 9-11 are mutation-tested by `test_genie_load_sim.py` and by the
+procedure in the plan doc: dropping a kit blob, reverting a prefill mask to
+the v1 shape, drifting the fallback's context size, and pointing the fallback
+at a prefill graph must each fire. The context-size mutation is why check 10
+compares whole documents -- an earlier version diffed only the QnnHtp block
+and let that drift through.
 
 Every failure is reported; the exit code is the violation count.
 
@@ -63,6 +81,7 @@ Run:
       --model  $LLMDEPLOY_DATA/models/Qwen3-VL-4B-Instruct
 """
 import argparse
+import copy
 import json
 import re
 import sys
@@ -999,15 +1018,36 @@ def check_fallback(bundle, nodes, graphs_by_bin, rep):
     if extra != sorted(SELECT_KEYS):
         rep.fail(f"{fb_path.name}: QnnHtp adds {extra}, expected "
                  f"{sorted(SELECT_KEYS)}")
-    stripped = {k: v for k, v in b.items() if k not in SELECT_KEYS}
-    if stripped != a:
-        diff = sorted(k for k in set(a) | set(stripped)
-                      if a.get(k) != stripped.get(k))
+
+    # Compare the WHOLE document, not just the QnnHtp block. An earlier version
+    # of this check only diffed QnnHtp, and a mutation that moved the
+    # fallback's context.size from 2048 to 1024 sailed straight through -- the
+    # exact class of silent behavioural drift this check exists to catch.
+    def _strip(doc):
+        d = copy.deepcopy(doc)
+        htp = (((d.get("text-generator") or {}).get("engine") or {})
+               .get("backend") or {}).get("QnnHtp")
+        if isinstance(htp, dict):
+            for k in SELECT_KEYS:
+                htp.pop(k, None)
+        return d
+
+    def _paths(x, y, prefix=""):
+        """Where two json documents disagree, as dotted paths."""
+        if isinstance(x, dict) and isinstance(y, dict):
+            out = []
+            for k in sorted(set(x) | set(y)):
+                out += _paths(x.get(k), y.get(k), f"{prefix}.{k}" if prefix else k)
+            return out
+        return [] if x == y else [f"{prefix} ({x!r} vs {y!r})"]
+
+    diffs = _paths(prim_doc, _strip(fb))
+    if diffs:
         rep.fail(f"{fb_path.name}: differs from the primary beyond the select "
-                 f"keys, on {diff}")
+                 f"keys, at {diffs[:6]}")
     else:
-        rep.ok(f"{fb_path.name}: identical to the primary once "
-               f"{sorted(SELECT_KEYS)} are removed")
+        rep.ok(f"{fb_path.name}: byte-for-byte the primary once "
+               f"{sorted(SELECT_KEYS)} are removed (whole document compared)")
 
     selected = b.get("execute-select-graphs") or []
     all_graphs = {g for gm in graphs_by_bin.values() for g in gm}
