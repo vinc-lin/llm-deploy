@@ -47,8 +47,21 @@ WEATHER_AXIS = ("rain", "fog", "snow", "clear", "overcast")
 
 
 def scenes_in(caption):
+    """Which scenes a caption is evidence for.
+
+    Matching is on WORD PREFIXES, not bare substrings: "ice" inside "rice
+    field" once labelled a green paddy as a snow scene, and "clear" inside
+    "nuclear" would do the same. \\b anchors the start; the trailing \\w*
+    still catches rain/rainy/raining from one entry.
+    """
     c = caption.lower()
-    return {s for s, words in SCENE_WORDS.items() if any(w in c for w in words)}
+    out = set()
+    for s, words in SCENE_WORDS.items():
+        for w in words:
+            if re.search(r"\b" + re.escape(w) + r"\w*", c):
+                out.add(s)
+                break
+    return out
 
 
 def main():
@@ -60,10 +73,6 @@ def main():
     ap.add_argument("--want", type=int, default=6)
     ap.add_argument("--prompt", default=PROMPT)
     args = ap.parse_args()
-
-    import torch
-    from PIL import Image
-    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
     cdir = Path(args.candidates)
     raw = json.loads((cdir / "candidates.json").read_text())
@@ -82,13 +91,34 @@ def main():
         manifest.append(e)
     print(f"{len(manifest)} candidates from {cdir} ({len(raw)} manifest entries)")
 
-    proc = AutoProcessor.from_pretrained(
-        args.model, min_pixels=EDGE * EDGE, max_pixels=EDGE * EDGE)
-    hf = Qwen3VLForConditionalGeneration.from_pretrained(
-        args.model, dtype=torch.float32, attn_implementation="eager").eval()
+    # Captioning an 11-image pool with a 4B fp32 model on CPU is ~10 minutes.
+    # Cache it, so tuning the SELECTION rules (which is where the bugs are)
+    # costs seconds instead of re-running the model.
+    cache_path = cdir / "captions.json"
+    cache = {}
+    if cache_path.is_file():
+        cache = {e["file"]: e for e in json.loads(cache_path.read_text())}
+    todo = [e for e in manifest if e["file"] not in cache]
+    if todo:
+        import torch
+        from PIL import Image
+        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+        proc = AutoProcessor.from_pretrained(
+            args.model, min_pixels=EDGE * EDGE, max_pixels=EDGE * EDGE)
+        hf = Qwen3VLForConditionalGeneration.from_pretrained(
+            args.model, dtype=torch.float32, attn_implementation="eager").eval()
+    else:
+        print(f"  reusing {len(cache)} cached caption(s) from {cache_path.name}")
 
     t0 = time.time()
     for i, entry in enumerate(manifest):
+        if entry["file"] in cache:
+            entry["caption_hf_fp32"] = cache[entry["file"]]["caption_hf_fp32"]
+            entry["scenes"] = sorted(scenes_in(entry["caption_hf_fp32"]))
+            print(f"  [{i + 1}/{len(manifest)}] {entry['file'][:44]:46s} "
+                  f"{entry['scenes']}  (cached)")
+            continue
         p = cdir / entry["file"]
         img = Image.open(p).convert("RGB").resize((EDGE, EDGE), Image.BICUBIC)
         messages = [{"role": "user", "content": [
@@ -108,17 +138,19 @@ def main():
         print(f"  [{i + 1}/{len(manifest)}] {entry['file'][:44]:46s} "
               f"{entry['scenes']}\n        {cap[:150]}", flush=True)
     print(f"  captioning wall {time.time() - t0:.0f}s")
+    cache_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
-    # -- greedy cover: take whichever candidate adds the most missing scenes --
+    # -- greedy cover, then fill ------------------------------------------- #
+    # Cover every scene first (each pick takes whichever candidate adds the
+    # most still-missing scenes), THEN keep filling to --want with the richest
+    # remaining images. Stopping at full coverage would ship a 3-image kit
+    # when 6 were asked for: coverage is the constraint, not the target.
     chosen, covered = [], set()
     pool = list(manifest)
     while pool and len(chosen) < args.want:
         pool.sort(key=lambda e: (-len(set(e["scenes"]) - covered),
                                  -len(e["scenes"])))
         best = pool.pop(0)
-        gain = set(best["scenes"]) - covered
-        if not gain and len(chosen) >= len(REQUIRED):
-            break
         chosen.append(best)
         covered |= set(best["scenes"])
 
