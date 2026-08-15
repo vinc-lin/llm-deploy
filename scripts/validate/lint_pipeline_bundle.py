@@ -44,6 +44,16 @@ Each check maps to a specific silent-failure mode with a known precedent:
      Also: no trailing newline (genie-app reads segment files with rdbuf(),
      `main.cpp:1151-1157`, so a trailing newline lands in the prompt) and no
      literal backslash-n (genie-app never unescapes, `main.cpp:655-658,1140-1142`).
+  9. Genie load simulation -- replays libGenie's own `validateModel`
+     (`nsp-model.cpp:620-964`) against the shipped info.jsons: graph
+     classification (`nsp-graph.cpp:194-262`), AR/CL derivation (`:72-187`),
+     the cache-group scatter/concat + ctx detection (`nsp-model.cpp:524-575`),
+     the `(AR,CL)`-keyed variant map with its **`DECODER_PREFILL` CL rewrite**
+     (`:580-614`), then every `checkShape` (`:844-917`). This is the check the
+     2026-08-14 bundle needed and did not have: it passed 1-8 and then died at
+     load with `ShapeError : attention_mask - Expected [ 1, 128, 2176] Found
+     [ 1, 128, 128]`, twice, before emitting a token. Failures are printed in
+     the device's own vocabulary so they diff against logcat directly.
 
 Every failure is reported; the exit code is the violation count.
 
@@ -583,6 +593,375 @@ def check_chat_template(bundle, model, seg_files, meta, rep):
 
 
 # --------------------------------------------------------------------------- #
+# check 9 -- Genie load simulation (replays validateModel off-device)
+# --------------------------------------------------------------------------- #
+KV_PREFIX = "past_"
+
+
+def _is_kv(name):
+    """QnnUtils::isKVTensor (qnn-utils.hpp:234-238)."""
+    return (name.endswith("_in") or name.endswith("_out")) and \
+           ("key" in name or "value" in name)
+
+
+def _dims4(dims):
+    """qualla's Dims axis mapping (qnn-utils.cpp:113-122 feeding :66-76).
+
+    Dims are RIGHT-ALIGNED into a 4-vector padded with 1s, then
+    (batch,height,width,channel) = (v0,v1,v2,v3). So [1,128,2176] is
+    h=1,w=128,c=2176 and [1,8,128,2048] is h=8,w=128,c=2048 -- which is why
+    the device prints a 3-tuple for a 4-D tensor.
+
+    Rank > 4 takes a different path (Dims still reads at(1..3), i.e. NOT the
+    trailing dims). No shipped graph has one; refuse rather than guess.
+    """
+    v = [int(x) for x in dims]
+    if len(v) > 4:
+        return None
+    v = [1] * (4 - len(v)) + v
+    h, w, c = v[1], v[2], v[3]
+    # "Hack to mix batch dimension" (qnn-utils.cpp:68-75), batchSize == 1
+    if v[0] != 1 and v[1] == 1:
+        h = v[0]
+    batch = v[0] if (v[0] > 1 and v[1] != 1) else 1
+    return batch, h, w, c
+
+
+class _T:
+    """One tensor as validateModel sees it."""
+
+    def __init__(self, name, dims):
+        self.name, self.raw = name, [int(x) for x in dims]
+        d = _dims4(dims)
+        self.ok = d is not None
+        self.batch, self.h, self.w, self.c = d if d else (1, 1, 1, 1)
+
+    numel = property(lambda s: s.h * s.w * s.c)
+    maxdim = property(lambda s: max(s.h, s.w, s.c))
+    hwc = property(lambda s: [s.h, s.w, s.c])
+
+
+class _G:
+    """One graph variant, plus the (AR, CL) and GraphType qualla derives."""
+
+    def __init__(self, name, gi, shard):
+        self.name, self.shard = name, shard
+        self.ins = {n: _T(n, t["dimensions"])
+                    for n, t in tensor_map(gi, "graphInputs").items()
+                    if t.get("dimensions")}
+        self.outs = {n: _T(n, t["dimensions"])
+                     for n, t in tensor_map(gi, "graphOutputs").items()
+                     if t.get("dimensions")}
+        self.type = self._classify()
+        self.ar = self._ar()
+        self.cl = self._cl()
+
+    def _classify(self):
+        """GraphVariant::determineGraphType (nsp-graph.cpp:194-262).
+
+        NOTE m_layerNames[INPUT] is still its default "input_ids" here
+        (nsp-model.hpp:47) -- validateModel only rewrites it to
+        "inputs_embeds" later (nsp-model.cpp:669). So an embeddings-input
+        decoder has inputIDExists == false and lands on the DECODER_PREFILL
+        branch. That is exactly how shard 0 got classified on device.
+        """
+        input_id = "input_ids" in self.ins
+        kv_in = any(n.startswith(KV_PREFIX) and _is_kv(n) for n in self.ins)
+        matched, past_kv, img = set(), False, False
+        for n in self.outs:
+            if n.startswith(KV_PREFIX) and _is_kv(n):
+                past_kv = True
+                matched.add(n)
+            if n.startswith(("image_features", "vision_embedding",
+                             "cross_attention_states")):
+                img = True
+                matched.add(n)
+                break                      # nsp-graph.cpp:223
+        logits = "logits" in self.outs
+        if logits:
+            matched.add("logits")
+        if "last_hidden_states" in self.outs:
+            matched.add("last_hidden_states")   # :231-233 -- the split handoff
+        matched_all = matched == set(self.outs)
+
+        if input_id and not past_kv and not logits:
+            return "LUT"
+        if not input_id and past_kv and not logits:
+            return "DECODER_PREFILL" if matched_all else "DECODER"
+        if kv_in and not past_kv:
+            return "KV_SHARE_NO_KV_OUTPUT"
+        if not input_id and not past_kv and logits:
+            return "LMHEAD"
+        if img:
+            return "IMAGE_ENCODER"
+        return "DEFAULT"
+
+    def _ar(self):
+        """determineGraphInputSize (nsp-graph.cpp:72-142), in its own order."""
+        t = self.ins.get("input_ids")
+        if t:
+            return t.numel // t.batch
+        for n in ("inputs_embeds",
+                  "_model_embed_tokens_Gather_Gather_output_0",
+                  "_embed_tokens_Gather_Gather_output_0"):
+            t = self.ins.get(n)
+            if t:
+                return t.numel // t.maxdim
+        t = self.ins.get("attention_mask")
+        if t:
+            return t.numel // t.maxdim
+        for n, t in self.outs.items():
+            if n.startswith(KV_PREFIX) and "key" in n:
+                return t.c
+        t = self.outs.get("logits")
+        if t:
+            return t.numel // t.c
+        return None
+
+    def _cl(self):
+        """determineGraphContextSize (nsp-graph.cpp:146-187)."""
+        t = self.ins.get("attention_mask")
+        if t:
+            return t.c
+        for n, t in self.outs.items():
+            if n.startswith(KV_PREFIX) and "key" in n:
+                tin = self.ins.get(n[:n.rfind("_")] + "_in")
+                if tin:
+                    return t.c + tin.c
+        return None
+
+
+def _shape_err(tensor, exp):
+    """checkShape's own message (nsp-model.cpp:486-493). -1 prints as '*'."""
+    e = ", ".join("*" if d == -1 else str(d) for d in exp)
+    f = ", ".join(str(d) for d in tensor.hwc)
+    return f"Expected [ {e}] Found [ {f}]"
+
+
+def _cmp(graph, tensor, exp, errors):
+    if tensor is None:
+        return
+    if all(e == -1 or e == g for e, g in zip(exp, tensor.hwc)):
+        return
+    errors.append((graph.name, tensor.name, _shape_err(tensor, exp)))
+
+
+def simulate_genie_load(shards, ctx_size, kv_dim, rope_dim):
+    """Replay Genie's load-time validation. `shards` is a list of
+    {graphName: graph-info} in ctx-bin load order (== m_nsp_graphs order).
+
+    Returns (errors, facts). Each error is (graph, tensor, message) using the
+    device's own vocabulary, so a failure here is directly comparable to an
+    adb logcat line.
+    """
+    graphs, facts = [], {}
+    for i, gmap in enumerate(shards):
+        for name, gi in sorted(gmap.items()):
+            graphs.append(_G(name, gi, i))
+    errors = []
+    for g in graphs:
+        if g.ar is None or g.cl is None:
+            errors.append((g.name, "-", "could not determine AR/CL from graph IO"))
+    if errors:
+        return errors, facts
+    facts["graphs"] = [(g.name, g.shard, g.ar, g.cl, g.type) for g in graphs]
+
+    # -- 1. cache-group scatter/concat + ctx size (nsp-model.cpp:524-575) ----
+    # nsp_graph_count is a std::map keyed by (n_tokens, ctx_size): ascending.
+    specs = sorted({(g.ar, g.cl) for g in graphs})
+    shard_type = {}
+    for g in graphs:
+        shard_type.setdefault(g.shard, g.type)
+    scatter, cache_ctx, detected = False, 0, False
+    for ar, cl in specs:
+        kv_ctx, mask = 0, None
+        for si in range(len(shards)):
+            if shard_type.get(si) == "KV_SHARE_NO_KV_OUTPUT":
+                continue
+            v = next((g for g in graphs
+                      if g.shard == si and g.ar == ar and g.cl == cl), None)
+            if v is None:
+                continue
+            if kv_ctx == 0:
+                for n, t in v.ins.items():
+                    if n.startswith(KV_PREFIX) and "key" in n:
+                        kv_ctx = t.c
+                        break
+            if mask is None:
+                mask = v.ins.get("attention_mask")
+            if kv_ctx != 0 and mask is not None:
+                group_ctx = mask.maxdim
+                if not detected:
+                    if kv_ctx == group_ctx:
+                        scatter = True
+                    elif kv_ctx == group_ctx - ar:
+                        scatter = False
+                    else:
+                        errors.append((
+                            v.name, "past_key_*_in",
+                            "Could not determine whether KV$ uses Scatter or "
+                            f"Concat. KV$ has input dimension {kv_ctx}. "
+                            f"Expected CL={cl} or CL - AR-n={cl - ar}"))
+                        return errors, facts
+                    cache_ctx = group_ctx
+                else:
+                    cache_ctx = max(cache_ctx, group_ctx)
+                detected = True
+                break
+    facts["use_scatter"], facts["cache_group_ctx_size"] = scatter, cache_ctx
+
+    # -- 2. variant map, with the DECODER_PREFILL CL rewrite (:580-614) ------
+    # Populated from the FIRST shard owning a past_*key* output, then keyed by
+    # (AR, CL) only -- so every shard sharing that key inherits shard 0's
+    # rewritten CL. That is why the device logged two IDENTICAL ShapeErrors.
+    vmap = {}
+    for si in range(len(shards)):
+        owner = [g for g in graphs if g.shard == si]
+        if not owner:
+            continue
+        rep_out = next((n for n in sorted(owner[0].outs)
+                        if n.startswith(KV_PREFIX) and "key" in n), None)
+        if rep_out is None:
+            continue
+        keyin = rep_out[:rep_out.rfind("_")] + "_in"
+        for g in owner:
+            kout = g.outs.get(rep_out)
+            if kout is None:
+                continue
+            arn = kout.c
+            kin = g.ins.get(keyin)
+            ctx = arn if kin is None else kin.c + (0 if scatter else arn)
+            if g.type == "DECODER_PREFILL":
+                ctx = cache_ctx                       # nsp-model.cpp:604-605
+            vmap[(g.ar, g.cl)] = (arn, ctx)
+        break
+    facts["variant_map"] = dict(vmap)
+
+    # -- 3. Check 3: shapes for all named tensors (:844-917) -----------------
+    for g in graphs:
+        if (g.ar, g.cl) not in vmap:
+            errors.append((g.name, "-", f"no cache-group mapping for "
+                                        f"(AR={g.ar}, CL={g.cl})"))
+            continue
+        arn, gctx = vmap[(g.ar, g.cl)]
+        past_dim = gctx if scatter else gctx - arn
+
+        _cmp(g, g.ins.get("attention_mask"), [1, arn, gctx], errors)   # :858
+        for n in ("position_ids_cos", "position_ids_sin"):             # :871-873
+            _cmp(g, g.ins.get(n), [1, g.ar, rope_dim], errors)
+
+        if g.type != "KV_SHARE_NO_KV_OUTPUT":                          # :889-890
+            for n, t in g.ins.items():
+                if not n.startswith(KV_PREFIX):
+                    continue
+                if "key" in n:
+                    _cmp(g, t, [-1, kv_dim, past_dim], errors)         # :903
+                elif "value" in n:
+                    _cmp(g, t, [-1, past_dim, kv_dim], errors)         # :905
+            for n, t in g.outs.items():
+                if not n.startswith(KV_PREFIX):
+                    continue
+                if "key" in n:
+                    _cmp(g, t, [-1, kv_dim, arn], errors)              # :911
+                elif "value" in n:
+                    _cmp(g, t, [-1, arn, kv_dim], errors)              # :913
+
+    # -- 4. Check 1 (first split) and Check 2 (last split) -------------------
+    last = len(shards) - 1
+    for g in graphs:
+        if g.shard == 0:
+            t = g.ins.get("inputs_embeds")
+            if t is None:
+                errors.append((g.name, "inputs_embeds", "Tensor not found"))
+            else:
+                embd = t.maxdim
+                if t.numel != g.ar * embd:                             # :709-716
+                    errors.append((g.name, "inputs_embeds", "Wrong input shape"))
+        if g.shard == last and g.type != "DECODER_PREFILL":            # :787
+            t = g.outs.get("logits")
+            if t is None:
+                errors.append((g.name, "logits", "Tensor not found"))
+            else:
+                vocab = t.maxdim
+                if t.numel not in (vocab, vocab * g.ar):               # :793-798
+                    errors.append((g.name, "logits", "Wrong logits shape"))
+
+    # -- at least one logit variant in the last split ------------------------
+    # Removing `logits` does NOT trip Check 2: a logits-less graph reclassifies
+    # to DECODER_PREFILL, which :787 exempts. The failure surfaces later and
+    # quieter -- registerLogitVariants (:1198-1204) walks the last split only,
+    # so m_logit_variants ends up empty and kvmanager.cpp:467-490 has nothing
+    # to fall back to when the final step must produce a sample.
+    if not any(g.shard == last and "logits" in g.outs for g in graphs):
+        errors.append(("-", "logits",
+                       "no variant in the last split produces logits -- "
+                       "m_logit_variants would be empty and no inference step "
+                       "could yield a sample"))
+
+    # -- context.size must fit the cache group ------------------------------
+    if ctx_size is not None and cache_ctx and ctx_size > cache_ctx:
+        errors.append(("-", "context.size",
+                       f"dialog context.size {ctx_size} exceeds the cache-group "
+                       f"context {cache_ctx}"))
+    return errors, facts
+
+
+def check_genie_load(bundle, nodes, graphs_by_bin, rep):
+    """Check 9 -- would libGenie's validateModel accept these ctx-bins?
+
+    The 2026-08-14 device attempt died here, twice, before a single token:
+      ShapeError : attention_mask - Expected [ 1, 128, 2176] Found [ 1, 128, 128]
+      -> Failed to create the Genie Node (-1) -> SIGSEGV
+    Nothing in the build chain models load-time validation, so a bundle that
+    can never load still passes every other gate. This replays the validator
+    against the finalised bytes and reports in the device's own vocabulary.
+    """
+    rep.head(9, "Genie load simulation (validateModel replay)")
+    seen = False
+    for node in nodes:
+        if node.kind != "text-generator":
+            continue
+        seen = True
+        shards = []
+        missing = False
+        for b in node.ctxbins:
+            g = graphs_by_bin.get(b)
+            if g is None:
+                rep.fail(f"{node.file}: no graph info for ctx-bin {b}")
+                missing = True
+                break
+            shards.append(g)
+        if missing or not shards:
+            continue
+
+        ctx_size = ((node.body.get("context") or {}).get("size"))
+        htp = node.backend.get(node.backend.get("type")) or {}
+        kv_dim = htp.get("kv-dim")
+        pe = (node.model.get("positional-encoding") or {})
+        rope_dim = pe.get("rope-dim")
+        if kv_dim is None or rope_dim is None:
+            rep.fail(f"{node.file}: cannot simulate load -- "
+                     f"kv-dim={kv_dim}, rope-dim={rope_dim}")
+            continue
+
+        errors, facts = simulate_genie_load(shards, ctx_size, kv_dim, rope_dim)
+        for name, shard, ar, cl, gtype in facts.get("graphs", []):
+            rep.info(f"{name}: shard {shard}, AR={ar}, CL={cl}, {gtype}")
+        if "cache_group_ctx_size" in facts:
+            rep.info(f"cache group '{KV_PREFIX}': ctx={facts['cache_group_ctx_size']}, "
+                     f"{'scatter' if facts['use_scatter'] else 'concat'}, "
+                     f"variant map {facts.get('variant_map')}")
+        if errors:
+            for gname, tname, msg in errors:
+                rep.fail(f"{node.file}: {gname} : {tname} - {msg}")
+        else:
+            rep.ok(f"{node.file}: {len(facts.get('graphs', []))} graphs would "
+                   f"pass validateModel")
+    if not seen:
+        rep.fail("no text-generator node found -- nothing to load-simulate")
+
+
+# --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bundle", required=True, help="assembled bundle directory")
@@ -641,6 +1020,7 @@ def main():
                  "['textFile', 'image', 'textFile'] (segment order IS the prompt)")
     else:
         check_chat_template(bundle, args.model, seg_files, meta, rep)
+    check_genie_load(bundle, nodes, graphs_by_bin, rep)
 
     n = len(rep.problems)
     if n:
