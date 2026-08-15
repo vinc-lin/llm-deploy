@@ -7,11 +7,12 @@ QAIRT 2.48.40, libGenie 1.19) with no device access. Bundles ship via HF
 scripts/configs/docs.
 
 **Building is device-free; the project is not.** A device team runs the bundles
-and reports back: `reports/` holds their test reports (and dated photo drops,
-transcribed to Markdown), `docs/DEVICE_*` the measurement reports and the
-exchange protocol. Check `reports/` before trusting any performance or "does it
-load" claim — the 2026-08-14 Qwen3-VL e2e attempt failed at load, and that is
-only recorded there.
+and reports back: `reports/` holds their test reports, `docs/DEVICE_*` the
+measurement reports and the exchange protocol. Some reports are transcribed
+from screen photographs — the Markdown IS the record, and the source photos are
+deleted once it is committed, so never treat a missing photo drop as lost data.
+Check `reports/` before trusting any performance or "does it load" claim — the
+2026-08-14 Qwen3-VL e2e attempt failed at load, and that is only recorded there.
 
 **Repo visibility is switched often and deliberately by the user — this file
 does not state it on purpose.** Read it live (`HfApi().repo_info(r).private`)
