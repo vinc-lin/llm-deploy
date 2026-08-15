@@ -6,6 +6,13 @@ QAIRT 2.48.40, libGenie 1.19) with no device access. Bundles ship via HF
 `vinccniv/sa8797p-qwen3vl-4b-bundles`). This repo holds only
 scripts/configs/docs.
 
+**Building is device-free; the project is not.** A device team runs the bundles
+and reports back: `reports/` holds their test reports (and dated photo drops,
+transcribed to Markdown), `docs/DEVICE_*` the measurement reports and the
+exchange protocol. Check `reports/` before trusting any performance or "does it
+load" claim — the 2026-08-14 Qwen3-VL e2e attempt failed at load, and that is
+only recorded there.
+
 **Repo visibility is switched often and deliberately by the user — this file
 does not state it on purpose.** Read it live (`HfApi().repo_info(r).private`)
 if it matters; change it **only** when asked in that message; if a bulk upload
@@ -58,6 +65,13 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
 - A prefill graph whose `attention_mask` is `[1,AR,AR]` registers `ctx_size ==
   AR` (bertcache) and is **never selected** for prompts longer than AR — the
   whole prompt goes through the AR=1 decode graph, silently and slowly.
+  **Unsplit only.** In a split tower the last shard owns the lm_head, so shard
+  0's prefill has no logits, classifies `DECODER_PREFILL`, and has its expected
+  CL rewritten to the cache-group max — the mask then fails validation and the
+  node **never loads** (`Failed to create the Genie Node (-1)` + SIGSEGV, one
+  ShapeError per shard). Splitting is mandatory ≳2B, so **any ≳2B model must
+  ship a past-KV prefill (`[1,AR,CL]`, `CL>AR`) or no prefill graph at all**;
+  the 0.6B pattern does not transfer. See `docs/REFERENCE.md` §3.6.
 - Image-encoder configs need `vision-param: {height, width}` in **patch units**
   (pre-merge), or MRoPE never engages and image rows fall back to plain rope.
 
@@ -116,5 +130,7 @@ numbers, dead ends, open questions) · `docs/BUILD_GUIDE.md` (full recipes) ·
 (Genie/qualla runtime contract, cited) · `docs/NOTES-genie-splits.md`
 (multi-ctx-bin contract — mandatory ≳2B) · `docs/NOTES-genie-pipeline.md`
 (multimodal pipeline contract: image-encoder dtype, MRoPE, deepstack-by-zeros) ·
+`docs/NOTES-htp-config-keys.md` (which HTP backend-extension keys are real,
+audited against the SDK's own `config.py` / `QnnHtpGraph.h`) ·
 `docs/SA8797P_HTP_v81_Hardware_and_Deployment_Quantization_Reference_EN.md`
 (device team's measured hardware truth, annotated).

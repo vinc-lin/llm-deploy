@@ -209,6 +209,29 @@ prefill **with past-KV inputs** (the ladekv-style past-KV prefill this repo
 already builds for Qwen3-0.6B). That is a text-tower re-export, not a config
 change.
 
+### ⚠ C1 — in a SPLIT tower it is not dead weight, it is fatal (device, 2026-08-14)
+
+**Correction to C.** C's analysis of graph *selection* holds, but its premise —
+that the model loads and the prefill graph is silently skipped — does not. The
+2026-08-14 device attempt never got that far: node creation died with two
+`ShapeError`s on `attention_mask` (Expected `[1,128,2176]`, Found `[1,128,128]`)
+and a SIGSEGV.
+
+C's specific claim that **"our prefill classifies as `GraphType::DEFAULT`, not
+`DECODER_PREFILL`, because it emits logits"** is true only of `prefill_1`. In the
+2-shard split the lm_head sits in the last shard, so **`prefill_0` has no
+`logits`** — it emits 36 KV tensors + `last_hidden_states` (confirmed by
+`qnn-context-binary-utility` on the shipped `qwen3vl-4b-w8a16_1_of_2.bin`) — and
+therefore *does* classify `DECODER_PREFILL` (`nsp-graph.cpp:247-249`, with `:232`
+letting `last_hidden_states` still satisfy `matchedAllOutputTensors`). That
+classification is what rewrites the expected CL to the cache-group maximum
+(2176) at `nsp-model.cpp:604-605` and fails validation at `:858`.
+
+Full chain, the `execute-select-graphs` workaround, and its exact semantics:
+`docs/NOTES-genie-io.md` § "Split prefill is fatal at load". The past-KV
+re-export in C above remains the real fix — it removes the AR==CL mask that
+starts the whole chain, and buys the TTFT back.
+
 ---
 
 ## D. 🚫 BLOCKER — a stock pipeline cannot drive an FP16 vision tower

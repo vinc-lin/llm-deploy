@@ -199,6 +199,30 @@ What `parity_ladekv_read.py` reproduces:
 - Chunking ceiling: accumulated KV ≤ `past_dim = CL − AR` (1024). Beyond that,
   `ContextLimitException`.
 
+### 3.6 An AR==CL prefill graph is FATAL in a split tower (2026-08-14)
+
+Unsplit, an `attention_mask [1,AR,AR]` prefill registers `ctx_size == AR`
+(bertcache) and is silently never selected — slow, not broken (§2.2,
+`NOTES-genie-pipeline.md` probe C). **Split, the same graph refuses to load.**
+
+In a 2-shard tower the lm_head is in the last shard, so shard 0's prefill emits
+no `logits` → classifies `DECODER_PREFILL` (`nsp-graph.cpp:247-249`) → its
+expected CL is rewritten to the cache-group max (`nsp-model.cpp:604-605`) →
+`validateModel` rejects the `[1,AR,AR]` mask (`:858`) → `Failed to create the
+Genie Node (-1)` + SIGSEGV. This killed the Qwen3-VL-4B e2e bring-up on
+2026-08-14 (Expected `[1,128,2176]`, Found `[1,128,128]`, twice — once per
+shard).
+
+Splitting is mandatory ≳2B (`NOTES-genie-splits.md`), so **any ≳2B model must
+ship a past-KV prefill** (`[1,AR,CL]`, `CL>AR`) or no prefill graph at all. The
+0.6B topology-A pattern does not transfer.
+
+Config-level escape hatch, if you are holding a ctx-bin you cannot rebuild:
+`"execute-select-graphs": [...]` drops the offending graphs before validation
+(`nsp-model.cpp:314-318`), optionally with `"load-select-graphs": true` to skip
+deserializing them. Undocumented; **unverified on device**; full semantics and
+the source chain are in `NOTES-genie-io.md` § "Split prefill is fatal at load".
+
 ---
 
 ## 4. Quantization
@@ -282,6 +306,18 @@ shipping anything.
 | Ctx-bin | `qnn-context-binary-utility --json_file` | all graphs listed, logits dims per §3.1, ~1.09 GB for 0.6B |
 | **ViT fixed-point I/O** | `vit_build_quant.sh` step 3 (fails the build itself) | `pixel_values` + all 4 outputs `QNN_DATATYPE_UFIXED_POINT_16`, scale/offset byte-equal to `model.encodings`, one graph named `vit`, O=3 / vtcm 16 / 4 HVX read back out of the binary |
 | **ViT quant numerics** | `parity_vit_quant.py` | min cos ≥ 0.99 on all four outputs (measured 0.9975 / 0.9998 / 0.9986 / 0.9977) |
+| **Qwen3-VL e2e** (image → ViT → splice → text tower) | `parity_e2e_vl.py` (no `--chains` filter, or the mutation checks are skipped) | chain0/chain1 token-identical vs `hf.generate` (measured **20/20**); chain2 ≥ 75% step agreement |
+
+⚠ **The 20/20 is a real-deepstack number and the shipped bundle does not
+reproduce it.** All three gated chains feed *real* deepstack; the configuration
+that actually ships — `tierA-zero-deep` — is **not gated**
+(`parity_e2e_vl.py:16-35`), because a stock Genie pipeline has no deepstack path
+and `initializeUnconnectedInputs` zeroes those three inputs
+(`NOTES-genie-pipeline.md` §A). Zeroing costs phrasing, not image understanding:
+HF's exact sentence vs the Tier-A sentence are both correct descriptions
+(`DEVICE_TEST_qwen3vl_e2e.md`). So on device the bar is **semantic, not
+token-exact** — do not quote 20/20 as the expected device behaviour, and do not
+read a wording difference on device as a regression.
 
 ---
 
@@ -453,6 +489,8 @@ the index of what changed.
 | 17 | **`lm_head` must remain FP16** (else error 0xc26) | HTP doc §5.1 | 0xc26 is the **embedding Gather** restriction only. An INT8 (`sFxp_8`) lm_head builds, loads, and runs with unchanged quality — verified in the qh build (§6.4). We keep it FP16 by default for the LADE-acceptance reason, not supportability. |
 | 18 | Unfused W8A16 at vtcm 16 spills **1.49 GB** at build time | HTP doc §4.2 ("older optctx2" row) | *Probable, not proven:* the graph-names-mismatch artifact — an unlisted graph gets 4 MB VTCM, and that exact failure measured 1.446 GB of spill here (`docs/NOTES-vit-htp-config.md`). Every correctly-configured vtcm-16 build, theirs and ours, spills ~0. |
 | 19 | An oversized ctx-bin means **weight sharing is disabled** (check `weight_sharing_enabled`) | this file §8.2; MAX_TPS §2 A.4 as originally written | Incomplete. Weight sharing can be **on and working** and the bin still inflate, because dedup needs the graphs' exported **weights to be byte-identical**, and a *calibrated* export is not byte-identical to an `--export-decode` export of the same model — see §6.7. Check which export path each graph came from before touching the config. |
+| 20 | An AR==CL prefill graph is **harmless dead weight — silently skipped, correctness unaffected** | `NOTES-genie-pipeline.md` probe C; §2.2/§3.3 as read until 2026-08-14 | True **unsplit** only. In a split tower shard 0's prefill has no logits, classifies `DECODER_PREFILL`, and its expected CL is rewritten to the cache-group max — the graph then **fails validation and the node never loads** (§3.6). Probe C also mis-stated that our prefill classifies `DEFAULT`: that holds for `prefill_1`, not `prefill_0`. |
+| 21 | The Qwen3-VL e2e gate's **20/20 token-identical** describes what the shipped bundle does | 2026-08-14 status report §3–§4 | The three gated chains run *real* deepstack; the configuration that ships (`tierA-zero-deep`) is explicitly **not gated**. On device the bar is semantic, not token-exact (§5). The report's own "HF exactness drops 0→20/20" is the same point, written backwards. |
 
 ---
 

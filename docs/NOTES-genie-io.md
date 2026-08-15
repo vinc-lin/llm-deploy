@@ -192,6 +192,91 @@ smallest registered AR (kvmanager.cpp:934). In lade this means AR-32↔AR-1
 reshapes every iteration; if device KPIs show this hurting, a lade-only
 ctx-bin without the AR-1 graph is the lever.
 
+## Split prefill is fatal at load — and `execute-select-graphs` is the escape hatch — extracted 2026-08-15
+
+Source: the 2026-08-14 device attempt on the Qwen3-VL-4B e2e pipeline
+(`reports/qwen3vl-4b-e2e-deployment-status-2026-08-14.md`). The node failed to
+create — twice over — before any graph-selection logic ran:
+
+```
+ShapeError : attention_mask — Expected [ 1, 128, 2176] bitwidth=*. Found [ 1, 128, 128] bitwidth=2
+ShapeError : attention_mask — Expected [ 1, 128, 2176] bitwidth=*. Found [ 1, 128, 128] bitwidth=2
+Error validating model. Failed to create the Genie Node (-1).
+Segmentation fault
+```
+
+The report attributes this to "Genie validates every graph against
+`context.size + AR = 2176`". That is not the rule. The real chain is narrower,
+and it is a **split-only** trap. Every step below is pinned in 2.48.40 sources
+and re-confirmed against the shipped ctx-bins with
+`qnn-context-binary-utility --json_file`:
+
+1. **Split 0's prefill emits no `logits`.** In a 2-shard tower the lm_head lives
+   in the last shard, so `prefill_0` outputs 36 KV tensors + `last_hidden_states`
+   (verified in `qwen3vl-4b-w8a16_1_of_2.bin`); `prefill_1` is the one with
+   `logits`.
+2. **That classifies it `DECODER_PREFILL`, not `DEFAULT`** (`nsp-graph.cpp:247-249`).
+   The branch needs `!inputIDExists && pastKVExists && !logitsExists`, and
+   `matchedAllOutputTensors` still holds because `last_hidden_states` is
+   explicitly inserted into the matched set (`:232`). `inputIDExists` is false
+   because our input is `inputs_embeds` while `LayerType::INPUT` is `input_ids`
+   (`nsp-model.hpp:47`).
+3. **A `DECODER_PREFILL` in the `past_` cache group gets its expected CL
+   rewritten to the group maximum** (`nsp-model.cpp:604-605`):
+   ```cpp
+   if (variant->variantType == GraphType::DECODER_PREFILL && (prefix == "past_")) {
+     ctx = static_cast<int32_t>(m_cache_group_ctx_size[prefix]);
+   ```
+   `m_cache_group_ctx_size` is the running max across variants (`:566`, `:569`) —
+   2176 here, from decode's `past_key_0_in [1,8,128,2175]` + AR 1.
+4. **`validateModel` checks each variant's mask against that map**
+   (loop `:844`, `checkShape` `:858`, error text `:493`). The map is keyed by the
+   *global* `(AR, CL)` variant and is filled from the **first split only**
+   (`:608`, then `break`), so both splits' AR=128 prefill variants inherit
+   `{128, 2176}` — hence **two identical** ShapeErrors, one per shard.
+
+**This is why 0.6B never hit it.** Unsplit (topology A), prefill emits logits →
+`DEFAULT` → `ctx = arn = 128` (`:601-603`, no `key_in`) → its `[1,128,128]` mask
+validates fine, and the graph is merely never *selected*
+(`docs/NOTES-genie-pipeline.md` probe C). **The same mask shape is
+silent-and-slow unsplit, and fatal at load once the tower is split.** Splitting
+is mandatory ≳2B (`docs/NOTES-genie-splits.md`), so every split model carrying an
+AR==CL prefill inherits this.
+
+### The escape hatch: `execute-select-graphs` / `load-select-graphs`
+
+Two **undocumented** config keys, read at `qnn-htp.cpp:80-81`:
+
+```json
+"execute-select-graphs": ["decode_0", "decode_1"],
+"load-select-graphs": true
+```
+
+They are not equivalent, and only the first one clears the load failure:
+
+| Key | Where it acts | Effect |
+|---|---|---|
+| `execute-select-graphs` (list) | `nsp-model.cpp:314-318`, *before* `m_variant_list.emplace_back` at `:320` | Unlisted graphs never become variants, so they are never shape-validated and never selectable. **This is what clears the ShapeError.** Mirrored for image nodes at `nsp-image-model.cpp:208-210`. |
+| `load-select-graphs` (bool) | `QnnApi.cpp:120` → `ContextEnableGraphsConfig` (`QnnContextConfig.hpp:29-42`) → `QNN_CONTEXT_CONFIG_ENABLE_GRAPHS` on `QnnContext_createFromBinary` | Unlisted graphs are not deserialized at all — init time and memory. **No-op on its own:** the guard is `loadSelectGraphs && !execSelectGraphs.empty()`. |
+
+So the report's framing ("with `load-select-graphs: true` … everything else is
+skipped, including validation") has it backwards: the validation skip comes from
+`execute-select-graphs`; `load-select-graphs` only avoids paying to deserialize
+what you already excluded.
+
+Guards: an empty match set only logs `__ERROR("No matching graphs based on conf
+file")` (`:351`) and continues, so a typo'd name degrades to "no graphs" rather
+than failing loudly. Names must match the ctx-bin exactly — same caveat as the
+graph-names section above (they are baked in from the converter's
+`--output_path` basename).
+
+**Status: UNVERIFIED ON DEVICE.** Staged 2026-08-14; the SA8797P board dropped
+off USB before it could run. The mechanism is confirmed in source and against
+our own ctx-bins — the on-device result is not. If it holds, it is also a
+general repair for a miscompiled multi-graph ctx-bin without a rebuild, which
+matters because `QnnContext_getBinary()` returns
+`QNN_COMMON_ERROR_OPERATION_NOT_PERMITTED` on contexts created from a binary.
+
 ## Other findings
 
 - x86_64 tools INCLUDE `genie-t2t-run` + `libGenie.so` → local e2e Genie smoke
