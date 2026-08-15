@@ -29,9 +29,12 @@ SPLIT=${4:-18}
 # torch re-export: torch.onnx.export renames Linear weights, so only 72/198
 # param encodings would match and most layers would convert as FP16.
 ONNX=${ONNX:-$LLMDEPLOY_DATA/work/onnx/qwen3vl-4b-aimet-split}
-ENCDIR=$LLMDEPLOY_DATA/work/quant/$NAME-split-enc
-DLC=$LLMDEPLOY_DATA/work/dlc/$NAME-split
-CTXBIN=$LLMDEPLOY_DATA/work/ctxbin/$NAME-split
+ENCDIR=${ENCDIR:-$LLMDEPLOY_DATA/work/quant/$NAME-split-enc}
+# Overridable so a variant build (e.g. the past-KV prefill) can land beside the
+# Stage 2 artifacts instead of overwriting them. NAME still fixes the ctx-bin
+# FILENAME, which the node config references and must not drift.
+DLC=${DLC:-$LLMDEPLOY_DATA/work/dlc/$NAME-split}
+CTXBIN=${CTXBIN:-$LLMDEPLOY_DATA/work/ctxbin/$NAME-split}
 CONVERTER="$QAIRT_SDK/bin/x86_64-linux-clang/qairt-converter"
 
 LAYERS=${LAYERS:-36}

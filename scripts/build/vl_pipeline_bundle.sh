@@ -56,6 +56,13 @@ UTIL=$QAIRT_SDK/bin/x86_64-linux-clang/qnn-context-binary-utility
 VIT_BIN=qwen3vl-4b-vit-w8a16_ctx.bin
 TEXT_BINS=(qwen3vl-4b-w8a16_1_of_2.bin qwen3vl-4b-w8a16_2_of_2.bin)
 
+# Where the two TEXT ctx-bins come from. Defaults to the gated Stage 2 text
+# bundle; point it at a variant build (the past-KV prefill rebuild lands in
+# work/ctxbin/<name>-splitkv/{1,2}_of_2/) to swap only the text tower while
+# every other byte still comes from its own gated source. The FILENAMES do not
+# change -- the node config references them.
+TEXT_CTX=${TEXT_CTX:-$TEXT}
+
 # Everything taken from the gated text bundle: ctx-bins, LUT, tokenizer, the
 # text tower's htp extensions, both genie drivers and the 7 runtime libraries.
 # genie-app is the driver for THIS bundle (it is the only prebuilt binary
@@ -76,9 +83,18 @@ CONFIGS=(
   genie_pipeline_qwen3vl.script
 )
 
+# src_of <file> -> the directory that file is taken from
+src_of() {
+    for b in "${TEXT_BINS[@]}"; do
+        [ "$1" = "$b" ] && { echo "$TEXT_CTX"; return; }
+    done
+    echo "$TEXT"
+}
+
 MISSING=0
 for f in "${TEXT_FILES[@]}"; do
-    [ -f "$TEXT/$f" ] || { echo "ERROR: missing $TEXT/$f" >&2; MISSING=1; }
+    s=$(src_of "$f")
+    [ -f "$s/$f" ] || { echo "ERROR: missing $s/$f" >&2; MISSING=1; }
 done
 for f in "${CONFIGS[@]}"; do
     [ -f "$LLMDEPLOY_ROOT/configs/$f" ] || {
@@ -102,7 +118,8 @@ disk_guard 16
 rm -rf "$OUT"; mkdir -p "$OUT"    # stale binaries must never leak into a bundle
 
 echo "== [1/5] copy gated artifacts =="
-for f in "${TEXT_FILES[@]}"; do cp "$TEXT/$f" "$OUT/"; done
+[ "$TEXT_CTX" = "$TEXT" ] || echo "   text ctx-bins from $TEXT_CTX"
+for f in "${TEXT_FILES[@]}"; do cp "$(src_of "$f")/$f" "$OUT/"; done
 cp "$VIT_CTXDIR/$VIT_BIN" "$OUT/"
 cp "$VIT_BUNDLE/htp_backend_ext_config_vit.json" "$OUT/"
 for f in "${CONFIGS[@]}"; do cp "$LLMDEPLOY_ROOT/configs/$f" "$OUT/"; done
