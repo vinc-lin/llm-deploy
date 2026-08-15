@@ -179,14 +179,14 @@ measured delta against a re-baselined control (B0).
 | Arm | Byte model | Compute model | Discriminates? |
 |---|---:|---:|---|
 | **W8 `lm_head`** (−155.6 MB = −16.2% bytes; 6.9% of cycles) | 805.5 MB → 18.75 ms → **+19.3%** | halve `lm_head` → −3.5% cycles → **+3.6%**, or **0%** if `REFERENCE.md` §8.1 holds and the head is re-materialized to FP16 at prepare time | ✅ **strongly** |
-| **CL=512** (−73.4 MB KV; GEMV+softmax scale with CL) | 887.7 MB → 20.67 ms → **+8.3%** | GEMV 39.35M → 17.47M, softmax −0.89M → −25.8% cycles → **+34.7%** | ✅ **strongly, and in the opposite direction** |
+| **`cl512`** = `context.size` 512, ctx-bin **CL=640**, past 639 (−58.7 MB KV; GEMV+softmax scale with CL) | 902.4 MB → **+6.5%** | 88.2M → 70.0M cycles (−20.6%) → **+26.0%** | ✅ **strongly, and in the opposite direction** |
 | **`hvx_threads: 8`** at build time | zero bytes change → **0.0%** | up to +100% if the build-time 4 is binding; sub-linear in practice | ✅ **null test** |
 | QKV + Gate-Up fusion | −80 MB measured by the device team (880 vs 960) → **+9.1%** | ~10% of cycles (V2 §1.3) → **+11%** | ❌ — ship candidate, not evidence |
 | KV signed-INT8 | −66.0 MB → **+7.4%** | GEMV byte-side only; small | weakly — but the kernel is confirmed to exist (A1.3), so it is now a build, not a question |
 | `soc_model: 72`, `extended_udma`, DLBC, `weights_packing` | unknown, plausibly 0 | unknown, plausibly 0 | ❌ — cheap lottery tickets |
 
-**The W8-head and CL=512 arms predict opposite orderings** (+19 vs +4, and +8 vs
-+35). Running both settles the regime with no assumption about clock or thread
+**The W8-head and `cl512` arms predict opposite orderings** (+19 vs +4, and +7 vs
++26). Running both settles the regime with no assumption about clock or thread
 count, which is exactly what the cycle profile cannot do alone. That pair is
 priority 1 in Part B, and building them is priority 1 in Part A.
 
@@ -275,15 +275,19 @@ generator's per-graph DDR report:
 |---|---:|---:|
 | baseline `gqafix` decode (**measured**, `ctxbin-ws.log`) | 961,130,496 | — |
 | W8 head | 805,548,032 | −155,582,464 |
-| CL=512 (KV term only; see note) | 887,730,176 | −73,400,320 |
+| `cl512` (`context.size` 512 → CL 640, past 639) | 902,410,240 | −58,720,256 |
 | KV INT8 @ CL=1152 | 895,127,552 | −66,002,944 |
 | W8 head + KV INT8 | 739,545,088 | −221,585,408 |
 | `hvx_threads: 8`, `soc_model: 72`, `extended_udma` | 961,130,496 | **0 — by construction** |
 
-*KV read = 2 × 28 layers × 8 heads × 128 dim × past × 2 B; past = 1151 → 132,005,888,
-past = 511 → 58,605,568. Revision 1 carried −88,082,432 for CL=512 attributed to V3;
-it is not derivable from V3 and the KV term accounts for only −73.4 MB. **Record the
-converter's own figure; do not assert this one.***
+*KV read = 2 × 28 layers × 8 heads × 128 dim × past × 2 B.* ⚠️ **The CL naming
+has been wrong in three places and is now pinned in
+`docs/VARIANT_PREDICTIONS.md` §4.** `cl512` means `context.size = 512`, so the
+ctx-bin CL is 640 and the decode past dim is 639 — verified against the built
+bin. V3 §3-3.3's "CL=512: KV 132 → 59 MB" is actually `cl384`; revision 1's
+"873,048,064 (known from V3)" is actually `cl256`; and this plan's own original
++8.3%/+34.7% was `cl384` too. The full ladder is tabulated there. **Record the
+converter's own figure; do not assert any of these.***
 
 **Cycle side** — `qairt-dlc-info` op-count and output-shape diff, mapped onto the
 08-13 category table, giving the predicted Δcycles from the 88.2M post-fix budget.
@@ -327,7 +331,7 @@ the plan and revision 1 under-weighted all of them.
 | # | Build | Why | Risk |
 |---|---|---|---|
 | **A3.7** | **`gqafix_qh_ladekv`** — W8 `lm_head` | **Discriminator arm 1** (§2.3): +19.4% byte vs +3.6% compute. `full_build.sh … --quant-head` → `lade_build.sh` → `ladekv_build.sh` (a bitwidth change needs the full chain, not the §5.6 fast path). Verify `qairt-dlc-info \| grep lm_head.weight` → `sFxp_8`, never trust the flag. Also finally records a converter DDR summary for a real qh build — none has ever existed (`REFERENCE.md` §6.5) | Low build risk; **`REFERENCE.md` §8.1 stands** — 151.3 MB left the DLC but only 12.5 MB left the ctx-bin, so the bytes may never reach the device. That is a *result*, not a reason to skip it |
-| **A3.8** | **`gqafix_cl512_ladekv`**, then `cl768` | **Discriminator arm 2** (§2.3): +8.3% byte vs +34.7% compute — the opposite ordering. New conversions, same post-B encodings lineage. Doubles as the product variant | Low |
+| **A3.8** | **`gqafix_cl512_ladekv`**, then `cl768` | **Discriminator arm 2** (§2.3): +6.5% byte vs +26.0% compute — the opposite ordering. New conversions, same post-B encodings lineage. Doubles as the product variant | Low |
 | **A3.9** | **`gqafix_fuseqkvgu_ladekv`** | The two winning changes have **never been combined** — every fused build predates the fix. Both models say ~+10%, so this is a ship candidate | **Gain uncertain.** Fusion's +15% was measured pre-fix at ~10 GB/s effective; if it was access-pattern recovery, the fix already collected it. Same reasoning that moved LADE |
 | **A3.10** | **The stack** — winner(s) of A3.1–A3.9 combined, then the CL ladder on it | Ship candidate | Low |
 | **A3.11** | **KV signed-INT8** — *unblocked by A1.3; the kernel exists* | −66.0 MB, and the byte side of attention GEMV | **Highest, and the shape of the risk changed.** The kernel is no longer in doubt; the work is ONNX-level. Hard constraints from `NOTES-htp-kernel-table.md`: K/V-proj outputs must quantize to **`sfxp8`** — signed, symmetric, per-tensor. Unsigned INT8 has no mixed kernel, and **the INT16 fallback does not exist** (no `f16 × *fxp16`), so there is no safe intermediate: it lands or it doesn't. Getting the dtype wrong reproduces the ViT failure exactly (`validateOpConfig failed 3110` at ComposeGraphs, `REFERENCE.md` §4). Cross-graph rule still binds — KV encodings byte-identical across all three graphs (`nsp-model.cpp:922-961`), satisfied by the `--export-decode` path. Kill criteria: `--eval` ≥3/4 **and** `parity_ladekv_read.py` 6/6 |
@@ -392,7 +396,7 @@ computed against it.
 | Pri | Arm | Decides |
 |---|---|---|
 | **0** | **Pull `/data/local/tmp/results/` off the device** | `/data` runs 98–99% full; the 08-15 per-op record is one cleanup away from gone. **Before anything else** |
-| **1** | **`gqafix_qh_ladekv` AND `gqafix_cl512_ladekv`, both vs the re-baselined `gqafix_ladekv`** | **The whole plan** (§2.3). The two models predict opposite orderings (qh +19/+4, cl512 +8/+35). Assumption-free — needs no clock or thread-count knowledge. Run them as a pair; either alone is half an answer |
+| **1** | **`gqafix_qh_ladekv` AND `gqafix_cl512_ladekv`, both vs the re-baselined `gqafix_ladekv`** | **The whole plan** (§2.3). The two models predict opposite orderings (qh +19/+4, cl512 +7/+26). Assumption-free — needs no clock or thread-count knowledge. Run them as a pair; either alone is half an answer |
 | **2** | **`gqafix_hvx8_ladekv`** | The null test. Byte model says exactly 0.0%. Also resolves enough of the thread ambiguity to make priority 3 interpretable |
 | 3 | P1 cycle profile with A1.5's regenerated inputs | Confirms ~88M cycles and zero replication ops, and — the real value — yields **the new top-10**, which is the input every subsequent plan needs. Demoted from revision 1's "unambiguous priority 1": at 4 threads it reads compute-bound and at 8 it reads byte-bound, so it does **not** discriminate on its own |
 | 4 | `gqafix_fuseqkvgu_ladekv` | Ship candidate; does fusion survive the fix? (A3.9's open risk) |
@@ -407,7 +411,7 @@ computed against it.
 | Observation | Action |
 |---|---|
 | **qh ≥ +12% and cl512 ≤ +12%** | **Byte-bound.** qh is the ship base; KV INT8 and compression lead; CL is a product knob only |
-| **cl512 ≥ +25% and qh ≤ +8%** | **Compute-bound.** The CL ladder leads; qh is parked next to W4A16; attention-side compute (fusion, GEMV shape, `hvx_threads`) is the workstream |
+| **cl512 ≥ +19% and qh ≤ +8%** | **Compute-bound.** The CL ladder leads; qh is parked next to W4A16; attention-side compute (fusion, GEMV shape, `hvx_threads`) is the workstream |
 | both ≥ their low bars, neither at its high bar | Mixed regime; re-derive the ladder from priority 3's per-op table before building anything further |
 | **both < +5%** | Neither model holds. Something outside both — dispatch overhead (~220 µs RPC × op count), DVFS, or the `pastkv2g` variance mechanism — is binding. Priority 3's profile becomes the only admissible next input, and open question 14 (is `llm_decode_burst` the real maximum clock?) escalates to the platform team |
 | **hvx8 > +5%** | Byte model **falsified** regardless of anything else — zero bytes changed. Adopt it in every build immediately; it is free |

@@ -28,7 +28,7 @@ stall), but they disagree about *which arm wins*, and that is robust.
 | `p4_qh_ladekv` | `p4_cl512_ladekv` | Verdict | What happens next |
 |---|---|---|---|
 | **≥ +12%** | ≤ +12% | **Byte-bound** | `qh` becomes the ship base. KV signed-INT8 (kernel confirmed available) and weight-stream compression become the lead workstreams. CL stays a product knob |
-| ≤ +8% | **≥ +25%** | **Compute-bound** | The CL ladder leads — build `cl768`, and re-open CL=256 for short-context products. `qh` is parked next to W4A16. Attention-side compute (fusion, GEMV shape, HVX occupancy) becomes the workstream |
+| ≤ +8% | **≥ +19%** | **Compute-bound** | The CL ladder leads — build `cl768`, and re-open CL=256 for short-context products. `qh` is parked next to W4A16. Attention-side compute (fusion, GEMV shape, HVX occupancy) becomes the workstream |
 | both mid-band | both mid-band | **Mixed regime** | Do not guess a ladder. Re-derive it from P1's per-op table before building anything further |
 | **both < +5%** | | **Neither model holds** | Something outside both is binding — per-op dispatch (~220 µs RPC × op count), DVFS, or whatever drives the `pastkv2g` variance. P1's profile becomes the only admissible next input, and "is `llm_decode_burst` actually the maximum HTP/DDR clock?" escalates to the platform team |
 | qh **negative** | — | Consistent with `REFERENCE.md` §8.1 — the 151 MB never reaches the device (only 12.5 MB left the ctx-bin) | Not a wasted build: it is the byte model's refutation on this arm. Record and park `qh` permanently |

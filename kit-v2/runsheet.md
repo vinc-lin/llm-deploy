@@ -62,7 +62,7 @@ moment you perturb the model, because they predict opposite orderings:
 | Arm | Byte model says | Compute model says |
 |---|---:|---:|
 | **W8 `lm_head`** | **+19.3%** | +3.6% |
-| **CL=512** | +8.3% | **+34.7%** |
+| **`cl512`** (`context.size` 512 → ctx-bin CL 640) | +6.5% | **+26.0%** |
 | **`hvx_threads: 8`** | **0.0%, by construction** | up to large |
 
 **Priority 1 is running the first two and seeing which ordering the silicon
@@ -210,7 +210,7 @@ Run **both**. Either alone is half an answer, because the verdict is in the
 | Arm | Bundle | Dialog | Topology | byte / compute |
 |---|---|---|---|---|
 | `p4_qh_ladekv` | `qwen3_06b_w8a16_gqafix_qh_ladekv` | `genie_dialog_basic.json` | **pure** | +19.3% / +3.6% |
-| `p4_cl512_ladekv` | `qwen3_06b_w8a16_gqafix_cl512_ladekv` | `genie_dialog_basic.json` | **pure** | +8.3% / +34.7% |
+| `p4_cl512_ladekv` | `qwen3_06b_w8a16_gqafix_cl512_ladekv` | `genie_dialog_basic.json` | **pure** | +6.5% / +26.0% |
 
 Both are same-lineage rebuilds of the 3-graph past-KV topology — identical to
 the baseline except for the one variable. The old `gqafix_qh` and

@@ -81,7 +81,7 @@ shape ops 3.2%.
 | Variant | Byte model | Compute model | Role |
 |---|---:|---:|---|
 | **W8 `lm_head`** (−155,582,464 B; 6.9% of cycles) | **+19.3%** | **+3.6%** — or **0%** if `REFERENCE.md` §8.1 holds and the head is re-materialized to FP16 at prepare time | ⭐ discriminator |
-| **CL=512** (−73,400,320 B of KV; GEMV+softmax scale with CL) | **+8.3%** | **+34.7%** (−25.8% cycles) | ⭐ discriminator, opposite ordering |
+| **`cl512`** (−58,720,256 B of KV; GEMV+softmax scale with CL) | **+6.5%** | **+26.0%** (−20.6% cycles) | ⭐ discriminator, opposite ordering |
 | **`hvx_threads: 8`** | **0.0%, by construction** (measured, §1) | up to large if build-time 4 was binding | ⭐ null test |
 | QKV + Gate-Up fusion | +9.1% (−80 MB, device-team measured) | ~+11% (~10% of cycles) | ship candidate, not evidence |
 | KV signed-INT8 (−66,002,944 B) | +7.4% | small — GEMV byte side only | build, kernel confirmed |
@@ -97,17 +97,37 @@ priority 1 of the device session and why both must be run.
 To be checked against each build's own DDR summary when it lands — a variant
 whose bytes did not move did not do what it claims.
 
-| Variant | Predicted decode `read_total_bytes` | Δ |
-|---|---:|---:|
-| W8 head | 805,548,032 | −155,582,464 |
-| CL=512 (KV term only — see note) | 887,730,176 | −73,400,320 |
-| KV signed-INT8 @ CL=1152 | 895,127,552 | −66,002,944 |
-| W8 head + KV INT8 | 739,545,088 | −221,585,408 |
+| Variant | `context.size` | ctx-bin CL | decode past | Predicted decode `read_total_bytes` | Δ | byte % | cycle % |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 1024 | 1152 | 1151 | 961,130,496 | — | — | — |
+| **W8 head** | 1024 | 1152 | 1151 | **805,548,032** | −155,582,464 | **+19.3%** | +3.6% |
+| `cl768` | 768 | 896 | 895 | 931,770,368 | −29,360,128 | +3.2% | +11.5% |
+| **`cl512`** | 512 | **640** | **639** | **902,410,240** | −58,720,256 | +6.5% | **+26.0%** |
+| `cl384` | 384 | 512 | 511 | 887,730,176 | −73,400,320 | +8.3% | +34.8% |
+| `cl256` | 256 | 384 | 383 | 873,050,112 | −88,080,384 | +10.1% | +44.9% |
+| KV signed-INT8 @ CL=1152 | 1024 | 1152 | 1151 | 895,127,552 | −66,002,944 | +7.4% | small |
+| W8 head + KV INT8 | 1024 | 1152 | 1151 | 739,545,088 | −221,585,408 | +29.9% | +3.6% |
 
-*KV read = 2 × 28 layers × 8 heads × 128 dim × past × 2 B; past = 1151 →
-132,005,888, past = 511 → 58,605,568. The CL=512 figure counts only the KV term;
-mask and activation terms also shrink, so **record the converter's own number**
-rather than asserting this one.*
+> ### ⚠️ A naming trap this table exists to close
+>
+> **"cl512" means `context.size = 512`, so the ctx-bin CL is 512 + 128 = 640 and
+> the decode graph's past dim is 639** — verified against the built
+> `gqafix_cl512` bin, whose decode graph is `AR=1 CL=640`.
+>
+> Three documents inherited the wrong geometry before this was checked:
+> V3 §3-3.3's *"CL=512: KV read 132 → 59 MB"* is the **`cl384`** row; V4 rev 1's
+> A2 entry *"CL=512 (known from V3) = 873,048,064"* is the **`cl256`** row; and
+> V4 rev 2's original **+8.3% / +34.7%** is also `cl384`. All corrected here.
+>
+> The discriminator is unaffected in kind — `cl512` is still **+6.5% byte vs
+> +26.0% compute**, a 4× gap in the opposite direction to the W8 head — but the
+> numbers changed, and this is exactly the class of inherited error the A2 gate
+> exists to catch. `cl384` would be a marginally sharper discriminator; `cl512`
+> is built instead because it is the product-meaningful context size.
+
+*KV read = 2 × 28 layers × 8 heads × 128 dim × past × 2 B. These count only the
+KV term; mask and activation terms also shrink with CL, so **record the
+converter's own `read_total_bytes`** rather than asserting the prediction.*
 
 ## 5. How to add a row
 
