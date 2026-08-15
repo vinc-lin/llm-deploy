@@ -13,3 +13,17 @@ __pycache__/
 # class, and the photos carry full terminal chrome.
 reports/0813/
 reports/sharegpt-onestep-1.7b-intent-ext-build-analysis.md
+
+# Photo drops are NEVER tracked -- the transcribed Markdown is the record (see
+# CLAUDE.md). They are screen photographs carrying full terminal chrome, which
+# is the exact leak class this history was scrubbed for twice. Match the drop
+# directories by pattern so a future `git add -A` cannot catch a new one.
+reports/[0-9][0-9][0-9][0-9]/
+
+# Device-team report PDFs: image-only scans (the 2026-08-14 Decode report is
+# 267 embedded images, no extractable text), so their contents cannot be
+# reviewed for that same leak class before a push to a PUBLIC remote.
+reports/*.pdf
+
+# Local Claude Code state: nested git worktrees, not project content.
+.claude/worktrees/
