@@ -30,6 +30,20 @@ summary. Three graphs per bin.
 | `udma` | 1,013,235,712 | **961,130,496** | 955,887,616 | **0** |
 | `dlbc` | 1,013,235,712 | **961,130,496** | 955,887,616 | **0** |
 | `wpack` | 1,013,235,712 | **961,130,496** | 955,887,616 | **0** |
+| **`qh_ladekv`** (W8 head) | 867,133,440 | **815,028,224** | 809,785,344 | **−146,102,272** |
+
+**The qh arm's byte gate passes, with a caveat worth carrying.** The measured
+saving is 146,102,272 B — **94% of the 155,582,464 ideal** (151936 × 1024). The
+~9.5 MB shortfall is unexplained; per-channel scales account for only ~0.6 MB.
+So the byte model's prediction for this arm is **+17.9%** measured, not the
++19.3% derived from the ideal saving. The bytes moved, which is what A2 gates
+on — but note this is *converter accounting*, and `REFERENCE.md` §8.1's open
+question is precisely whether the saving survives to the device: the DLC shrank
+151.3 MB while the ctx-bin shrank only 12.5 MB on the 2026-08-12 build.
+
+Head dtype verified `sFxp_8` on **all three** graphs (`decode`, `verify32`,
+`prefill`), against a `Float_16` baseline — see `BUILD_GUIDE.md` §5.7 for why the
+obvious grep gives the wrong answer here.
 
 Two things worth keeping:
 
