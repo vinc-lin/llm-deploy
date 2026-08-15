@@ -73,6 +73,13 @@ def main():
         print(f"  cache group 'past_': ctx={facts['cache_group_ctx_size']}, "
               f"{'scatter' if facts['use_scatter'] else 'concat'}, "
               f"variant map {facts.get('variant_map')}")
+    n_enc = facts.get("encoding_names_checked", 0)
+    if facts.get("encoding_check_applicable"):
+        print(f"  cross-graph encodings: {n_enc} tensor name(s) compared")
+    else:
+        print("  cross-graph encodings: N/A -- every cross-graph tensor is "
+              "FLOAT_16 (unquantized), so Check 4 has nothing to compare. "
+              "It becomes live only for a KV-INT8 build.")
     if errors:
         print(f"\nGENIE LOAD WOULD FAIL ({len(errors)} error(s)):")
         for gname, tname, msg in errors:

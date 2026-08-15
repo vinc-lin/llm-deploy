@@ -649,8 +649,9 @@ def _dims4(dims):
 class _T:
     """One tensor as validateModel sees it."""
 
-    def __init__(self, name, dims):
+    def __init__(self, name, dims, qp=None):
         self.name, self.raw = name, [int(x) for x in dims]
+        self.qp = qp                      # (scale, offset) or None -- Check 4
         d = _dims4(dims)
         self.ok = d is not None
         self.batch, self.h, self.w, self.c = d if d else (1, 1, 1, 1)
@@ -665,10 +666,10 @@ class _G:
 
     def __init__(self, name, gi, shard):
         self.name, self.shard = name, shard
-        self.ins = {n: _T(n, t["dimensions"])
+        self.ins = {n: _T(n, t["dimensions"], scale_offset(t))
                     for n, t in tensor_map(gi, "graphInputs").items()
                     if t.get("dimensions")}
-        self.outs = {n: _T(n, t["dimensions"])
+        self.outs = {n: _T(n, t["dimensions"], scale_offset(t))
                      for n, t in tensor_map(gi, "graphOutputs").items()
                      if t.get("dimensions")}
         self.type = self._classify()
@@ -916,6 +917,50 @@ def simulate_genie_load(shards, ctx_size, kv_dim, rope_dim):
                        "no variant in the last split produces logits -- "
                        "m_logit_variants would be empty and no inference step "
                        "could yield a sample"))
+
+    # -- 5. Check 4: cross-graph encodings identity (nsp-model.cpp:921-949) --
+    # Every same-named tensor must carry a byte-identical (scale, offset) in
+    # EVERY graph of the cache group, with `*_in` mapped onto `*_out` -- the KV
+    # a graph writes is the KV another graph reads back, so a difference means
+    # the cache is reinterpreted mid-dialog. This is a hard load error in the
+    # same class as the 2026-08-14 ShapeError, and it had no coverage here
+    # until 2026-08-16.
+    #
+    # It stays green only because split_encodings.py derives every chunk from
+    # one calibration. Nothing else enforces that, and the exposed surface is
+    # wider than the shard boundary: attention_mask, position_ids_* and
+    # inputs_embeds appear in graphs on BOTH ctx-bins, so a per-chunk
+    # re-quantisation or a hand-patched encodings file fails the node at load.
+    enc = {}
+    for g in graphs:
+        for coll in (g.ins, g.outs):
+            for n, t in coll.items():
+                if t.qp is None:
+                    continue
+                key = n[:-3] if n.endswith("_in") else (
+                    n[:-4] if n.endswith("_out") else n)
+                enc.setdefault(key, []).append((g.name, n, t.qp))
+    for key, seen in sorted(enc.items()):
+        distinct = {qp for _, _, qp in seen}
+        if len(distinct) > 1:
+            where = ", ".join(f"{gn}.{tn}=({s:.9g},{o})"
+                              for gn, tn, (s, o) in seen)
+            errors.append((("-"), key,
+                           "encodings differ across graphs for the same tensor "
+                           f"-- {where}. Genie requires byte-identical "
+                           "(scale, offset); the KV one graph writes is read "
+                           "back by another"))
+    facts["encoding_names_checked"] = len(enc)
+    # Be explicit when this checked nothing. On every current text tower it
+    # does: all cross-graph IO (inputs_embeds, attention_mask, position_ids_*,
+    # past_key/value_*) is FLOAT_16 with QUANTIZATION_ENCODING_UNDEFINED, which
+    # is the whole point of the "K/V projections stay FP16" rule -- Check 4 is
+    # satisfied trivially because there is nothing quantized to disagree about.
+    # It becomes load-bearing the moment a KV-INT8 variant is attempted, which
+    # is exactly when a per-chunk re-quantisation would otherwise reach silicon.
+    # Reporting a bare PASS here would read as "verified" when it means
+    # "not applicable".
+    facts["encoding_check_applicable"] = bool(enc)
 
     # -- context.size must fit the cache group ------------------------------
     if ctx_size is not None and cache_ctx and ctx_size > cache_ctx:

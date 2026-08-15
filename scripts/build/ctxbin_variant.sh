@@ -91,4 +91,38 @@ for name, k in ar_cl:
     seen[k] = name
 print("OK: graph names match and every (AR, CL) is unique")
 PYEOF
+
+# Read the COMPILED tuning values back out of the finalized binary.
+#
+# This script exists to produce A/B variants, so it is the one place where a
+# config that silently failed to bind would be misread as "the knob under test
+# did nothing" -- the most expensive possible failure here, because it looks
+# like a measurement. Every other build script (vit_build*.sh, vl_text_ctxbin*.sh)
+# already asserts this; this one did not until 2026-08-16.
+python3 - "$OUT_DIR/$BIN_NAME.info.json" "$OVERRIDES" <<'PYEOF'
+import json, re, sys
+raw = open(sys.argv[1]).read()
+want = json.loads(sys.argv[2])
+# graph-level tuning keys as they appear in the finalized bin
+alias = {"hvx_threads": "numHvxThreads",
+         "vtcm_mb": "vtcmSizeInMB",
+         "O": "optimizationLevel"}
+defaults = {"numHvxThreads": 4, "vtcmSizeInMB": 16, "optimizationLevel": 3}
+found = {k: sorted({int(v) for v in re.findall(r'"%s"\s*:\s*(\d+)' % k, raw)})
+         for k in defaults}
+print("compiled tuning values:", found)
+bad = []
+for key, expect in list(defaults.items()):
+    exp = want.get(next((a for a, b in alias.items() if b == key), ""), expect)
+    got = found.get(key) or []
+    if not got:
+        print(f"  NOTE: {key} not reported in info.json; cannot verify")
+        continue
+    if any(v != exp for v in got):
+        bad.append(f"{key}: compiled {got}, config asked {exp}")
+if bad:
+    sys.exit("FAIL: config did not bind -- " + "; ".join(bad) +
+             "\n  Any A/B built on this binary would be measuring nothing.")
+print("OK: compiled tuning values match the requested config")
+PYEOF
 echo "CTXBIN VARIANT READY: $OUT_DIR/$BIN_NAME.bin"

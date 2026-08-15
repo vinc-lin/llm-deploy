@@ -34,8 +34,11 @@ N_LAYERS, SPLIT_AT, EMBD, VOCAB = 36, 18, 2560, 151936
 AR, PAST, TOTAL = 128, 2048, 2176           # ground truth: PAST+AR == TOTAL
 
 
-def _t(name, dims):
-    return {"name": name, "dimensions": list(dims)}
+def _t(name, dims, scale=0.001, offset=0):
+    """Tensor with encodings attached -- Check 4 compares (scale, offset)."""
+    return {"name": name, "dimensions": list(dims),
+            "quantizeParams": {"scaleOffset": {"scale": scale,
+                                               "offset": offset}}}
 
 
 def _kv(lo, hi, ar, past, out_ar):
@@ -204,6 +207,27 @@ def main():
         print("  OK   logits-less decode_1 reclassifies to DECODER_PREFILL "
               "(exempt by :787, not a load error)")
         passed.append(True)
+
+    # Check 4: cross-graph encodings identity. The KV that prefill_0 WRITES is
+    # what decode_0 READS back, so a per-graph re-quantisation reinterprets the
+    # cache mid-dialog. Genie refuses the load; nothing else in this repo
+    # catches it. Mutate one scale on one tensor in one graph.
+    m = copy.deepcopy(good)
+    for t in m[0]["decode_0"]["graphInputs"]:
+        if t["name"] == "past_key_0_in":
+            t["quantizeParams"]["scaleOffset"]["scale"] = 0.002
+    passed.append(run("mismatched KV encodings across graphs", m,
+                      expect_pass=False,
+                      must_contain="encodings differ across graphs"))
+
+    # And the offset half of the pair, on a tensor that spans both shards.
+    m = copy.deepcopy(good)
+    for t in m[1]["prefill_1"]["graphInputs"]:
+        if t["name"] == "attention_mask":
+            t["quantizeParams"]["scaleOffset"]["offset"] = 7
+    passed.append(run("mismatched mask offset across shards", m,
+                      expect_pass=False,
+                      must_contain="encodings differ across graphs"))
 
     n_bad = passed.count(False)
     print(f"\n{len(passed) - n_bad}/{len(passed)} checks passed")
