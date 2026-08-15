@@ -211,11 +211,21 @@ change.
 
 ### ⚠ C1 — in a SPLIT tower it is not dead weight, it is fatal (device, 2026-08-14)
 
-**Correction to C.** C's analysis of graph *selection* holds, but its premise —
-that the model loads and the prefill graph is silently skipped — does not. The
-2026-08-14 device attempt never got that far: node creation died with two
-`ShapeError`s on `attention_mask` (Expected `[1,128,2176]`, Found `[1,128,128]`)
-and a SIGSEGV.
+**Correction to C.** Both halves of C are now known wrong, for independent
+reasons.
+
+*The premise* — that the model loads and the prefill graph is merely skipped —
+is wrong: the 2026-08-14 device attempt never got that far. Node creation died
+with two `ShapeError`s on `attention_mask` (Expected `[1,128,2176]`, Found
+`[1,128,128]`) and a SIGSEGV.
+
+*The selection analysis* is wrong too, per the 2026-08-15 probe: the
+`DECODER_PREFILL` exclusion in `prepareInferenceStrategy` is gated on
+`output_all`, and a basic dialog passes `false` at every call site, so **a
+prefill graph IS selected** — see `docs/NOTES-genie-io.md` § "A past-KV prefill
+IS selected in a basic dialog". C's "dead weight / never selected / all-decode"
+conclusion, and the ~30 s all-decode TTFT estimate that follows from it, do not
+survive that. A 273-token prompt is three AR=128 prefill calls, not 273 decodes.
 
 C's specific claim that **"our prefill classifies as `GraphType::DEFAULT`, not
 `DECODER_PREFILL`, because it emits logits"** is true only of `prefill_1`. In the

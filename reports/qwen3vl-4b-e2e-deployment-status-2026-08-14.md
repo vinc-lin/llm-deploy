@@ -252,6 +252,6 @@ above has been altered.
    semantics), `docs/NOTES-genie-pipeline.md` §C1 (correcting probe C's "silently skipped"
    premise and its `DEFAULT` classification claim), `docs/REFERENCE.md` §3.6 (hard
    contract), §5 (e2e gate row + the real-deepstack caveat) and corrections #20/#21.
-8. **Source photographs retained** at `reports/0814/IMG_3043..IMG_3050.HEIC`. Unlike the
-   2026-08-10 batch, they have not been deleted; delete them only once this transcription
-   is accepted as the record.
+8. **Source photographs deleted 2026-08-15** once transcribed (formerly
+   `reports/0814/IMG_3043..IMG_3050.HEIC`, never tracked in git) — same disposition as the
+   2026-08-10 batch. **This document is now the only record of them.**
