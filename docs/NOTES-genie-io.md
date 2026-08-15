@@ -277,6 +277,113 @@ general repair for a miscompiled multi-graph ctx-bin without a rebuild, which
 matters because `QnnContext_getBinary()` returns
 `QNN_COMMON_ERROR_OPERATION_NOT_PERMITTED` on contexts created from a binary.
 
+## A past-KV prefill IS selected in a basic dialog — the `output_all` exclusion never fires — extracted 2026-08-15
+
+Probe for the prefill-KV rebuild. The open question was whether rebuilding
+shard-0's prefill with past-KV is pointless: shard 0 still has no `logits`, so
+it still classifies `DECODER_PREFILL`, and `prepareInferenceStrategy`'s `pick`
+lambda skips exactly that type:
+
+```cpp
+// kvmanager.cpp:388-394
+auto pick = [output_all](int32_t n, std::set<GraphVariantInfo>& choices) -> int32_t {
+  for (auto choice : choices) {
+    if (output_all && choice.type == GraphType::DECODER_PREFILL) {
+      continue;
+    }
+```
+
+**The exclusion is gated on `output_all`, and a basic dialog always passes
+`false`.** Every `engine.process(...)` call in `dialogs/basic.cpp` passes
+`false` explicitly (`:104`, `:225`, `:237`, `:332`, `:413`, `:781`) or takes the
+`= false` default (`:613`, the embeddings+per-layer overload — the Qwen3-VL
+path). `output_all == true` appears **only** in `lhd-dec.cpp:161,264` (lade),
+`ssd-q1.cpp`, `spec-dec.cpp:255` and `multistream.cpp:86,102`. Our text
+generator is `"type": "basic"`, so the DECODER_PREFILL variant stays eligible.
+
+Two further reasons the rebuild is safe even under `output_all == true`:
+
+1. **Registration is per shard, not per model.** `initializeKVManager` walks
+   *every* `m_nsp_graphs` entry and registers each variant with that shard's own
+   type (`nsp-model.cpp:979-986`). `GraphVariantInfo::operator<` orders on
+   `(arN, type)` (`kvmanager.hpp:390-395`), so AR=128 is inserted **twice** into
+   `m_supported_variants[2176]` — once as shard-0 `DECODER_PREFILL`, once as
+   shard-1 `DEFAULT`. `pick` only reads `choice.arN`, so the surviving DEFAULT
+   entry keeps AR=128 selectable regardless.
+2. **Logit variants come from the last split only.** `logit_containing_variants`
+   is built by iterating `m_nsp_graphs.back().variants` (`nsp-model.cpp:1198-1204`),
+   so `{128, 2176}` registers as a logit variant via `prefill_1`. The
+   "last step must produce logits" post-process (`kvmanager.cpp:467-490`) is
+   therefore a no-op for us and never pops the prefill step.
+
+### Corollary: the device runs THREE prefill calls for a 273-token prompt, not 2 + 17 decodes
+
+`variant` is picked **once** before the loop (`kvmanager.cpp:409`) and only
+re-picked if the cache boundary is hit (`:439-445`). With choices `{1, 128}` and
+`n_inputs = 273`, `pick` finds nothing `>= 273`, so it returns the largest
+choice below — `128`. The loop then emits `n_process = min(n_remain, 128)`:
+
+| Step | variant | ctx | n_past | n_valid_kv | n_process |
+|---|---|---|---|---|---|
+| 1 | 128 | 2176 | 0 | 0 | 128 |
+| 2 | 128 | 2176 | 128 | 128 | 128 |
+| 3 | 128 | 2176 | 256 | 256 | **17** |
+
+The tail of the prompt runs on the **AR=128 graph padded to 17 valid tokens** —
+it does not fall back to 17 AR=1 decode steps. `past_dim = ctx_size - variant =
+2048` (`:448`), which is exactly the rebuilt `past_key_N_in [1,8,128,2048]`.
+Any device-faithful parity chain must model three prefill calls.
+
+## `validateModel` expectations, per named tensor — extracted 2026-08-15
+
+`checkShape(name, tensor, height, width, channel, bitwidth, errors)`
+(`nsp-model.cpp:477-497`) compares only `Dims.height/width/channel/bitwidth`;
+`-1` means "ignore". Its message is the device-visible one:
+`Expected [ H, W, C] bitwidth=BW. Found [ h, w, c] bitwidth=bw`.
+
+**Axis mapping** (`qnn-utils.cpp:113-122`, `:66-76`): dims are **right-aligned**
+into a 4-vector padded with 1s, then `(batch,height,width,channel) = (v0,v1,v2,v3)`.
+So `[1,128,2176]` → `h=1, w=128, c=2176`, and `[1,8,128,2048]` → `h=8, w=128,
+c=2048`. With `batchSize == 1` a hack applies: `height = (v0!=1 && v1==1) ? v0 :
+height`, `batch = (v0>1 && v1!=1) ? v0 : 1`.
+
+Let `AR = variant.n_tokens`, `CL = variant.ctx_size`, and per cache-group prefix `p`:
+
+- `(group_arn, group_ctx) = m_cache_group_variant_map[p][{AR,CL}]`, defaulting to
+  `{AR,CL}` (`:516`) and then recomputed at `:601-608` from the KV tensors —
+  **with the rewrite that caused the incident**:
+  ```cpp
+  // nsp-model.cpp:604-605
+  if (variant->variantType == GraphType::DECODER_PREFILL && (prefix == "past_")) {
+    ctx = static_cast<int32_t>(m_cache_group_ctx_size[prefix]);   // cache-group MAX
+  }
+  ```
+- `past_dim = use_scatter ? group_ctx : group_ctx - group_arn` (`:894-895`)
+- `group_kv_dim` = config `kv-dim`, else auto-detected from `past_key*` width (`:826-842`)
+
+| Tensor | Expected `[h, w, c]` | Source |
+|---|---|---|
+| `attention_mask` | `[1, group_arn, group_ctx]` | `:858` |
+| `position_ids_cos` / `_sin` (ROPE) | `[1, AR, rope.dims]` | `:871-873` |
+| `past_key_*_in` | `[*, group_kv_dim, past_dim]` | `:903` |
+| `past_value_*_in` | `[*, past_dim, group_kv_dim]` | `:905` |
+| `past_key_*_out` | `[*, group_kv_dim, group_arn]` | `:911` |
+| `past_value_*_out` | `[*, group_arn, group_kv_dim]` | `:913` |
+| `inputs_embeds` (first split) | bitwidth only, **plus** `numElements == AR × batch × embd_size` | `:694-716` |
+| `logits` (last split) | `numElements/batch ∈ {vocab, vocab×AR}` | `:792-798` |
+
+Two exemptions worth knowing: `logits` is **not required** when
+`variantType == DECODER_PREFILL` (`:787`), and KV shapes are skipped entirely
+for `KV_SHARE_NO_KV_OUTPUT` variants (`:889-890`). Check 4 (`:921-949`)
+additionally requires byte-identical `(scale, offset)` for every tensor name
+across all graphs, mapping `*_in` → `*_out` — this is the "same encodings
+lineage" contract, enforced at load.
+
+Worked example, the 2026-08-14 failure: shipped `prefill_0` had
+`attention_mask [1,128,128]`, `group_arn = 128`, and `group_ctx` rewritten to
+the cache-group max `2176` → `Expected [ 1, 128, 2176] Found [ 1, 128, 128]`,
+once per shard. The rebuild ships `[1,128,2176]` and matches by construction.
+
 ## Other findings
 
 - x86_64 tools INCLUDE `genie-t2t-run` + `libGenie.so` → local e2e Genie smoke
