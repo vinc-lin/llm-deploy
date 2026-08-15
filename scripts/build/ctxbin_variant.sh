@@ -105,9 +105,9 @@ raw = open(sys.argv[1]).read()
 want = json.loads(sys.argv[2])
 # graph-level tuning keys as they appear in the finalized bin
 alias = {"hvx_threads": "numHvxThreads",
-         "vtcm_mb": "vtcmSizeInMB",
+         "vtcm_mb": "vtcmSize",          # info.json spells it vtcmSize, not vtcmSizeInMB
          "O": "optimizationLevel"}
-defaults = {"numHvxThreads": 4, "vtcmSizeInMB": 16, "optimizationLevel": 3}
+defaults = {"numHvxThreads": 4, "vtcmSize": 16, "optimizationLevel": 3}
 found = {k: sorted({int(v) for v in re.findall(r'"%s"\s*:\s*(\d+)' % k, raw)})
          for k in defaults}
 print("compiled tuning values:", found)

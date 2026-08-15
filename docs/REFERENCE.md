@@ -567,13 +567,37 @@ read_total_bytes=961130496
 
 Two things follow, and both overturn earlier planning:
 
-1. **`read_total_bytes = 961,130,496` is a PRE-GQA-fix number.** It comes from
-   `ctxbin-ws.log` dated 2026-08-10, four days before the fix (see also
-   correction #5, which established the same provenance for a different misuse).
-   Anything quoting it as the current or post-fix byte count is wrong, including
-   any "% of bandwidth ceiling" derived from it. **No post-fix `read_total_bytes`
-   has ever been recorded** — the gqafix build directories keep the ctx-bins and
-   `info.json` but no logs. Capturing it is a ~20-minute device-free job.
+1. **The GQA fix changed decode DDR traffic by exactly zero bytes — measured.**
+   The post-fix count was never recorded until 2026-08-16, when the gqafix
+   ctx-bin was regenerated from its own DLCs and the generator log captured
+   (`work/ctxbin/qwen3-0.6b-w8a16-gqafix-ladekv-hvx4.log`, graphs in order
+   `prefill, decode, verify32`):
+
+   | graph | `read_total_bytes` | `write_total_bytes` | spill/fill |
+   |---|---:|---:|---:|
+   | prefill (AR=128, past-KV) | 1,013,235,712 | 185,696,256 | 0 |
+   | **decode (AR=1)** | **961,130,496** | **419,840** | 0 |
+   | verify32 (AR=32) | 955,887,616 | 26,238,976 | **0** |
+
+   The decode row is **byte-identical** to the 2026-08-10 pre-fix figures
+   (`ctxbin-ws.log`) — same reads, same writes, to the byte. So the fix removed
+   74.7% of decode cycles, moved **zero** additional or fewer DDR bytes, and
+   throughput went 6.836 → 44.707 tok/s. That is the byte model's obituary,
+   now measured rather than inferred.
+
+   Two corollaries fall out of the same table:
+
+   - **`verify32` no longer spills.** Pre-fix it moved 1,906 MB with **745/750 MB
+     of VTCM spill/fill** (§6.5); post-fix it reads 956 MB with **spill 0**. The
+     replication tensors were what overflowed 16 MB VTCM at AR=32.
+   - **That is a second, independent refutation.** `verify32` now costs
+     essentially the same DDR traffic as a single decode step (956 vs 961 MB)
+     while verifying up to 32 positions. On a byte model LADE should now win by
+     a large factor. It measured a **30% loss** (§6.8). Bytes are not what binds.
+
+   ⚠ The figure `961,130,496` is *also* the pre-fix number, so quoting it
+   without a date still communicates nothing — that ambiguity is exactly what
+   put two documents wrong (correction #5). Always cite the log and date.
 2. **The replication ops never touched DDR.** The decode graph writes **419,840
    bytes** per step — 420 KB, not the 264 MB assumed by every byte-side estimate
    of the fix. That traffic was VTCM-resident. So the fix removed ~262M cycles
@@ -839,6 +863,24 @@ also the cleanest model discriminator available (§8.11). Set it where it is
 actually consumed — `scripts/build/ctxbin_variant.sh` and
 `configs/htp_backend_config.json`, **not** the runtime config — and verify by
 reading `numHvxThreads` back out of the binary.
+
+**The A/B pair is built and waiting (2026-08-16).** Both regenerated from the
+same three gqafix DLCs, so the only difference is the compiled thread count:
+
+| | `numHvxThreads` | ctx-bin | decode `read_total_bytes` | spill |
+|---|---:|---:|---:|---:|
+| `…-gqafix-ladekv-hvx4` (control) | **4** | 1,086,570,496 | 961,130,496 | 0 |
+| `…-gqafix-ladekv-hvx8` | **8** | 1,088,847,872 | 961,130,496 | 0 |
+
+Three things this establishes without hardware: the knob **binds** (it is read
+back out of the finalized binary, not merely requested); the compiler really
+does emit different code for it (+2.28 MB, so it is not a metadata flag); and
+DDR traffic is **byte-identical** across the pair. That last point is what makes
+this the clean discriminator — it varies compute width while holding bytes
+exactly constant, which no other proposed experiment does.
+
+Both live in `$LLMDEPLOY_DATA/work/ctxbin/`. They still need bundling before a
+device run.
 
 ### 8.10 n-gram acceptance at 4B
 Everything LADE buys at 4B hinges on acceptance holding near 0.6B's ~1.94
