@@ -104,9 +104,18 @@ def finite(name, arr):
     assert not bad.any(), f"{name}: {int(bad.sum())}/{a.size} non-finite values"
 
 
-def make_image():
-    """Deterministic, semantically legible: red circle + blue square."""
+def make_image(path=None):
+    """The gate's scene.
+
+    Default is deterministic and semantically legible (red circle + blue
+    square) so the gate needs no external asset and its Tier-A text is
+    reproducible. `path` swaps in a real photograph, which is how the test
+    kit gets a per-image expected caption from exactly this machinery --
+    same feed, same chains, same zero-deepstack degradation as the device.
+    """
     from PIL import Image, ImageDraw
+    if path:
+        return Image.open(path).convert("RGB").resize((512, 512), Image.BICUBIC)
     img = Image.new("RGB", (512, 512), "white")
     d = ImageDraw.Draw(img)
     d.ellipse((96, 96, 288, 288), fill=(220, 30, 30))
@@ -117,7 +126,7 @@ def make_image():
 # --------------------------------------------------------------------------- #
 # phase A: every HF reference, computed while the 18 GB fp32 model is alive
 # --------------------------------------------------------------------------- #
-def hf_phase(model_dir, steps):
+def hf_phase(model_dir, steps, image=None):
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
     proc = AutoProcessor.from_pretrained(
@@ -130,7 +139,7 @@ def hf_phase(model_dir, steps):
         {"type": "image"}, {"type": "text", "text": PROMPT}]}]
     text = proc.apply_chat_template(messages, tokenize=False,
                                     add_generation_prompt=True)
-    inputs = proc(text=[text], images=[make_image()], return_tensors="pt")
+    inputs = proc(text=[text], images=[make_image(image)], return_tensors="pt")
     ids = inputs.input_ids[0]
     pv, grid = inputs.pixel_values, inputs.image_grid_thw
     assert tuple(pv.shape) == (1024, 1536), tuple(pv.shape)
@@ -515,6 +524,10 @@ def main():
                     help="past-KV prefill onnx for chain0b "
                          "(default <text-onnx>/prefillkv/prefillkv.onnx)")
     ap.add_argument("--steps", type=int, default=STEPS)
+    ap.add_argument("--image", default=None,
+                    help="photograph to caption instead of the built-in "
+                         "synthetic scene (used to build the test kit's "
+                         "per-image expected captions)")
     ap.add_argument("--chains", default=",".join(ALL_CHAINS),
                     help="comma-separated subset of " + ",".join(ALL_CHAINS))
     ap.add_argument("--threads", type=int, default=0, help="0 = ORT default")
@@ -542,7 +555,7 @@ def main():
     failures = []
 
     print("== phase A: HF reference (model alive, no ORT session) ==", flush=True)
-    ref = hf_phase(args.model, args.steps)
+    ref = hf_phase(args.model, args.steps, args.image)
     meta, n, L = ref["meta"], ref["n"], ref["meta"]["layers"]
     print(f"  n={n} image rows [{ref['img_pos'][0]},{ref['img_pos'][-1]}] "
           f"layers={L} hidden={meta['hidden']}  t={time.time() - t0:.0f}s",
