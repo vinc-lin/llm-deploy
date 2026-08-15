@@ -74,13 +74,18 @@ the runsheet.
 Profile `profiling/qwen3-0.6b-w8a16-gqafix-decodeonly_ctx.bin` against the known
 **350,302,972**-cycle baseline. **Expect ~90M.**
 
-**This did not run on 2026-08-15.** The `decode_profile_inputs.tar.gz` shipped
-alongside it was generated 2026-08-13 against the **pre-fix** decode graph
-(128-dim KV, 128-byte `position_ids`) and is incompatible with the gqafix
-graph's 64-dim layout. The ctx-bin is fine; the inputs are not. Build-side
-packaging defect — regenerate with `scripts/util/gen_decode_profile_inputs.py`
-before re-shipping, and add "regenerate profiling inputs whenever graph I/O
-changes" to the drop checklist. The ~90M expectation stands, untested.
+**This did not run on 2026-08-15, and the reason recorded at the time was
+wrong.** The failure was attributed to the shipped `decode_profile_inputs.tar.gz`
+being pre-fix format ("128-dim KV, 128-byte `position_ids`"). Checked against the
+artifacts on 2026-08-16: **all 60 input files match the gqafix decode graph
+exactly** — `past_key_0_in [1,8,128,1151]` FP16 = 2,357,248 B and the shipped
+file is 2,357,248 B. The 128 is `head_dim` and the 64 is `rope_dim`; both are
+correct, and this drop's own claim that "the KV I/O contract is unchanged" is
+right, so gqafix and pre-fix decode I/O are byte-identical.
+
+The inputs are fine. **The real cause is unknown** — most likely the
+`graph_names` narrowing the profiling package README warns about. Do not
+regenerate the inputs. The ~90M expectation stands, untested.
 
 ### If you only have time for one *Genie* run — ✅ answered
 

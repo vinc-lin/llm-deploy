@@ -547,9 +547,18 @@ removes all 56. KV I/O contract unchanged; numerically bit-identical for decode.
 - **Rep variance is larger than most effects worth chasing** (the `pastkv2g` arm
   spread 23.4–44.5 on one binary). Any future A/B needs ≥5 reps, median reported,
   fixed thermal state, and **no interpretation when the spread exceeds the delta**.
-- **The P1 cycle profile did not run** — the shipped profiling inputs were pre-fix
-  format (128-dim KV) against a 64-dim gqafix graph. Build-side packaging defect,
-  not a device failure. Regenerate profiling inputs whenever graph I/O changes.
+- **The P1 cycle profile did not run, and the recorded reason is wrong
+  (correction #27).** The 08-15 report attributes it to pre-fix profiling inputs
+  ("128-dim KV and 128-byte `position_ids`, incompatible with the gqafix graph's
+  64-dim KV"). **Checked against the artifacts: all 60 input files match the
+  gqafix decode graph exactly, zero mismatches** — e.g. `past_key_0_in`
+  `[1,8,128,1151]` FP16 = 2,357,248 B and the shipped file is 2,357,248 B;
+  `attention_mask` `[1,1,1152]` = 2,304 B, file 2,304 B. The 128 is `head_dim`
+  and the 64 is `rope_dim`; both are correct, and the gqafix and pre-fix
+  `ladekv` bins have byte-identical decode I/O (the fix left the KV contract
+  untouched, exactly as the drop README says). **So the real cause is unknown** —
+  the most likely candidate is the `graph_names` narrowing the profiling package
+  warns about. Do not "regenerate the profiling inputs"; they are correct.
 
 ### 6.9 Build-time DDR accounting — and why the byte model died (2026-08-16)
 
@@ -689,6 +698,7 @@ the index of what changed.
 | 23 | **2 concurrent Genie processes × 4.0 tok/s = linear split ⇒ decode is DDR-bound** | this file §4.1 until 2026-08-16; HTP doc §6 | The inference does not follow. Two processes contending for **one** HTP split compute exactly as linearly as bandwidth, so the test cannot distinguish the two. It remains a valid observation about concurrency; it was never evidence for DDR-boundedness. |
 | 24 | The `hvx_threads` 4-vs-8 question **was tested and showed nothing** (−0.1%) | 08-13 report Test 5; this file §8.9 until 2026-08-16 | Test 5 changed the **runtime** config. `hvx_threads` is baked in at **build time** — the report says so itself and the profiler kept reporting the compiled value. Read back from the binaries: the shipping `gqafix-ladekv` ctx-bin is `numHvxThreads=4` against 8 available HVX units. **The real A/B has never been run** (§8.9). |
 | 25 | Decode runs at **~88% of the 49 GB/s streaming ceiling**, so little headroom remains | MAX_TPS V4 §1 | Apples-to-oranges. The 49–67 GB/s microbenchmark ran under `qnn-net-run`, whose `--perf_profile` flag is a documented no-op, i.e. at the GVM **default** clock — the slowest of four tiers, with a 1.95× swing to `llm_decode_burst`, which is what decode actually uses. The figure is a floor on the burst-clock ceiling, not the ceiling (§1). |
+| 27 | The 2026-08-15 P1 cycle profile failed because **the shipped profiling inputs were pre-fix format** (128-dim KV vs the gqafix graph's 64-dim) | 08-15 report §5 and §0.3; this file §6.8 and `PLAN_0.6B_max_tps.md` A5 until 2026-08-16 | **The inputs are correct.** All 60 files match the gqafix decode graph byte-for-byte (`past_key_0_in [1,8,128,1151]` = 2,357,248 B, file 2,357,248 B; `attention_mask [1,1,1152]` = 2,304 B, file 2,304 B). 128 is `head_dim`, 64 is `rope_dim` — both correct — and gqafix vs pre-fix `ladekv` decode I/O is byte-identical, since `--grouped-gqa` changes attention internals and not the KV contract. Regenerating them is wasted work; the real cause of the P1 failure is **still unknown**, most likely `graph_names` narrowing. |
 | 26 | The SDK's `examples/Genie/.../src/qualla` tree is **the source of the shipped `libGenie.so`** | implicitly, wherever that tree is cited as runtime behaviour | It is not. The device rejects unknown `QnnHtp` config keys, and **no unknown-key validation exists anywhere in that source tree**. A decode-only fallback derived from it failed on device (2026-08-15). The source remains the best available guide to runtime *contracts*, but any claim about what the binary does needs that caveat. |
 
 ---
@@ -735,11 +745,35 @@ reconstructed. Treat two-graph bin sizes as uninformative until this is closed.
 `docs/archive/`). The outstanding asks are in `docs/PLAN_0.6B_max_tps.md` §4;
 §8.11 names the two that decide the direction.*
 
-### 8.1 Where do the ~139 MB go? *(qh, §6.4)*
-The DLC shrinks 151 MB, the ctx-bin only 12.5 MB. Hypothesis: HTP re-materializes
-the INT8 head as 16-bit at prepare time because the surrounding activations are
-FP16. If true, `--quant-head` cannot save DDR on this backend at all, and the
-whole variant is moot. Needs on-device DDR counters or a prepare-time weight dump.
+### 8.1 Where do the ~139 MB go? — **answered from the blob, 2026-08-16**
+
+The old hypothesis — "HTP re-materializes the INT8 head as 16-bit at prepare
+time" — is **wrong**, and it was thought unanswerable because ctx-bin dumps
+expose no weight tensors (`numContextTensors: 0`). But `graphBlobInfo` carries
+`sharedWeightsSize` and `constSize` per graph, and that is enough:
+
+| bin | shared pool | `constSize` (prefill / decode / verify32) |
+|---|---:|---|
+| `ladekv` | 1,067,503,616 | 4,136,448 / 256 / 0 |
+| `qh-ladekv` | **912,904,192** | 0 / **144,408,832** / 0 |
+
+- The shared pool drops **154,599,424 B** against an ideal head saving of
+  155,582,464 (151936 × 1024). **The INT8 head is correctly halved.** It is not
+  re-materialized to 16 bits.
+- Simultaneously the *decode* graph acquires **144,408,832 B** of private
+  constants where it had 256 B. Net new private data =
+  144,408,832 − 4,136,448 − 256 = **140,272,128 B ≈ 140 MB**, which is the
+  "~139 MB" gap (DLC −151.3 MB vs ctx-bin −12.5 MB).
+
+So the question is not a dtype question. It is the same closed-source *layout*
+decision as §6.10's bertcache 444 MB copy: **why does quantising the head push
+~144 MB of constants out of the shared pool and onto decode privately?**
+
+Consequence: the inference "the saving never reaches the device" no longer
+follows, and the pre-committed W8-head decision that rested on it must be
+re-derived. There is weak on-device corroboration too — the two device reports
+give decode's PD footprint as 167 MB (`ladekv`) and 304 MB (`qh-ladekv`) while
+agreeing within 1% on prefill and verify32, and 167 + 144 = 311 ≈ 304 (§8.12).
 
 ### 8.2 What actually changed between v1 (1.52 GB) and v2 (1.09 GB)?
 
@@ -911,6 +945,55 @@ between them. Scoreboard as it stands:
 Prefer both to the W8-head A/B that earlier plans led with: the head changes
 bytes *and* is independently suspected of never reaching the device at all
 (§8.1), so it confounds the very question it was meant to answer.
+
+### 8.12 Device observations nobody followed up (surfaced 2026-08-16)
+
+Sitting unexplained in the four historical reports. None needs hardware to
+pursue; all four are artifact-side.
+
+- **Decode PD footprint disagrees 1.8× between two near-identical bins.** The
+  ladekv report gives decode ~167 MB; the qh report gives 304 MB — while prefill
+  (226 vs 223) and verify32 (185 vs 186.79) agree within a percent. §8.1's
+  144 MB private const block on *decode* is the obvious candidate
+  (167 + 144 = 311 ≈ 304), which would make this on-device corroboration that
+  the 140 MB is real and resident.
+- **A 323 ms first-decode-step** in the fuseqkvgu report against a canonical
+  79–93 ms graph-switch (106 ms and 91 ms in the other two reports). 3.5× the
+  usual, never reconciled — and it matters now that TTFT (103 ms) is a shipped
+  product metric.
+- **The +39 MB RAM delta is the all-position logits buffer, exactly.**
+  171,082,240 − 132,490,496 = **38,591,744** = 127 × 151936 × 2, byte-exact.
+  The v2 report guessed "likely extra buffers/caches"; it is an independent
+  on-device confirmation of the §3.1 root cause that nobody did the arithmetic
+  on. It also means the all-position fix made the runtime allocation *bigger*,
+  so the v1→v2 ctx-bin shrink (§8.2) must have a separate cause.
+- **Prefill-phase step time improved 50.0 → ~42 ms** between v1 and v2 on the
+  same graph and phase, while writing 38.6 MB *more* logits per step. Awkward
+  for any byte-bound reading of prefill; unreconciled.
+
+### 8.13 Qwen3-1.7B: the surviving v1-era exemplar
+
+`work/ctxbin/qwen3-1.7b-w8a16/` still exists (4,097,552,384 B) and its
+`info.json` shows **weight sharing badly broken**: `sharedWeightsSize`
+1,245,650,944 with `constSize` 1,416,626,944 **on each of the two graphs** —
+1.246 + 2 × 1.417 = 4.079 GB, i.e. the whole bin, where a deduped build would be
+~2.66 GB. **~1.42 GB is a redundant private copy.** Its prefill `logits` is
+`[1,1,151936]`, the broken last-token-only head, confirmed from the binary.
+
+This matters beyond 1.7B: it is the **surviving artifact** for open question
+§8.2 (what changed between the v1 1.52 GB and v2 1.09 GB 0.6B bins), whose own
+quant dirs are gone. Same script, same day, un-deduped at scale — and it is the
+counter-example to §6.7's unexplained note that two 2026-08-10 two-graph bins
+deduped *despite* mixing export paths.
+
+Its never-logged build-time DDR (`rebuild-1.7b.log`): decode read
+2,248,755,200, **write 419,840** — *identical* to the 0.6B decode write. Same 28
+layers, 8 KV heads, head_dim 128; the write side is logits + KV-out only and is
+independent of hidden size. An independent cross-model confirmation of §6.9.
+
+`BUILD_GUIDE.md`'s "expect ~3.9 GB and roughly ⅓ of 0.6B tok/s (DDR-bound
+scaling)" is wrong on both halves: the size is a defect, and the scaling model is
+retired by correction #22.
 
 ---
 

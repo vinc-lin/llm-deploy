@@ -371,7 +371,7 @@ MODEL=$LLMDEPLOY_DATA/models/Qwen3-1.7B QUANT_DEVICE=cpu \
     ./scripts/build/full_build.sh qwen3-1.7b-w8a16 128 1024
 ```
 
-Expect ~3.9 GB ctx-bin and roughly ⅓ of 0.6B decode tok/s (DDR-bound scaling).
+⚠ The existing 1.7B bin is 4.10 GB **because weight sharing is broken** (~1.42 GB redundant private copy) and it carries the broken last-token-only prefill head — see REFERENCE §8.13. A correct rebuild should land ~2.7 GB, needs `--grouped-gqa`, and its throughput is unpredicted: the old "⅓ of 0.6B, DDR-bound scaling" estimate is retired by correction #22.
 
 ### 5.6 Graph-shape-only rebuilds (fast path)
 

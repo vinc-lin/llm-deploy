@@ -36,11 +36,11 @@ them is worth doing regardless of how they land.
 
 | # | Action | Why it is first | Cost |
 |---|---|---|---|
-| ~~A1~~ | ✅ **DONE 2026-08-16.** hvx8 and hvx4 ctx-bins built from the same DLCs; `numHvxThreads` reads back 8 and 4 respectively, bins differ by 2.28 MB, DDR bytes byte-identical (§8.9) | The A/B pair exists and is provably differentiated. **Remaining work is to bundle them** — then it is the first arm of the next device session | done |
+| ~~A1~~ | ✅ **DONE 2026-08-16.** hvx8 and hvx4 ctx-bins built from the same DLCs; `numHvxThreads` reads back 8 and 4 respectively, bins differ by 2.28 MB, DDR bytes byte-identical (§8.9) | Bundled and tarred as `qwen3_06b_w8a16_gqafix_ladekv_hvx{4,8}` (884/885 MB). `spillFillBufferSize = 0` on all six graphs, so unlike the old `fuseqkvgu_hvx8` bundle this really is single-variable. Ready to push | done |
 | ~~A2~~ | ✅ **DONE 2026-08-16.** Post-fix decode `read_total_bytes` = **961,130,496**, `write_total_bytes` = **419,840** — *byte-identical to pre-fix* (§6.9) | The GQA fix moved **zero** DDR bytes and won 6.5×. The byte model is refuted by measurement, not inference. `verify32`'s 745 MB spill is also gone | done |
 | **A3** | **`soc_model: 72`** variant | Shipping bins carry `socModel = 0`; the device team's own "verified working" build sets 72. Never A/B'd (§8.4) | ctx-bin regen |
 | **A4** | **Debug `gqafix_hybrid`'s degenerate output** | Blocks the TTFT product win (103 → ~40 ms). Reproducible device-free: drive the bertcache graph's exact I/O with a `parity_ladekv_read.py`-style feed and expect an argmax divergence. Suspects, in order: per-graph input naming, the position-id path under grouped attention, graph selection handing the wrong prefill its mask | half a day |
-| **A5** | **Regenerate `decode_profile_inputs`** against the gqafix decode graph | The 08-15 P1 profile died on pre-fix input format (128-dim KV vs 64-dim). Build-side packaging defect. `gen_decode_profile_inputs.py` ships in the same package | ~1 h |
+| **A5** | **Re-diagnose why the P1 cycle profile did not run** | ⚠ **Not an input-format defect.** All 60 profiling inputs match the gqafix decode graph byte-for-byte (`REFERENCE.md` correction #27), so the recorded reason is wrong and regenerating them is wasted work. The real cause is unknown; start with the `graph_names` narrowing the profiling package warns about | ~1 h |
 | **A6** | **Fusion on the gqafix base** (`gqafix_fuseqkvgu_ladekv`) | The two winning changes have never been combined. **Genuinely uncertain**: fusion's +15% was measured pre-fix, and if it was dispatch-overhead recovery the GQA fix may already have collected it — the same reasoning that killed LADE | one build |
 | **A7** | **Byte-accounting gate** — record `read_total_bytes` / `write_total_bytes` per graph for every variant and check against prediction | A variant whose bytes did not move did not do what it claims. Device-free analogue of the `Unknown Key` rule | free, add to build scripts |
 
@@ -76,7 +76,7 @@ every delta is computed against it.
 |---|---|---|
 | — | **Pull `/data/local/tmp/results/` off the device** | `/data` runs 98–99% full; the per-op record is one cleanup away from gone. Do this **first** |
 | **1** | **hvx8 vs hvx4**, same lineage | The regime question (§2). Everything else re-ranks on the answer |
-| 2 | P1 cycle profile with A5's regenerated inputs | Confirms ~90M cycles / zero replication ops, and decomposes 22.37 ms into compute vs streaming — the input every future plan needs |
+| 2 | P1 cycle profile — inputs are **already correct** (A5) | Confirms ~90M cycles / zero replication ops, and decomposes 22.37 ms into compute vs streaming — the input every future plan needs |
 | 3 | `soc_model: 72` | Free knob, never tested |
 | 4 | Fusion on gqafix (A6) | Does fusion survive the fix? |
 | 5 | W8 head, basic mode | The byte lever, now that basic mode removes the acceptance confound |
@@ -95,7 +95,7 @@ arms.
 | hvx8 +5…20% | Partially compute-bound. Ship it; re-derive from priority 2's cycle profile |
 | hvx8 < +5% | Compute model is wrong despite its out-of-sample hit. Priority 2 becomes the only admissible next input; revisit byte levers with A2's real number |
 | fusion flat | Retire fusion as a lever — it was pre-fix dispatch recovery, already collected |
-| W8 head < +5% | The 139 MB never reaches the device (§8.1 confirmed). Park it next to W4A16 |
+| W8 head < +5% | ⚠ Do **not** conclude "the saving never reaches the device" — §8.1 now shows the head *is* halved in the shared pool and ~144 MB simply moved to a private const block on decode. A null result means the byte saving is real but does not convert, which is evidence about the *regime*, not about the head |
 | any arm's spread > its delta | Undecided. Re-run under B0; do not interpret |
 
 ## 5. What we explicitly do not do
