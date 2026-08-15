@@ -28,6 +28,7 @@ guarantees a pool of usable, decodable, correctly-licensed photographs.
   $PY_DEPLOY scripts/pipeline/fetch_test_images.py --out work/kit-candidates
 """
 import argparse
+import hashlib
 import json
 import socket
 import sys
@@ -190,9 +191,14 @@ def main():
                 print(f"    = {hit['title'][:50]}: already kept for another scene")
                 continue
             seen.add(hit["title"])
-            name = f"{scene}_{Path(hit['title']).stem[:40]}".replace(" ", "_")
-            name = "".join(c for c in name if c.isalnum() or c in "_-")
-            dst = out / f"{name}.img"
+            # The title is truncated for readability, so two DIFFERENT files
+            # can sanitise to the same name and silently overwrite each other
+            # -- which inflates the "kept" count while shrinking the pool.
+            # A short digest of the full title makes the name unique.
+            stem = f"{scene}_{Path(hit['title']).stem[:36]}".replace(" ", "_")
+            stem = "".join(c for c in stem if c.isalnum() or c in "_-")
+            tag = hashlib.sha1(hit["title"].encode()).hexdigest()[:6]
+            dst = out / f"{stem}_{tag}.img"
             try:
                 blob = _get(hit["url"])
             except Exception as exc:                              # noqa: BLE001
@@ -242,6 +248,9 @@ def main():
 
     (out / "candidates.json").write_text(json.dumps(manifest, indent=2) + "\n")
     scenes = sorted({m["scene"] for m in manifest})
+    # Count FILES, not manifest rows: an overcount here reads as a healthy
+    # pool while the captioning pass sees far fewer distinct images.
+    kept = len({m["file"] for m in manifest})
     print(f"\nkept {kept} usable image(s) covering {scenes}")
     print(f"manifest: {out / 'candidates.json'}")
     if kept < args.min_usable:
