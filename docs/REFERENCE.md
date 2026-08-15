@@ -646,11 +646,28 @@ reconstructed. Treat two-graph bin sizes as uninformative until this is closed.
 team for run-now measurements covering §8.3, §8.8, §8.9, and the op-level
 decode profile (where the ~155 ms/step actually goes).*
 
-### 8.1 Where do the ~139 MB go? *(qh, §6.4)*
+### 8.1 Where do the ~139 MB go? *(qh, §6.4)* — **independently reproduced 2026-08-16**
 The DLC shrinks 151 MB, the ctx-bin only 12.5 MB. Hypothesis: HTP re-materializes
 the INT8 head as 16-bit at prepare time because the surrounding activations are
 FP16. If true, `--quant-head` cannot save DDR on this backend at all, and the
 whole variant is moot. Needs on-device DDR counters or a prepare-time weight dump.
+
+**Reproduced on a second, independent build** (`gqafix_qh_ladekv`, 3-graph
+past-KV topology, 2026-08-16 — a different topology from the 08-12 build):
+
+| | 2026-08-12 `qh_ladekv` | 2026-08-16 `gqafix_qh_ladekv` |
+|---|---:|---:|
+| DLC | −151.3 MB | −151.3 MB per graph |
+| converter decode `read_total_bytes` | not recorded | 961,130,496 → **815,028,224** (−146.1 MB) |
+| **ctx-bin** | **−12.5 MB** | **−8.4 MB** (1,086,570,496 → 1,078,185,984) |
+
+So the effect is not an artifact of the 08-12 build. The head is verifiably
+`sFxp_8` in all three DLCs, the converter's DDR model credits the full saving,
+and the shipped context blob still does not shrink. **Treat "the qh arm measures
+≈0% on device" as the leading hypothesis, not the null result** — and note the
+converter's `read_total_bytes` is a graph-level estimate that evidently does not
+describe what the prepared context streams. See `docs/VARIANT_PREDICTIONS.md`
+§2b.
 
 ### 8.2 What actually changed between v1 (1.52 GB) and v2 (1.09 GB)?
 A ~430 MB shrink is far too large for the all-position-logits fix, which should
@@ -829,6 +846,9 @@ cross-variant `load_encodings`).
 | **`docs/MAX_TPS_QWEN3_0.6B_V4.md`** | **current — the 0.6B speed plan** | rev 2, 2026-08-16. The blend correction (§1), the byte-vs-compute degeneracy (§2), and the device session. **Start here.** Supersedes V3 §3–§7 and retires V3 §7 item 4 |
 | `docs/DEVICE_MEASUREMENT_REPORT_2026-08-15.md` | current device truth | the GQA-fix result: 44.707 tok/s basic, 6.54× over the pre-fix control, LADE parked |
 | `docs/NOTES-htp-kernel-table.md` | current, SDK-cited | every MatMul/FC dtype combination v81 supports. Read before any quantization-dtype decision — it answers KV INT8 and retro-explains the ViT V-path failure |
+| `docs/VARIANT_PREDICTIONS.md` | current | the A2 gate: per-variant byte and cycle predictions, which knobs verifiably reached the artifact, and §2b's reproduction of §8.1 |
+| `docs/DROP_README_2026-08-16-regime.md` · `kit-v2/` | current | the 2026-08-16 drop and its session kit. **Supersedes `kit/`**, whose priorities 4–5 point at blended bundles |
+| `docs/DEVICE_TEAM_EXCHANGE_2026-08-16.md` | current | the blend correction sent to the device team, the P1 retraction, and the three artifacts still outstanding |
 | `docs/MAX_TPS_QWEN3_0.6B_V3.md` | **superseded by V4** for §3–§7 | §0 (the inversion principle) and its build discipline still current. Its §10b execution log is the record of the gqafix build |
 | `docs/MAX_TPS_QWEN3_0.6B_V2.md` | current for §0–§2 only | measured baselines, revised performance model, ctx-bin forensics |
 | `docs/MAX_TPS_QWEN3_0.6B.md` (V1) | **superseded** | the original 10.8 tok/s recipe. Its headline predates the 2026-08-13 measurement that showed basic AR-1 at 11.72 on the same device. Historical. |
