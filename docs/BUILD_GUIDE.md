@@ -373,8 +373,28 @@ chain (not the §5.6 fast path):
   `--keep-head-weight` (the build scripts forward it automatically) — without it
   `filter_aimet_w8a16.py` strips the encoding and the converter silently emits
   `Float_16`, producing a build byte-identical to a non-qh one. Verify, don't
-  assume: `qairt-dlc-info -i prefill.dlc | grep lm_head.weight` must show
-  `sFxp_8`, not `Float_16`.
+  assume — but **use this exact command** (2026-08-16):
+
+  ```bash
+  qairt-dlc-info -i prefill.dlc \
+      | grep -oP 'lm_head\.weight \(data type: \K[A-Za-z_0-9]+'   # -> sFxp_8
+  ```
+
+  ⚠️ **The obvious `grep lm_head.weight` gives the wrong answer.** It reports
+  `Float_16` on a build whose head is correctly `sFxp_8`, for two compounding
+  reasons: `.` is a regex wildcard, and the op-table row for the `lm_head`
+  `FullyConnected` lists its **activation** input (`Float_16`) before the weight
+  tensor, so `grep -m1` matches the activation. This produced a false FAIL on a
+  correct build, which is the same class of error as the trap the check exists
+  to catch — just inverted. The size check is a useful cross-reference: a real
+  W8 head shrinks each 0.6B DLC from ~1,074 MB to ~923 MB.
+
+  **Note the head can also arrive without the flag.** `lade_build.sh` and
+  `ladekv_build.sh` do not re-run the filter — they pass an already-filtered
+  encodings file to `--quantization_overrides`. So exporting the verify/past-KV
+  graphs against a **qh prefill quant dir** yields `sFxp_8` in those graphs even
+  though the export log lists `lm_head.params` among its disabled quantizers.
+  Confirmed on all three graphs of `gqafix_qh_ladekv`, 2026-08-16.
 
   What it actually buys, measured (2026-08-12):
 

@@ -352,7 +352,7 @@ shipping anything.
 | DLC shape | `qairt-dlc-info -i prefill.dlc \| grep logits` | `1,128,151936` — never `1,1,…` |
 | **Graph names** | `qnn-context-binary-utility --json_file` → `graphName` | exactly matches both HTP configs (§3.3) |
 | **Decode topology** | `lint_bundle_topology.py <ctxbin>` | `pure` for anything whose tok/s will be compared against another bundle; `BLENDED` bins carry an AR==CL graph and report a two-phase rate (§6.9) |
-| Quantized head | `qairt-dlc-info \| grep lm_head.weight` | `sFxp_8` with `--quant-head`, else `Float_16` |
+| Quantized head | `qairt-dlc-info -i <dlc> \| grep -oP 'lm_head\.weight \(data type: \K[A-Za-z_0-9]+'` | `sFxp_8` with `--quant-head`, else `Float_16`. ⚠️ a plain `grep lm_head.weight` reports the **activation** dtype and false-FAILs a correct build — `BUILD_GUIDE.md` §5.7 |
 | Ctx-bin | `qnn-context-binary-utility --json_file` | all graphs listed, logits dims per §3.1, ~1.09 GB for 0.6B |
 | **ViT fixed-point I/O** | `vit_build_quant.sh` step 3 (fails the build itself) | `pixel_values` + all 4 outputs `QNN_DATATYPE_UFIXED_POINT_16`, scale/offset byte-equal to `model.encodings`, one graph named `vit`, O=3 / vtcm 16 / 4 HVX read back out of the binary |
 | **ViT quant numerics** | `parity_vit_quant.py` | min cos ≥ 0.99 on all four outputs (measured 0.9975 / 0.9998 / 0.9986 / 0.9977) |
