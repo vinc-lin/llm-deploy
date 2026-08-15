@@ -93,6 +93,43 @@ part.
 alter layout. It proves only that nothing observable offline changed, which is
 enough to rank `dlbc` and `wpack` last.
 
+### 2b. ⚠️ The qh ctx-bin independently reproduces `REFERENCE.md` §8.1
+
+| Build | ctx-bin bytes | Δ vs control | spill |
+|---|---:|---:|---:|
+| `ctrl` | 1,086,570,496 | — | 0 |
+| `qh_ladekv` | 1,078,185,984 | **−8,384,512** | 0 |
+| `cl512_ladekv` | 1,084,981,248 | −1,589,248 | 0 |
+
+**The qh DLCs are ~151 MB smaller each, and the converter's decode
+`read_total_bytes` drops 146,102,272 — but the shipped ctx-bin shrinks only
+8.4 MB.** That is the same signature the 2026-08-12 qh build showed (DLC
+−151.3 MB, ctx-bin −12.5 MB, `REFERENCE.md` §6.4/§8.1), now reproduced on an
+independent build with a different topology.
+
+The hypothesis it supports is that **HTP re-materializes the INT8 head to 16
+bits when preparing the context blob**, because the `FullyConnected`'s input and
+output are both `Float_16`. If so, the converter's DDR estimate — a graph-level
+model — does not describe what the device streams, and the qh arm's real device
+result is **~0%, not +17.9%**.
+
+This gives the qh arm a **third** prediction, and it sharpens the experiment
+rather than muddying it:
+
+| qh device result | Reading |
+|---|---|
+| ≈ +18% | converter accounting is right, byte-bound, §8.1 refuted |
+| ≈ +4% | compute-bound |
+| **≈ 0%** | **§8.1 confirmed — the saving never reaches the device**, and the byte model is untestable on this arm. `cl512` then carries the whole discrimination |
+
+Either way it is not a wasted build. But it is a reason to weight `cl512` — whose
+saving is activation traffic and cannot be re-materialized away — as the more
+trustworthy half of the pair.
+
+Weight sharing is healthy on both new bins (~1.08 GB, not the ~1.5 GB an
+unshared build produces) and spill is 0 across all graphs, so neither carries
+the bertcache weight-dup of V3 §10b.
+
 ## 3. Compute side — predicted
 
 Cycle shares renormalized over the 88,225,159 residual: attention GEMV 44.6%,
