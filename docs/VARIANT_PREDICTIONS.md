@@ -70,8 +70,15 @@ times). The only offline signal is whether the built artifact changed.
 | `ctrl` | 1,086,570,496 | — | — |
 | **`hvx8`** | 1,088,847,872 | **+2,277,376** | ✅ **yes** |
 | **`udma`** | 1,086,783,488 | **+212,992** | ✅ **yes** |
+| **`socmodel72`** | 1,086,820,352 | **+249,856** | ✅ **yes** |
 | `dlbc` | 1,086,570,496 | 0 | ⚠️ identical — unproven |
 | `wpack` | 1,086,570,496 | 0 | ⚠️ identical — unproven |
+
+`socmodel72` sets `soc_model` **and** `soc_id` to 72 in the `devices` block —
+`REFERENCE.md` §8.4's never-run A/B, which the device team's own verified config
+(HTP doc §8.4) sets and ours left at the generic 0. It changes the artifact, so
+whatever extra O=3 algorithms Qualcomm document behind naming the SoC are being
+selected. `ctxbin_variant.sh` needed a `__devices` override key to build it.
 
 `hvx_threads` was known inert at **runtime** (08-13 Test 5) and is documented
 build-time-only. **This is the first evidence the build-time value is actually
