@@ -286,6 +286,11 @@ def main():
                          "(saves ~155MB/token of decode DDR stream)")
     ap.add_argument("--fuse-gate-up", action="store_true")
     ap.add_argument("--fuse-qkv", action="store_true")
+    ap.add_argument("--grouped-gqa", action="store_true",
+                    help="batch the attention MatMuls over the 8 KV heads instead of "
+                         "materialising 16 replicated ones. Removes the 56 Expand+Reshape "
+                         "pairs that cost 74.7%% of decode DSP cycles (device profile "
+                         "2026-08-13). Numerically equivalent; KV I/O shapes unchanged.")
     # aimet-torch 2.36 SHIPS the exact config the summary doc names — use it directly
     ap.add_argument("--config", default=str(
         Path(torch.__file__).parent.parent / "aimet_torch/common/quantsim_config/htp_quantsim_config_v81_per_channel_linear.json"))
@@ -395,7 +400,8 @@ def main():
                 hf, args.fuse_gate_up, args.fuse_qkv, use_past=use_past,
                 logits_last_only=False, n_deepstack=args.n_deepstack)
         return ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
-                                   use_past=use_past, logits_last_only=False)
+                                   use_past=use_past, logits_last_only=False,
+                                   grouped_gqa=args.grouped_gqa)
 
     def head_dummies(ar):
         """The graph inputs that bracket mask/cos/sin: the token-or-embedding

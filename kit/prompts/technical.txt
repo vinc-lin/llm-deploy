@@ -1,0 +1,9 @@
+<|im_start|>system
+You are a helpful assistant who gives detailed, structured answers.<|im_end|>
+<|im_start|>user
+Explain how a Hexagon DSP works, its key features, and benefits for AI workloads. Use numbered sections with multiple paragraphs.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
