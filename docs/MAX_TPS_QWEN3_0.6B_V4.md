@@ -178,8 +178,8 @@ measured delta against a re-baselined control (B0).
 
 | Arm | Byte model | Compute model | Discriminates? |
 |---|---:|---:|---|
-| **W8 `lm_head`** (−155.6 MB = −16.2% bytes; 6.9% of cycles) | 805.5 MB → 18.75 ms → **+19.3%** | halve `lm_head` → −3.5% cycles → **+3.6%**, or **0%** if `REFERENCE.md` §8.1 holds and the head is re-materialized to FP16 at prepare time | ✅ **strongly** |
-| **`cl512`** = `context.size` 512, ctx-bin **CL=640**, past 639 (−58.7 MB KV; GEMV+softmax scale with CL) | 902.4 MB → **+6.5%** | 88.2M → 70.0M cycles (−20.6%) → **+26.0%** | ✅ **strongly, and in the opposite direction** |
+| **W8 `lm_head`** (measured −146.1 MB; 6.9% of cycles) | 815.0 MB → **+17.9%** | halve `lm_head` → −3.5% cycles → **+3.6%**, or **0%** if `REFERENCE.md` §8.1 holds and the head is re-materialized to FP16 at prepare time | ✅ **strongly** |
+| **`cl512`** = `context.size` 512, ctx-bin **CL=640**, past 639 (measured −88.1 MB) | 873.0 MB → **+10.1%** | 88.2M → 70.0M cycles (−20.6%) → **+26.0%** | ✅ **strongly, and in the opposite direction** |
 | **`hvx_threads: 8`** at build time | zero bytes change → **0.0%** | up to +100% if the build-time 4 is binding; sub-linear in practice | ✅ **null test** |
 | QKV + Gate-Up fusion | −80 MB measured by the device team (880 vs 960) → **+9.1%** | ~10% of cycles (V2 §1.3) → **+11%** | ❌ — ship candidate, not evidence |
 | KV signed-INT8 | −66.0 MB → **+7.4%** | GEMV byte-side only; small | weakly — but the kernel is confirmed to exist (A1.3), so it is now a build, not a question |
@@ -538,10 +538,39 @@ Three findings:
 `dlbc` and `wpack` produce byte-identical binaries. That does not prove a no-op
 — some keys are runtime hints — but it ranks them last.
 
-Still to build in A3a: `socmodel72` (`ctxbin_variant.sh` gained a `__devices`
-override for it; `soc_model` was hardcoded to 0) and `sparse`, which is deferred
-because `finalize_config` is an undocumented free-form dict and a wrong shape is
-silently ignored — the exact failure class this repo has hit three times.
+**`socmodel72` built afterwards: 1,086,820,352 B, +249,856 vs control —
+consumed.** `ctxbin_variant.sh` needed a `__devices` override key for it, since
+`soc_model` was hardcoded to 0. So three of six knobs demonstrably reach the
+artifact and two do not.
+
+`sparse` remains deferred: `finalize_config` is an undocumented free-form dict,
+a wrong shape is silently ignored — the exact failure class this repo has hit
+three times — and `REFERENCE.md` §4.1 already measures
+`sparse_weights_compression` at **0 bytes saved**. Not worth guessing a schema
+for a lever with a measured-zero prior.
+
+### A3.7 — built and verified
+
+| | |
+|---|---|
+| ctx-bin | 3 graphs (`prefill`/`decode`/`verify32`), 60 in / 57 out each, 1.1 GB |
+| Parity | **6/6**, including both chunked prompts (n=129, n=200) |
+| Head dtype | **`sFxp_8` on all three graphs**, against a `Float_16` baseline |
+| decode `read_total_bytes` | 961,130,496 → **815,028,224** (−146,102,272) |
+
+The byte gate passes but the saving is **94% of the 155,582,464 ideal**, not
+100%; ~9.5 MB is unexplained (per-channel scales account for only ~0.6 MB). So
+this arm's byte-model prediction is **+17.9%** from measured accounting rather
+than the +19.3% derived from the ideal. `REFERENCE.md` §8.1's question — whether
+any of it survives to the device — remains exactly as open.
+
+**A caution recorded in `BUILD_GUIDE.md` §5.7:** the documented verification
+`grep lm_head.weight` **false-FAILs a correct build**. `.` is a regex wildcard
+and the op-table row lists the `lm_head` op's *activation* input (`Float_16`)
+before the weight tensor, so `grep -m1` reports the wrong dtype. Use
+`grep -oP 'lm_head\.weight \(data type: \K[A-Za-z_0-9]+'`. I hit this false
+negative before reading the raw output — the same class of error as the trap the
+check exists to catch, inverted.
 
 ### A3.7 — `gqafix_qh_ladekv` is much cheaper than rev 1 assumed
 

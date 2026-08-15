@@ -96,7 +96,7 @@ run_arm p0_rebaseline    qwen3_06b_w8a16_gqafix_ladekv        genie_dialog_basic
 
 log ""
 log "=== P4 -- THE PAIR THAT DECIDES THE PLAN. Run BOTH; the verdict is in the ordering. ==="
-log "    byte model: qh +19.3% / cl512 +6.5%   compute model: qh +3.6% / cl512 +26.0%"
+log "    byte model: qh +17.9% / cl512 +10.1%  compute model: qh +3.6% / cl512 +26.0%"
 run_arm p4_qh_ladekv     qwen3_06b_w8a16_gqafix_qh_ladekv     genie_dialog_basic.json "$P_TECH" pure
 run_arm p4_cl512_ladekv  qwen3_06b_w8a16_gqafix_cl512_ladekv  genie_dialog_basic.json "$P_TECH" pure
 

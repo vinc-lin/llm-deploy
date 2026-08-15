@@ -132,8 +132,8 @@ orderings** for two cheap arms, which is what kit v2's priority 4 exploits:
 
 | Arm | byte model | compute model |
 |---|---:|---:|
-| W8 `lm_head` | **+19.3%** | +3.6% |
-| CL=512 | +8.3% | **+34.7%** |
+| W8 `lm_head` | **+17.9%** | +3.6% |
+| `cl512` (`context.size` 512) | +10.1% | **+26.0%** |
 
 Plus a free falsification test: `hvx_threads: 8` changes **zero DDR bytes** by
 construction, so the byte model predicts exactly 0.0%. (We confirmed the

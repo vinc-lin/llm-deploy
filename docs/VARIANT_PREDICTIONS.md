@@ -118,37 +118,43 @@ priority 1 of the device session and why both must be run.
 To be checked against each build's own DDR summary when it lands — a variant
 whose bytes did not move did not do what it claims.
 
-| Variant | `context.size` | ctx-bin CL | decode past | Predicted decode `read_total_bytes` | Δ | byte % | cycle % |
+**M** = measured from the build's own DDR summary. **e** = estimated (see the
+calibration note below).
+
+| Variant | `context.size` | ctx-bin CL | decode past | decode `read_total_bytes` | Δ | byte % | cycle % |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| baseline | 1024 | 1152 | 1151 | 961,130,496 | — | — | — |
-| **W8 head** | 1024 | 1152 | 1151 | **805,548,032** | −155,582,464 | **+19.3%** | +3.6% |
-| `cl768` | 768 | 896 | 895 | 931,770,368 | −29,360,128 | +3.2% | +11.5% |
-| **`cl512`** | 512 | **640** | **639** | **902,410,240** | −58,720,256 | +6.5% | **+26.0%** |
-| `cl384` | 384 | 512 | 511 | 887,730,176 | −73,400,320 | +8.3% | +34.8% |
-| `cl256` | 256 | 384 | 383 | 873,050,112 | −88,080,384 | +10.1% | +44.9% |
-| KV signed-INT8 @ CL=1152 | 1024 | 1152 | 1151 | 895,127,552 | −66,002,944 | +7.4% | small |
-| W8 head + KV INT8 | 1024 | 1152 | 1151 | 739,545,088 | −221,585,408 | +29.9% | +3.6% |
+| baseline | 1024 | 1152 | 1151 | **961,130,496** ᴹ | — | — | — |
+| **W8 head** | 1024 | 1152 | 1151 | **815,028,224** ᴹ | −146,102,272 | **+17.9%** | +3.6% |
+| `cl768` | 768 | 896 | 895 | 917,090,304 ᵉ | −44,040,192 | +4.8% | +11.5% |
+| **`cl512`** | 512 | **640** | **639** | **873,048,064** ᴹ | −88,082,432 | **+10.1%** | **+26.0%** |
+| `cl384` | 384 | 512 | 511 | 851,030,016 ᵉ | −110,100,480 | +12.9% | +34.8% |
+| `cl256` | 256 | 384 | 383 | 829,009,920 ᵉ | −132,120,576 | +15.9% | +44.9% |
+| KV signed-INT8 @ CL=1152 | 1024 | 1152 | 1151 | 895,127,552 ᵉ | −66,002,944 | +7.4% | small |
 
-> ### ⚠️ A naming trap this table exists to close
+> ### ⚠️ Two things this table corrects, one of them my own over-correction
 >
-> **"cl512" means `context.size = 512`, so the ctx-bin CL is 512 + 128 = 640 and
-> the decode graph's past dim is 639** — verified against the built
-> `gqafix_cl512` bin, whose decode graph is `AR=1 CL=640`.
+> **1. The geometry.** "cl512" means `context.size = 512`, so the ctx-bin CL is
+> 512 + 128 = **640** and the decode past dim is **639** — verified against the
+> built bin, whose decode graph is `AR=1 CL=640`. V3 §3-3.3's *"CL=512: KV read
+> 132 → 59 MB"* uses past = 511, which is `cl384` geometry, so that figure is
+> mis-derived.
 >
-> Three documents inherited the wrong geometry before this was checked:
-> V3 §3-3.3's *"CL=512: KV read 132 → 59 MB"* is the **`cl384`** row; V4 rev 1's
-> A2 entry *"CL=512 (known from V3) = 873,048,064"* is the **`cl256`** row; and
-> V4 rev 2's original **+8.3% / +34.7%** is also `cl384`. All corrected here.
+> **2. But V4 rev 1's `873,048,064` was RIGHT, and my re-attribution of it to
+> `cl256` was wrong.** It is the genuine measured `read_total_bytes` of the
+> cl512 decode graph, confirmed twice on 2026-08-16 (the lade intermediate and
+> the ladekv bin both report it). Its Δ of **−88,082,432** is exact. What was
+> wrong was *my* arithmetic: a KV-only model predicts −58,720,256 and
+> **under-predicts the real saving by a factor of 1.50**.
 >
-> The discriminator is unaffected in kind — `cl512` is still **+6.5% byte vs
-> +26.0% compute**, a 4× gap in the opposite direction to the W8 head — but the
-> numbers changed, and this is exactly the class of inherited error the A2 gate
-> exists to catch. `cl384` would be a marginally sharper discriminator; `cl512`
-> is built instead because it is the product-meaningful context size.
-
-*KV read = 2 × 28 layers × 8 heads × 128 dim × past × 2 B. These count only the
-KV term; mask and activation terms also shrink with CL, so **record the
-converter's own `read_total_bytes`** rather than asserting the prediction.*
+> **Calibration.** The measured ratio is 88,082,432 / 58,720,256 = **1.50003** —
+> clean enough to use. It is consistent with the concatenated **K** tensor being
+> re-read after the `Concat`: past K+V is 1.0×, and re-reading the concatenated K
+> alone adds 0.5×. The `ᵉ` rows apply that 1.50 factor to their KV term; they are
+> calibrated on one measured point, so **record the converter's own figure when
+> each is built** rather than trusting them.
+>
+> The discriminator is unaffected in kind: `cl512` is **+10.1% byte vs +26.0%
+> compute**, still the opposite ordering to the W8 head's **+17.9% / +3.6%**.
 
 ## 5. How to add a row
 
