@@ -21,7 +21,7 @@ each attempt a seconds-scale iteration instead of a multi-minute one.
 | Run | Input file | Size (bytes) | Question it answers |
 |---|---|---|---|
 | **1** | `sample_image.raw` | 3,145,728 (exact) | Does a *correctly sized* blob crash at all? |
-| **2** | `sample_pad.raw` (Run 1 blob + 4 KB zeros) | 3,149,824 | Is the overrun on the **source** (padding fixes it) or the **destination** (padding changes nothing)? |
+| **2** | `sample_pad.raw` (Run 1 blob + 4 KB zeros) | 3,149,824 | **Expected to fix it.** §1.2b resolves the mechanism off-device: a one-byte over-read into Scudo's guard page, on a heap buffer sized from *your* `fileSize`. Padding moves the guard page |
 | every crash | — | — | Pull the tombstone. Frame `#00`'s raw pc offset is the single most valuable byte of data on this bug. |
 
 Then report per §7. Decision tree in §6.
@@ -64,6 +64,56 @@ decode-only fallback we shipped was derived from that source — that failure is
 on us; the fallback is being removed from the bundle). So treat §1.1 as the
 *bug class*, not gospel: the shipped copy loop may differ by exactly the
 off-by-one this experiment is hunting.
+
+### 1.2b What the binary actually does (resolved off-device, 2026-08-16)
+
+We walked the vtable graph in the byte-identical `libGenie.so` through its RELA
+relocations and disassembled the real callee. Three findings change the picture:
+
+**1. The buffer is not a DMA buffer — it is an ordinary heap allocation, sized
+by the caller.** `genie::pipeline::ImageEncoder`'s vtable slot `+0x90` resolves
+to `0x3ef514`, and that function does:
+
+```
++436   tbnz  x20, #0x3f, ...      ; reject negative size
++440   mov   x0, x20              ; x20 = the size YOU passed
++444   bl    operator new         ; allocate exactly that many bytes
++448   mov   x1, x21              ; your data pointer
++452   mov   x2, x20
++460   bl    memcpy               ; copy exactly that many bytes
++512   add   x20, x22, x20        ; end = begin + size
++540   stp   x22, x20, [x23,#0x28] ; std::vector {begin, end, cap}
+```
+
+It null-checks your pointer and zero-checks your size first. So the node makes
+its **own** `std::vector` of exactly `fileSize` bytes. The graph-derived length
+is applied later, downstream, against *that* vector.
+
+**2. The graph demands exactly the size we ship.** The ViT ctx-bin declares
+`pixel_values [1024,1536] UFIXED_POINT_16` = 1,572,864 × 2 = **3,145,728 bytes
+= 0x300000**, and all seven shipped `.raw` blobs are exactly 3,145,728 bytes.
+So the downstream copy is *exactly* in bounds — its last byte is
+`base + 0x2FFFFF`.
+
+**3. `SEGV_ACCERR` at exactly `base + 0x300000` is a guard-page signature.**
+`SEGV_ACCERR` is a *permission* fault, not a missing mapping (`SEGV_MAPERR`).
+Android's Scudo allocator services a 3 MB request from its secondary allocator,
+which maps the region page-aligned with a **PROT_NONE guard page immediately
+after** — and 3,145,728 is exactly 768 pages, so the guard begins at precisely
+`base + 0x300000`. A read of one byte past the end lands on it and raises
+exactly the fault you saw, at exactly the address you saw.
+
+**Conclusion: this is an off-by-one over-read of the source buffer (H-src),
+not a DMA/destination problem.** Something forms and dereferences the
+end pointer — a `<=` where `<` was meant, or a length of `bufferSize + 1`.
+
+**And that makes padding a real fix, not just a probe.** Because the allocation
+is sized from *your* `fileSize`, adding bytes to the file enlarges the heap
+allocation and pushes the guard page beyond the over-read, while the graph still
+consumes only the first 0x300000 bytes. The padding never reaches the tensor.
+
+Run 2 below is therefore expected to **succeed**. If it does, padded blobs are a
+legitimate shipping workaround and we re-cut the bundle the same day.
 
 ### 1.3 `GenieNode_setData+572` is a call site, not the faulting access
 
