@@ -190,13 +190,21 @@ the 2-graph layout is non-deterministic and that matters more.
 
 ### P3 — Prompt distribution on the baseline
 
-| Arm | Bundle | Prompt | Topology |
-|---|---|---|---|
-| `p3_basic_simple` | `qwen3_06b_w8a16_gqafix_ladekv` | `prompts/simple.txt` | pure |
-| `p3_basic_structured` | `qwen3_06b_w8a16_gqafix_ladekv` | `prompts/structured.txt` | pure |
+| Arm | Bundle | Prompt | Generated tokens | Topology |
+|---|---|---|---|---|
+| `p3_basic_structured` | `qwen3_06b_w8a16_gqafix_ladekv` | `prompts/structured.txt` | ~150–250 | pure |
+| `p3_basic_simple` | `qwen3_06b_w8a16_gqafix_ladekv` | `prompts/simple.txt` | **~10–30 ⚠️** | pure |
 
 44.707 is one prompt. The record needs the distribution before it is quoted as
 "the" number.
+
+> ⚠️ **`simple` generates too few tokens for a trustworthy rate.** Its reference
+> continuation is one sentence, so the run is dominated by prefill and
+> first-token latency and its tok/s is **indicative only** — do not average it
+> with the others or quote it as a decode rate. It is included because its TTFT
+> and prompt-rate numbers are still useful, and because it is the prompt class on
+> which LADE historically won. `structured` is the one that carries the
+> distribution claim.
 
 ---
 
