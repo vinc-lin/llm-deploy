@@ -118,21 +118,46 @@ ship is a nuisance; a bundle that returns a confidently wrong number is a hazard
 
 ## 2. The two performance models are degenerate at this operating point
 
-### 2.1 Corrected regime table
+### 2.1 Corrected regime table — **the GQA fix moved ZERO DDR bytes**
 
-Using the *corrected* pre-fix step time throughout. Pre-fix bytes = 961 MB base
-+ 264 MB replication write + 264 MB replication re-read (V2 §1.2).
+*Rewritten 2026-08-16 after measuring the post-fix byte count, which nobody had
+ever recorded. It refutes the first draft of this section.*
+
+Both figures below are read out of the converter's own DDR summary — the pre-fix
+decode-only bin's `ctxbin.log`, and today's `gqafix` control build:
+
+```
+pre-fix  decode graph:  read_total_bytes = 961,130,496   write_total_bytes = 419,840
+post-fix decode graph:  read_total_bytes = 961,130,496   write_total_bytes = 419,840
+                                           ^^^^^^^^^^^ byte-for-byte identical
+```
+
+**The 56 replication ops never appear in the DDR accounting at all.** V2 §1.2
+modelled them as 264 MB written + 264 MB re-read per step; the converter says
+the decode graph writes **419,840 bytes**, full stop. The replicated KV was
+VTCM-resident and never reached DDR.
 
 | | step | bytes/step | effective BW | DSP cycles | aggregate cycle rate |
 |---|---:|---:|---:|---:|---:|
-| pre-fix AR-1 (08-15 P3) | 146.3 ms | ~1,489 MB | **10.2 GB/s** | 350,302,972 (measured) | 2.39 Mcyc/ms |
-| post-fix AR-1 (08-15 P2) | 22.37 ms | 961,130,496 | **43.0 GB/s** | 88.2M (predicted) | 3.94 Mcyc/ms |
+| pre-fix AR-1 (08-15 P3) | 146.3 ms | **961,130,496** | **6.6 GB/s** | 350,302,972 (measured) | 2.39 Mcyc/ms |
+| post-fix AR-1 (08-15 P2) | 22.37 ms | **961,130,496** | **43.0 GB/s** | 88.2M (predicted) | 3.94 Mcyc/ms |
 
-Revision 1 and the 08-15 report's own §0.2 annotation both put the pre-fix rate at
-~17.5 GB/s. That used `local`'s blended 85.3 ms with `ladekv`'s byte count — two
-different arms. **The corrected 10.2 GB/s is consistent with `REFERENCE.md` §1's
-independently established ~6–7 GB/s effective decode bandwidth** instead of
-contradicting it, which is the first sign the correction is the right one.
+Two consequences, and the first is fatal to something this plan asserted:
+
+1. **The byte model cannot explain the GQA fix.** Identical bytes, 6.54× the
+   throughput. A purely byte-bound step would have taken the same time. Whatever
+   bound the *pre-fix* regime, it was not DDR traffic — the pre-fix step was
+   **compute-bound**, and the 74.7%-of-cycles finding is the whole story.
+2. **6.6 GB/s lands exactly on `REFERENCE.md` §1's independently established
+   ~6–7 GB/s** effective decode bandwidth. The earlier drafts' 17.5 and 10.2
+   GB/s were both artifacts — of a blended step time and of V2's phantom 528 MB
+   respectively.
+
+⚠️ **This weakens, but does not kill, the byte model for the *post-fix* point.**
+43.0 GB/s is 88% of the 49 GB/s streaming ceiling, so DDR could plausibly bind
+*now* even though it demonstrably did not before. That is a genuine regime flip,
+not a contradiction. But the prior has moved substantially toward compute-bound,
+and §2.3's arms should be read with that weighting.
 
 ### 2.2 Both models fit the post-fix point, and neither can claim it
 
@@ -144,14 +169,26 @@ ceiling.**
 **88.2M** (re-summed from the 08-13 category table; V2 rounded to 88.5M). At 4 HVX
 threads and ~1 GHz: 88.2 / 4 = **22.06 ms against 22.37 measured — 1.4%.**
 
-Both land. They are not distinguishable by any measurement taken so far, and the
-plan must stop pretending otherwise. Two further notes keep this honest:
+Both land **at this one point**. But §2.1 breaks the tie on everything else, so
+"degenerate" overstates it — the honest summary is that the compute model
+explains the transition and the byte model does not:
 
-- The compute model **fails on the pre-fix point**: it predicts 350.3M / 4 =
-  87.6 ms against 146.3 measured, off by 1.67×. Read forward, that is not a defect
-  — it says the replication ops achieved only ~60% of the DSP's compute-limited
-  rate, i.e. *they* were the memory-bound part, and what survives them is not.
-  The regime genuinely flipped; the argument is about where it landed.
+| | explains the 6.54× fix? | fits the post-fix point? |
+|---|---|---|
+| Byte model | **No.** Identical bytes either side (§2.1) | yes, 88% of ceiling |
+| Compute model | **Yes** — 350.3M → 88.2M cycles, 3.97× predicted vs 6.54× measured | yes, to 1.4% |
+
+Two notes keep this honest:
+
+- The compute model **under-predicts the pre-fix point**: 350.3M / 4 = 87.6 ms
+  against 146.3 measured, off by 1.67×. With §2.1's finding that the replication
+  never touched DDR, the residual has to be intrinsic to those ops — a broadcast
+  FP16 multiply over VTCM at low IPC, or poor thread scaling — rather than
+  memory stall. It also means the fix's 6.54× exceeds the 3.97× the cycle counts
+  alone predict, because the surviving ops parallelize better.
+- Neither model is a licence to stack predictions multiplicatively. Both columns
+  in §2.3 are upper bounds, and the byte column now carries the extra caveat that
+  it has already failed once on the only transition we can check it against.
 - Both models' projections below are **upper bounds**, for opposite reasons. The
   byte model holds 43 GB/s fixed while removing the single largest *contiguous*
   read (the head), which `REFERENCE.md` §1 says should lower the average rate. The
