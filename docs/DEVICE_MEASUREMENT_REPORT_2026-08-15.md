@@ -50,6 +50,31 @@ improved" directly.
 
 ### 0.3 The P1 blocker is a build-side packaging defect, not a device-side failure
 
+> ### ⚠️ WITHDRAWN 2026-08-16 — this annotation was wrong, and so is §5's reason
+>
+> This section accepted §5's account at face value. Direct audit refutes it:
+>
+> - **The pre-fix and post-fix decode-only ctx-bins have byte-identical input
+>   contracts** — 60 inputs, identical names, shapes and dtypes. The GQA fix is
+>   graph-internal and the KV I/O was frozen by design (`MAX_TPS_V2` §3-B), so
+>   one set of profiling inputs feeds *both* bins and a shape mismatch between
+>   them was **impossible**.
+> - **The shipped inputs already match the gqafix graph exactly**, 60/60, by
+>   `scripts/validate/verify_profile_inputs.py`. Including the file §5 singles
+>   out: `position_ids_cos` is 128 bytes because it is `[1,1,64]` fp16 — 128 B
+>   *is* the correct size, and "64-dim" describes `position_ids`, not the KV
+>   cache (which is `[1,8,128,1151]` in both bins).
+>
+> **So there is no packaging defect, regenerating the inputs fixes nothing, and
+> the real cause of the P1 failure remains unknown.** Plausible candidates, in
+> the order worth checking: the `--retrieve_context` path not resolving after
+> extraction; `ADSP_LIBRARY_PATH` unset; a silently truncated extract (`/data`
+> runs 98–99% full and the package plus bin is ~1.1 GB); or the two *expected*
+> `Unknown Key` warnings being read as the error.
+>
+> `verify_profile_inputs.py` now ships in the package so the next attempt
+> reports the actual mismatch instead of inviting a guess.
+
 §5 records that P1 could not run because the shipped profiling inputs were
 pre-fix format. Those inputs (`decode_profile_inputs.tar.gz`) were generated on
 2026-08-13 against the **pre-fix** decode graph and were re-shipped unchanged
