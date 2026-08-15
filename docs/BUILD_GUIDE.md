@@ -174,9 +174,10 @@ mismatch itself is still a hard load failure.)
   whole-window reprocess) until the KV passes 128 positions, then switches to
   the AR-1 decode graph (~155 ms/tok). Quote tok/s numbers per phase.
 - Device-measured (v2, 2026-08-11): decode ~6.5 tok/s, prefill-phase
-  ~23.8 tok/s, init ~0.8 s, RAM ~163 MB. (The device team's own unfused builds
-  measure **7.8 tok/s** with identical runtime configs — the ~20% delta is
-  build-side and unexplained, REFERENCE §8.8.)
+  ~23.8 tok/s, init ~0.8 s, RAM ~163 MB. (A later run measured
+  `qwen3_06b_w8a16_local` at **11.72 tok/s** AR-1 — *faster* than the device
+  team's 7.79, inverting the old "their builds are ~20% faster" premise. See
+  REFERENCE §8.8, now marked resolved-backwards.)
 - **Graph selection is numeric best-fit on (AR, CL) — names are cosmetic *to
   Genie*.** Genie picks the smallest CL ≥ current KV, then the smallest AR ≥ the
   batch size (largest smaller AR = chunking fallback). Consequences: two graphs

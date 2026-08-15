@@ -1,6 +1,7 @@
 # qwen3_06b_w8a16_fuseqkvgu_ladekv — Qwen3-0.6B W8A16, QKV+Gate-Up fused, LADE
 
-Built 2026-08-13 from `docs/MAX_TPS_QWEN3_0.6B.md` Phase B, device-free, on
+Built 2026-08-13 from `docs/MAX_TPS_QWEN3_0.6B.md` Phase B (that plan doc is now
+superseded by V3 — see its header before reusing the sequencing), device-free, on
 QAIRT 2.48.40.260702 for Hexagon v81 / SA8797P.
 
 **This is the max-TPS candidate, and its speed is NOT yet measured.** It stacks

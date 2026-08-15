@@ -1,5 +1,19 @@
 # Qwen3-0.6B maximum-TPS build — the complete process
 
+> ## ⚠ SUPERSEDED — this is V1
+>
+> Sequencing and recommendations here are superseded by
+> **`docs/MAX_TPS_QWEN3_0.6B_V3.md`** (which supersedes V2 §3–§5; V2 §0–§2
+> remain the analytical basis). Its headline "10.8 tok/s, highest measured"
+> also predates the 2026-08-13 device run that measured basic AR-1 at
+> **11.72 tok/s** on the same hardware, so LADE's advantage is prompt-dependent,
+> not universal (`DEVICE_MEASUREMENT_REPORT_2026-08-13.md`).
+>
+> Kept as the historical record of how the recipe was derived. **Do not follow
+> its command blocks for a new build** — at least one `ENC_SRC` path below now
+> points at a quant dir that was archived to `/mnt/x/llm-archive/` after it was
+> consumed.
+
 *2026-08-13. Companion to `docs/REFERENCE.md` (facts, corrections) and
 `docs/BUILD_GUIDE.md` (per-variant recipes). This document is the one path to
 the fastest 0.6B bundle we know how to build, with every measured alternative

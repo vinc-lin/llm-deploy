@@ -111,9 +111,11 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
   (`--lpbq`/`--seq-mse` stay only for a future SDK).
 - `--quant-head` (W8 lm_head) is a **net LADE regression**: −14% tok/s on device
   (9.3 vs 10.8), because it costs ~10% n-gram acceptance. Quality is fine; the
-  DDR win does not survive spec-decode amortization. It also needs
-  `--keep-head-weight` or the filter strips the encoding and you silently get an
-  FP16 head — verify with `qairt-dlc-info | grep lm_head.weight` → `sFxp_8`.
+  DDR win does not survive spec-decode amortization. It pairs with
+  `filter_aimet_w8a16.py --keep-head-weight` — **not** a `quantize_aimet.py`
+  flag; the build scripts add it to the filter automatically when they see
+  `--quant-head`. Without it the filter strips the encoding and you silently get
+  an FP16 head — verify with `qairt-dlc-info | grep lm_head.weight` → `sFxp_8`.
 - `genie-app` script strings **never unescape**: `"\n"` in a quoted `node set
   text` argument yields the two characters `\` and `n`. Use `node set textFile`
   (read via `rdbuf()`) whenever the prompt needs a real newline. The SDK's own

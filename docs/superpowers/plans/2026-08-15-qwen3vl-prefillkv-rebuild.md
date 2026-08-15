@@ -92,7 +92,8 @@ regenerated in Phase 2 regardless.
    sealed inside `libQnnHtp`. Hence: fallback, never primary.
 3. **GLM-4v precedent.** Qualcomm's own split pipeline example ships AR=32 +
    AR=128 past-KV graphs across a 2-split weight-shared ctx-bin
-   (`configs/glm-4v/glm-4v.json`) — a split multi-AR past-KV tower is a
+   (`$QAIRT_SDK/examples/Genie/configs/glm-4v/glm-4v.json` — the SDK's, not
+   ours) — a split multi-AR past-KV tower is a
    supported, shipped configuration, not an experiment.
 
 ---

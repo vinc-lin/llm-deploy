@@ -6,7 +6,9 @@
 
 - WSL2 (kernel 6.6.87.2), Ryzen 9 5900X (24T), 47 GB RAM, RTX 4060 Ti 8 GB (CUDA passthrough OK)
 - Repo: `/mnt/x/code/llm-deploy` (drvfs/NTFS — Windows-visible; `~/code` is a symlink here)
-- Heavy data: `/home/vinc/llm-local` (real ext4, 820 GB free): `envs/`, `models/`, `work/`, `sdk/`
+- Heavy data: `/home/vinc/llm-local` (real ext4): `envs/`, `models/`, `work/`, `sdk/`.
+  Free space moves constantly — check it live (`df -h`), and note `disk_guard`
+  gates on **`/mnt/c`**, not on this path, because the vhdx lives on C:.
 - No sudo; `uv` manages Python toolchains. Proxy available at `http://127.0.0.1:17890` (`proxy-on`).
 
 ## Divergences from the remote (jump-host) environment
@@ -25,8 +27,13 @@ Genie on-HTP execution. Local success = artifact correctness + numerical parity.
 
 ## Reconstruction uncertainties (review before trusting)
 
-1. **`clip_weights_to_7f7f`** — reconstructed as "clamp weights to symmetric ±127
-   steps so nothing maps to INT8 -128". Original semantics unknown.
+1. ~~**`clip_weights_to_7f7f`**~~ — **RESOLVED 2026-08-14.** Reconstructed as
+   "clamp weights to symmetric ±127 steps so nothing maps to INT8 -128", which
+   is right *for a symmetric grid* — and it was being applied unguarded. On the
+   Qwen3-VL ViT the v81 config makes `nn.LayerNorm` weights **asymmetric**, so
+   every all-ones LayerNorm gain was rewritten 1.0 → 0.498 (cos 0.758 → 0.997
+   once a symmetry guard was added). RMSNorm models are unaffected, which is why
+   it went unnoticed. See CLAUDE.md Gotchas.
 2. **Genie graph I/O naming** (`position_ids_cos/sin`, `past_key_i_in/out`, KV
    layout `[1, n_kv, len, head_dim]`, right-aligned sliding window) — chosen from
    qai-hub/Genie conventions + summary values (pos-id-dim 64, kv-dim 128); MUST be

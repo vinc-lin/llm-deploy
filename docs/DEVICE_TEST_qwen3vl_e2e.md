@@ -48,20 +48,44 @@ stock Genie pipeline — see below) produces
 white background."*, which is HF's exact output. Zeroing deepstack costs
 phrasing, not image understanding.
 
-## Expected timing
+## ⛔ SUPERSEDED BY THE 2026-08-14 DEVICE ATTEMPT — this bundle does not load
 
-**First token will take roughly 30 seconds, and that is expected.**
+**Everything below about timing was written before the bundle met hardware, and
+the prediction was wrong.** The run never reached a first token: node creation
+died at load with
 
-The prompt is 273 tokens and every one of them goes through the **AR=1 decode
-graph**, one at a time. The AR=128 prefill graph is never selected: qualla
-derives a graph's context size from the attention mask's trailing dim
-(`nsp-graph.cpp:146-155`), ours is `[1,128,128]`, so `ctx_size == AR` — the
-bertcache shape — and the strategy loop skips that bucket for any prompt longer
-than 128 tokens (`kvmanager.cpp:411-416`). At the 0.6B-measured ~10 tok/s that
-is ~27 s of prompt processing before generation starts.
+```
+ShapeError : attention_mask — Expected [ 1, 128, 2176] bitwidth=*. Found [ 1, 128, 128] bitwidth=2   (x2, one per shard)
+Error validating model. Failed to create the Genie Node (-1).
+Segmentation fault
+```
 
-This is a throughput defect, not a correctness one, and the fix is a text-tower
-re-export with a past-KV prefill graph. Do not chase it during bring-up.
+Cause: this is a **split** tower. The lm_head lives in the last shard, so
+`prefill_0` emits no `logits`, classifies `DECODER_PREFILL`
+(`nsp-graph.cpp:245-251`), and its expected CL is rewritten to the cache-group
+max (`nsp-model.cpp:604-605`) — so the `[1,128,128]` mask fails `validateModel`
+before any graph-selection logic runs. The reasoning below (bertcache graph
+silently skipped, slow but working) is correct **only for an unsplit tower**.
+
+**Do not re-run this bundle as shipped.** The fix is the past-KV prefill
+re-export — see `docs/superpowers/plans/2026-08-15-qwen3vl-prefillkv-rebuild.md`.
+A config-level escape hatch (`execute-select-graphs`) exists and is
+**unverified on hardware**; see `docs/REFERENCE.md` §3.6.
+
+Full mechanism: `docs/NOTES-genie-io.md` § "Split prefill is fatal at load",
+`docs/NOTES-genie-pipeline.md` § C1. Device record:
+`reports/qwen3vl-4b-e2e-deployment-status-2026-08-14.md`.
+
+## Expected timing — *once a loadable bundle exists*
+
+With the past-KV prefill rebuild, the 273-token prompt processes as
+128 + 128 + 17 rows, so **TTFT should be ~3-4 s**, not 30.
+
+The ~30 s figure below applied to the all-decode fallback path (every prompt
+token through the AR=1 decode graph). It remains the expectation **if** you run
+with the `execute-select-graphs` decode-only config, since that deliberately
+drops the prefill graphs. At the 0.6B-measured ~10 tok/s that is ~27 s of
+prompt processing before generation starts.
 
 ## Triage
 
@@ -69,6 +93,7 @@ re-export with a past-KV prefill graph. Do not chase it during bring-up.
 |---|---|---|
 | `GENIE_STATUS_ERROR_JSON_SCHEMA` at load | a config declares `positional-encoding` **and** backend `pos-id-dim`/`rope-theta` | `Engine.cpp:159-161,677-680`. This exact bug shipped in the Stage 2 bundle. `lint_pipeline_bundle.py` check 3 |
 | Load error naming a tensor or quant params | split encodings lineage — identically-named tensors across splits must carry byte-identical quant params | `docs/NOTES-genie-splits.md` |
+| **`ShapeError: attention_mask Expected [1,AR,CL] Found [1,AR,AR]` → `Failed to create the Genie Node (-1)` + SIGSEGV** | **an AR==CL bertcache prefill in a SPLIT tower — OBSERVED 2026-08-14.** Shard 0's prefill has no logits → `DECODER_PREFILL` → expected CL rewritten to cache-group max → mask rejected at load | Not fixable by config alone. Rebuild with a past-KV prefill (`[1,AR,CL]`, `CL>AR`), or drop the prefill graphs via `execute-select-graphs` (untested). `REFERENCE.md` §3.6 |
 | SIGSEGV on the first token | a graph not listed in `graph_names`, silently compiled with backend defaults (O=0, 4 MB VTCM) | `qnn-context-binary-utility --json_file`, compare against **both** `htp_backend_ext_config_*.json`. Precedent: BUILD_GUIDE §5.4b |
 | Output is `!!!…` (token 0) | logits read past the end of a one-row buffer | prefill must emit all-position logits `[1,AR,vocab]` — `docs/NOTES-genie-io.md` |
 | `"Unsupported requantization operation"` | an fp16 tensor reached the embedding accumulator | the ViT ctx-bin must be W8A16 with UFIXED_16 IO, not the old fp16 one. `Quantization.cpp:163-192` |

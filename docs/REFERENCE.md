@@ -18,8 +18,8 @@ out of that reconciliation.*
 
 | | |
 |---|---|
-| **Best sustained decode, 0.6B** | **10.8 tok/s** — LADE speculative decoding, `qwen3_06b_w8a16_ladekv` (2026-08-11) |
-| Non-speculative AR-1 decode | 6.3–6.5 tok/s (~155 ms/step) on our bundles; **7.8 on the device team's own builds** — unexplained build-side delta (§8.8) |
+| **Best sustained decode, 0.6B** | **prompt-dependent — no single winner.** 11.72 tok/s basic AR-1 (`qwen3_06b_w8a16_local`) vs 9.18 LADE on the *same* technical prompt (2026-08-13, `DEVICE_MEASUREMENT_REPORT_2026-08-13.md`); 10.8 LADE on the 2026-08-11 prompt. LADE's win is not universal — it was −22% here |
+| Non-speculative AR-1 decode | 6.3–6.5 tok/s (~155 ms/step) on the 2026-08-11 v2 bundle, but **11.72 tok/s** on `qwen3_06b_w8a16_local` (2026-08-13) — **faster than the device team's 7.79**, not slower (§8.8, premise now inverted) |
 | Bertcache early phase (topology A only) | ~23.8 tok/s for the first ~117 tokens, then falls to AR-1 |
 | Output correctness | ✅ since v2 (2026-08-10) |
 | Quantization | W8A16 (INT8 per-channel weights, FP16 activations) — the only recipe that works |
@@ -598,14 +598,21 @@ Downstream of export, the 4B text tower **must** ship as ≥2 ctx-bins:
 and the 36-layer graph estimates 4.18 GiB (weights only — context length does
 not move it). The split contract is in `docs/NOTES-genie-splits.md`.
 
-### 8.8 Why are the device team's builds ~20% faster?
-Their unfused W8A16 decodes at 7.79–7.80 tok/s where our v2 bundle measures
-6.5, with runtime configs identical field-for-field (§6.6). The delta is
-build-side: their unfused ctx-bin is 1.01 GB vs our 1.087 GB, so something
-structural differs — converter flags, context length, embedding handling, or
-calibration. Resolve by diffing their exact converter/quantizer invocations and
-a `qnn-context-binary-utility --json_file` dump of their bin against ours.
-Worth ~20% on every future build if it transfers.
+### 8.8 ~~Why are the device team's builds ~20% faster?~~ — RESOLVED BACKWARDS (2026-08-13)
+
+**The premise was wrong: our builds are faster, not slower.** Measured on the
+same device, same prompt: `qwen3_06b_w8a16_local` **11.72 tok/s** AR-1 vs the
+device team's reported **7.79** — **+51% in our favour**
+(`DEVICE_MEASUREMENT_REPORT_2026-08-13.md:362-368`, and its §Test 3).
+
+The original 6.5-vs-7.79 comparison stood on our *2026-08-11 v2* bundle only;
+it was never a build-quality gap, it was a bundle-to-bundle difference on our
+own side. Do not spend effort chasing their converter flags on this basis.
+
+What the same measurement DID surface is the real lead: 74.7% of decode DSP
+cycles in unreplicated-KV `Expand` ops — see the GQA replication fix
+(`DROP_README_2026-08-14-gqafix.md`, `MAX_TPS_QWEN3_0.6B_V3.md`,
+`--grouped-gqa` in `quantize_aimet.py`).
 
 ### 8.9 `hvx_threads`: 4 or 8?
 The runtime always reports **8 HVX threads in use**, on every workload size,
@@ -680,7 +687,14 @@ cross-variant `load_encodings`).
 | **`docs/REFERENCE.md`** (this file) | **current truth** | start here |
 | `CLAUDE.md` | current | terse operating rules for agents |
 | `docs/BUILD_GUIDE.md` | current | step-by-step recipes, per-variant commands, troubleshooting |
-| `docs/MAX_TPS_QWEN3_0.6B.md` | current | the single path to the fastest 0.6B bundle — proven 10.8 tok/s recipe + fused-LADEKV candidate + config A/Bs |
+| `docs/MAX_TPS_QWEN3_0.6B_V3.md` | **current** | the 0.6B speed plan. Supersedes V2 §3–§5 (sequencing); V2 §0–§2 remain the analytical basis. **Start here, not at V1.** |
+| `docs/MAX_TPS_QWEN3_0.6B_V2.md` | current for §0–§2 only | measured baselines, revised performance model, ctx-bin forensics |
+| `docs/MAX_TPS_QWEN3_0.6B.md` (V1) | **superseded** | the original 10.8 tok/s recipe. Its headline predates the 2026-08-13 measurement that showed basic AR-1 at 11.72 on the same device. Historical. |
+| `docs/NOTES-genie-pipeline.md` | current, SDK-cited | the multimodal pipeline contract — image-encoder dtype, MRoPE, deepstack-by-zeros, and the split-prefill load failure (§C1) |
+| `docs/NOTES-htp-config-keys.md` | current, SDK-cited | which HTP backend-extension keys are real, audited against the SDK's own `config.py` / `QnnHtpGraph.h` |
+| `docs/DEVICE_MEASUREMENT_REPORT_2026-08-13.md` | current device truth | the 5-test measurement run: 11.72 basic vs 9.18 LADE, and the 74.7% `Expand` finding |
+| `docs/DROP_README_2026-08-14-gqafix.md` | current | the GQA replication fix (`--grouped-gqa`) and the bundles it produced |
+| `reports/qwen3vl-4b-e2e-deployment-status-2026-08-14.md` | current device truth | the Qwen3-VL e2e attempt — **failed at load**, see §3.6 |
 | `docs/NOTES-genie-io.md` | current, SDK-cited | the Genie/qualla contract — read before touching graph I/O |
 | `docs/NOTES-vit-htp-config.md` | current | why graph names must appear in the backend config |
 | `docs/NOTES-genie-splits.md` | current, SDK-cited | the multi-ctx-bin (split) contract — required for any graph over the 3.5 GiB serialization limit, i.e. every text tower ≳2B |

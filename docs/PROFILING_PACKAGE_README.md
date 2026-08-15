@@ -89,6 +89,14 @@ python3 gen_decode_profile_inputs.py --out ./ar1_random --random
 ```
 
 Non-KV inputs are already realistic: `input_ids` is a real token id, the mask
-is qualla's additive fp16 (`0.0` allow / `-1000.0` deny) for a near-full
-context, and the RoPE tables are true cos/sin at the matching position with
-`rope_theta = 1e6` (Qwen3, not Qwen2's 1e5).
+is additive fp16 (`0.0` allow / `-1000.0` deny) for a near-full context, and the
+RoPE tables are true cos/sin at the matching position with `rope_theta = 1e6`
+(Qwen3, not Qwen2's 1e5).
+
+> The `-1000.0` here is **this harness's synthetic input**, not a runtime
+> constant. Our exported graphs are traced with `MASK_VALUE = -100.0`
+> (`scripts/export/modeling_export.py:35`); qualla's own deny constant is not a
+> literal in `attention-mask.cpp` and remains unconfirmed (`LOCAL_ENV.md` §5
+> records it as unknown). Any deny value large enough to saturate softmax is
+> equivalent for profiling, so the discrepancy does not affect these numbers —
+> but do not cite this line as the runtime's value.
