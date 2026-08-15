@@ -133,6 +133,10 @@ for f in "${TEXT_FILES[@]}"; do cp "$(src_of "$f")/$f" "$OUT/"; done
 cp "$VIT_CTXDIR/$VIT_BIN" "$OUT/"
 cp "$VIT_BUNDLE/htp_backend_ext_config_vit.json" "$OUT/"
 for f in "${CONFIGS[@]}"; do cp "$LLMDEPLOY_ROOT/configs/$f" "$OUT/"; done
+# Docs ship WITH the bundle and are tracked in the repo, so what the device
+# team reads is version-controlled rather than hand-written into a build dir.
+cp "$LLMDEPLOY_ROOT/docs/BUNDLE_README_qwen3vl_4b_e2e.md" "$OUT/README.md"
+cp "$LLMDEPLOY_ROOT/docs/DEVICE_TEST_qwen3vl_e2e.md" "$OUT/DEVICE_TEST.md"
 if [ -d "$KIT" ] && compgen -G "$KIT/wx_*.raw" >/dev/null; then
     cp "$KIT"/wx_*.{raw,json,jpg,script} "$KIT/TEST_IMAGES.md" "$OUT/"
     echo "   test kit: $(ls "$KIT"/wx_*.raw | wc -l) image(s) from $KIT"
