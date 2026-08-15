@@ -234,6 +234,11 @@ def main():
     ap.add_argument("--cl-prefill", type=int, default=128)
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--n-deepstack", type=int, default=3)
+    ap.add_argument("--prefill-past", type=int, default=0,
+                    help="past-KV length for the prefill graph (0 = the AR==CL "
+                         "bertcache prefill; use --ctx for the past-KV prefill, "
+                         "the only shape a split tower can load). Exports as "
+                         "'prefillkv' so it sits beside the bertcache pair.")
     ap.add_argument("--split-at", type=int, default=0,
                     help="split the layer stack at this GLOBAL layer index, "
                          "emitting prefill_0/decode_0 (layers [0,N)) and "
@@ -272,12 +277,26 @@ def main():
     # baked in at conversion time from the DLC basename. prefill_0 < prefill_1
     # and decode_0 < decode_1 sort into chunk order. See
     # docs/NOTES-genie-splits.md.
+    # A prefill with past-KV. --prefill-past 0 keeps the AR==CL bertcache
+    # prefill; --prefill-past <ctx> gives mask [1,AR,ctx+AR] and past <ctx>,
+    # which is the ONLY prefill shape a SPLIT tower can load (REFERENCE.md
+    # 3.6). This is the fp32 counterpart of the quantized rebuild, used by the
+    # e2e gate's chain0b.
+    p_past = args.prefill_past
+    if p_past and p_past + args.cl_prefill != past_len + 1:
+        raise SystemExit(
+            f"--prefill-past {p_past} + --cl-prefill {args.cl_prefill} = "
+            f"{p_past + args.cl_prefill}, but decode's window is {past_len + 1}. "
+            "Both AR variants must land in the SAME cache group or Genie sees "
+            "two context sizes.")
+
     todo = []
     for ci, (s, e) in enumerate(chunks):
         sfx = f"_{ci}" if split else ""
         # deepstack lands on GLOBAL layers 0..n-1, so only the first chunk takes it
         nd = args.n_deepstack if s == 0 else 0
-        todo.append((ci, (s, e), nd, f"prefill{sfx}", args.cl_prefill, 0))
+        tag = "prefillkv" if p_past else "prefill"
+        todo.append((ci, (s, e), nd, f"{tag}{sfx}", args.cl_prefill, p_past))
         todo.append((ci, (s, e), nd, f"decode{sfx}", 1, past_len))
 
     specs = []
