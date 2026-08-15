@@ -172,6 +172,10 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     deadline = time.time() + args.timeout_min * 60
     kept, manifest = 0, []
+    # One file can match several scene searches. Without this the later hit
+    # overwrites the earlier file and the manifest gains a duplicate entry
+    # pointing at it -- two "different" kit images that are the same photo.
+    seen = set()
 
     print(f"== Wikimedia Commons: {len(SCENES)} scenes x {args.per_scene} ==")
     for scene, term in SCENES.items():
@@ -182,6 +186,10 @@ def main():
         for hit in commons_search(term, args.per_scene):
             if time.time() > deadline:
                 break
+            if hit["title"] in seen:
+                print(f"    = {hit['title'][:50]}: already kept for another scene")
+                continue
+            seen.add(hit["title"])
             name = f"{scene}_{Path(hit['title']).stem[:40]}".replace(" ", "_")
             name = "".join(c for c in name if c.isalnum() or c in "_-")
             dst = out / f"{name}.img"
