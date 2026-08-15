@@ -582,6 +582,7 @@ def main():
 
     variants = {
         "chain0-alldecode": (ref["feats_hf"], ref["deep_hf"]),
+        "chain0b-prefillkv": (ref["feats_hf"], ref["deep_hf"]),
         "chain1-hf-vit": (ref["feats_hf"], ref["deep_hf"]),
         "chain2-onnx-vit": (feats_ort, deep_ort),
         "tierA-zero-deep": (ref["feats_hf"],
@@ -590,6 +591,10 @@ def main():
     cos, sin = mrope_tables(ref["pos3"], meta["head_dim"], meta["theta"])
     finite("host mrope cos", cos)
     finite("host mrope sin", sin)
+    unmapped = [c for c in chains if c not in variants]
+    assert not unmapped, (
+        f"{unmapped} listed in ALL_CHAINS but absent from `variants` -- add the "
+        "(features, deepstack) pair it should run on")
     feeds_cache = {c: spliced_inputs(ref, *variants[c]) for c in chains}
 
     # ----------------------------------------------------------------- prefill
