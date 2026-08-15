@@ -42,6 +42,24 @@ HEAD_DIM=${HEAD_DIM:-128}
 PAST=$((CTX + CL - 1))
 TOTAL=$((PAST + 1))
 
+# Prefill flavour. 0 keeps the Stage 2 bertcache prefill (mask [1,AR,AR], no
+# past-KV). That shape is FATAL in a split tower: shard 0 has no logits, so it
+# classifies DECODER_PREFILL, its expected CL is rewritten to the cache-group
+# max, and the mask fails validateModel -- the node never loads (observed on
+# device 2026-08-14; REFERENCE.md 3.6). Set PREFILL_PAST=$CTX for the past-KV
+# prefill, which is the only shape that both loads and gives a real TTFT.
+PREFILL_PAST=${PREFILL_PAST:-0}
+# Suffix for the prefill graphs' deepstack inputs. Distinct names give them
+# their own rpcmem allocations, so each is zero-filled at its own full size
+# rather than at the last-registered variant's (nsp-model.cpp:1481). Only
+# meaningful once prefill actually loads. See rename_deepstack_inputs.py.
+DSP_SUFFIX=${DSP_SUFFIX:-}
+if [ "$PREFILL_PAST" -gt 0 ]; then
+    P_TOTAL=$((PREFILL_PAST + CL))
+else
+    P_TOTAL=$CL
+fi
+
 OPT_LEVEL=3          # these three are what the generated config exists to secure;
 VTCM_MB=16           # step 3 reads them back out of each finalized binary and
 HVX_THREADS=4        # fails the build if the config did not bind
@@ -75,8 +93,10 @@ convert() {
     # shellcheck disable=SC2046
     args+=($(head_dims "$seq" "$first" "$total"))
     if [ "$first" = "1" ]; then
+        local dsuf=""
+        case "$graph" in prefill_*) dsuf=$DSP_SUFFIX ;; esac
         for i in $(seq 0 $((NDEEP - 1))); do
-            args+=(-d "deepstack_visual_embed_$i" "1,1,$seq,$HIDDEN")
+            args+=(-d "deepstack_visual_embed_${i}${dsuf}" "1,1,$seq,$HIDDEN")
         done
     fi
     if [ "$past" -gt 0 ]; then
@@ -96,10 +116,11 @@ convert() {
         --float_bitwidth 16 --target_backend HTP "${args[@]}"
 }
 
-convert prefill_0 "$CL" 0      1 0       "$SPLIT" 0 "$CL"
-convert decode_0  1     "$PAST" 1 0      "$SPLIT" 0 "$TOTAL"
-convert prefill_1 "$CL" 0      0 "$SPLIT" "$LAYERS" 1 "$CL"
-convert decode_1  1     "$PAST" 0 "$SPLIT" "$LAYERS" 1 "$TOTAL"
+echo "== prefill flavour: past=$PREFILL_PAST, mask total=$P_TOTAL, deepstack suffix='${DSP_SUFFIX:-<none>}' =="
+convert prefill_0 "$CL" "$PREFILL_PAST" 1 0       "$SPLIT" 0 "$P_TOTAL"
+convert decode_0  1     "$PAST"         1 0       "$SPLIT" 0 "$TOTAL"
+convert prefill_1 "$CL" "$PREFILL_PAST" 0 "$SPLIT" "$LAYERS" 1 "$P_TOTAL"
+convert decode_1  1     "$PAST"         0 "$SPLIT" "$LAYERS" 1 "$TOTAL"
 ls -lh "$DLC"
 
 # One ctx-bin per chunk, holding that chunk's two AR variants so its weights are
@@ -212,9 +233,52 @@ for c in (0, 1):
                     f"graphs' weights separately")
 
     for name, info in sorted(graphs.items()):
-        ins = {t["info"]["name"] for t in info.get("graphInputs", [])}
+        idims = {t["info"]["name"]: t["info"]["dimensions"]
+                 for t in info.get("graphInputs", [])}
+        ins = set(idims)
         outs = {t["info"]["name"]: t["info"]["dimensions"]
                 for t in info.get("graphOutputs", [])}
+
+        # -- the shapes Genie's validateModel will demand --------------------
+        # Getting these wrong is not a slow model, it is a node that never
+        # loads. Assert them here, on the finalized binary, in the same terms
+        # the device reports.
+        is_prefill = name.startswith("prefill")
+        seq = $CL if is_prefill else 1
+        want_total = $P_TOTAL if is_prefill else $TOTAL
+        want_past = $PREFILL_PAST if is_prefill else $PAST
+        if idims.get("attention_mask") != [1, seq, want_total]:
+            errs.append(f"{name}: attention_mask {idims.get('attention_mask')} "
+                        f"!= [1, {seq}, {want_total}]")
+        for t in ("cos", "sin"):
+            if idims.get(f"position_ids_{t}") != [1, seq, 64]:
+                errs.append(f"{name}: position_ids_{t} "
+                            f"{idims.get(f'position_ids_{t}')} != [1, {seq}, 64]")
+        kv_in = sorted(n for n in ins if n.startswith("past_") and n.endswith("_in"))
+        if want_past > 0:
+            if len(kv_in) != 2 * ($SPLIT if c == 0 else $LAYERS - $SPLIT):
+                errs.append(f"{name}: {len(kv_in)} past-KV inputs, expected "
+                            f"{2 * ($SPLIT if c == 0 else $LAYERS - $SPLIT)}")
+            for n in kv_in:
+                want = ([1, $NKV, $HEAD_DIM, want_past] if "key" in n
+                        else [1, $NKV, want_past, $HEAD_DIM])
+                if idims[n] != want:
+                    errs.append(f"{name}: {n} {idims[n]} != {want}")
+                    break
+        elif kv_in:
+            errs.append(f"{name}: has past-KV inputs but PREFILL_PAST=0")
+
+        # deepstack: the prefill graphs must carry the SUFFIXED names and the
+        # decode graphs the bare ones, or they share one undersized buffer.
+        deep = sorted(n for n in ins if n.startswith("deepstack_visual_embed_"))
+        if c == 0:
+            want_deep = sorted(f"deepstack_visual_embed_{k}"
+                               + ("$DSP_SUFFIX" if is_prefill else "")
+                               for k in range($NDEEP))
+            if deep != want_deep:
+                errs.append(f"{name}: deepstack inputs {deep} != {want_deep}")
+        elif deep:
+            errs.append(f"{name}: split 2 should not carry deepstack inputs: {deep}")
         # First split must expose inputs_embeds; last must emit logits. Genie
         # checks exactly this (validateModel 1a and 2).
         if c == 0:
@@ -239,6 +303,16 @@ if errs:
     sys.exit(1)
 print("BOTH BINARIES VERIFIED")
 PYEOF
+
+# Shape readback above proves the tensors match the RECIPE. This proves they
+# match what libGenie's validateModel will actually demand, which is not the
+# same thing: the DECODER_PREFILL CL rewrite means a graph can have exactly the
+# shapes it was converted with and still be rejected at load. That is precisely
+# how the 2026-08-14 bundle shipped.
+echo "== Genie load simulation (validateModel replay) =="
+$PY_DEPLOY "$LLMDEPLOY_ROOT/scripts/validate/genie_load_check.py" \
+    --info "$CTXBIN/1_of_2/info.json" "$CTXBIN/2_of_2/info.json" \
+    --config "$LLMDEPLOY_ROOT/configs/genie_text_generator_qwen3vl_4b.json"
 
 du -sh "$CTXBIN"/*
 echo "SPLIT CTXBIN COMPLETE: $CTXBIN"

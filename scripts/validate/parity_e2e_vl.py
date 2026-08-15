@@ -16,21 +16,24 @@ Four chains, all sharing one prompt/image:
   chain0-alldecode  HF visual + real deepstack, EVERY prompt row through
                     decode.onnx from an empty cache -- no prefill call at all.
                     BAR: token-for-token identical to hf.generate.
-                    This is the path the device takes *once it loads*: qualla
-                    derives a graph's ctx_size from the attention_mask trailing
-                    dim (nsp-graph.cpp:146-155), our prefill is [1,128,128] so
-                    its ctx_size == AR == 128, and prepareInferenceStrategy
-                    (kvmanager.cpp:411-416) skips that bucket outright for a
-                    ~290-token prompt. See docs/NOTES-genie-pipeline.md probe C.
-                    CAVEAT (2026-08-14 device attempt): with the SPLIT text
-                    tower it does not get that far -- shard 0's prefill has no
-                    logits, classifies DECODER_PREFILL, and its [1,128,128] mask
-                    fails validateModel, so the node never loads. Chain0 stays
-                    the right emulation of the intended feed, but "the path the
-                    DEVICE actually takes" is unproven until the
-                    execute-select-graphs fix (or a past-KV prefill re-export)
-                    is confirmed on hardware. See docs/NOTES-genie-io.md
-                    "Split prefill is fatal at load" and probe C1.
+                    NOT the device path -- this was believed to be it (qualla
+                    derives ctx_size from the attention_mask trailing dim,
+                    nsp-graph.cpp:146-155, ours is [1,128,128] so ctx_size == AR
+                    == 128, and prepareInferenceStrategy was read as skipping
+                    that bucket). Two 2026-08-14/15 findings retire that reading:
+                      1. The split tower does not even load -- shard 0's prefill
+                         has no logits, classifies DECODER_PREFILL, and its
+                         [1,128,128] mask fails validateModel (node never
+                         created). docs/NOTES-genie-io.md "Split prefill is
+                         fatal at load".
+                      2. The DECODER_PREFILL exclusion is gated on output_all,
+                         which a basic dialog never sets, so a prefill graph IS
+                         selected. A 273-token prompt is three AR=128 prefill
+                         calls, not 273 decodes. docs/NOTES-genie-io.md "A
+                         past-KV prefill IS selected in a basic dialog".
+                    Chain0 remains a valid worst-case all-decode emulation and a
+                    useful cross-check on the KV feed, but do not read it as
+                    "what the device does". See probe C1.
   chain1-hf-vit     HF visual + real deepstack, prefill.onnx for rows 0..AR-1
                     then decode.onnx for the tail. BAR: token-for-token.
                     Validates the prefill graph, which still matters if prefill
