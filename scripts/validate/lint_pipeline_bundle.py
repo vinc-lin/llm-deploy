@@ -962,6 +962,168 @@ def check_genie_load(bundle, nodes, graphs_by_bin, rep):
 
 
 # --------------------------------------------------------------------------- #
+# check 10 -- decode-only fallback
+# --------------------------------------------------------------------------- #
+SELECT_KEYS = ("load-select-graphs", "execute-select-graphs")
+
+
+def check_fallback(bundle, nodes, graphs_by_bin, rep):
+    """The fallback must be one file swap, not a second bundle.
+
+    Any drift between primary and fallback beyond the two select-graphs keys
+    means the device team's "try the fallback" step silently changes something
+    else -- context size, kv-dim, tuning -- and a failure then proves nothing.
+    """
+    rep.head(10, "decode-only fallback (one file swap, two keys)")
+    prim = next((n for n in nodes if n.kind == "text-generator"), None)
+    fb_files = sorted(bundle.glob("genie_text_generator_*_decodeonly.json"))
+    fb_scripts = sorted(bundle.glob("genie_pipeline_*_decodeonly.script"))
+    if not fb_files or not fb_scripts:
+        rep.fail("no decode-only fallback shipped (config and/or script) -- the "
+                 "single-attempt plan requires one")
+        return
+    if prim is None:
+        rep.fail("no primary text-generator to compare the fallback against")
+        return
+
+    fb_path = fb_files[0]
+    try:
+        fb = json.loads(fb_path.read_text())
+    except Exception as exc:                                  # noqa: BLE001
+        rep.fail(f"{fb_path.name}: unparseable ({exc})")
+        return
+    prim_doc = json.loads((bundle / prim.file).read_text())
+    a = prim_doc["text-generator"]["engine"]["backend"]["QnnHtp"]
+    b = fb["text-generator"]["engine"]["backend"]["QnnHtp"]
+    extra = sorted(set(b) - set(a))
+    if extra != sorted(SELECT_KEYS):
+        rep.fail(f"{fb_path.name}: QnnHtp adds {extra}, expected "
+                 f"{sorted(SELECT_KEYS)}")
+    stripped = {k: v for k, v in b.items() if k not in SELECT_KEYS}
+    if stripped != a:
+        diff = sorted(k for k in set(a) | set(stripped)
+                      if a.get(k) != stripped.get(k))
+        rep.fail(f"{fb_path.name}: differs from the primary beyond the select "
+                 f"keys, on {diff}")
+    else:
+        rep.ok(f"{fb_path.name}: identical to the primary once "
+               f"{sorted(SELECT_KEYS)} are removed")
+
+    selected = b.get("execute-select-graphs") or []
+    all_graphs = {g for gm in graphs_by_bin.values() for g in gm}
+    unknown = [g for g in selected if g not in all_graphs]
+    if unknown:
+        rep.fail(f"{fb_path.name}: execute-select-graphs names no shipped graph: "
+                 f"{unknown}")
+    if any(g.startswith("prefill") for g in selected):
+        rep.fail(f"{fb_path.name}: selects a prefill graph, which defeats the "
+                 "point of the fallback")
+
+    # The fallback loads only its selected graphs, so validate that subset.
+    shards = []
+    for cb in prim.ctxbins:
+        gm = graphs_by_bin.get(cb) or {}
+        shards.append({k: v for k, v in gm.items() if k in set(selected)})
+    if all(shards):
+        ctx = (prim.body.get("context") or {}).get("size")
+        htp = prim.backend.get(prim.backend.get("type")) or {}
+        pe = prim.model.get("positional-encoding") or {}
+        errs, _ = simulate_genie_load(shards, ctx, htp.get("kv-dim"),
+                                     pe.get("rope-dim"))
+        if errs:
+            for gname, tname, msg in errs:
+                rep.fail(f"{fb_path.name} (decode-only): {gname} : {tname} - {msg}")
+        else:
+            rep.ok(f"{fb_path.name}: the {len(selected)} selected graph(s) would "
+                   "pass validateModel")
+    else:
+        rep.fail(f"{fb_path.name}: a ctx-bin contributes none of {selected}")
+
+    fb_script = fb_scripts[0]
+    body = strip_comments(fb_script.read_text())
+    prim_script = next((p for p in bundle.glob("genie_pipeline_*.script")
+                        if "decodeonly" not in p.name), None)
+    if prim_script is None:
+        rep.fail("no primary pipeline script to compare the fallback against")
+        return
+    pa = [l.strip() for l in strip_comments(prim_script.read_text()).splitlines()
+          if l.strip()]
+    pb = [l.strip() for l in body.splitlines() if l.strip()]
+    if len(pa) != len(pb):
+        rep.fail(f"{fb_script.name}: {len(pb)} statements vs the primary's "
+                 f"{len(pa)} -- it must differ by ONE line")
+    else:
+        diffs = [(x, y) for x, y in zip(pa, pb) if x != y]
+        if len(diffs) != 1 or fb_path.name not in diffs[0][1]:
+            rep.fail(f"{fb_script.name}: expected exactly one differing line "
+                     f"naming {fb_path.name}, got {diffs}")
+        else:
+            rep.ok(f"{fb_script.name}: differs from the primary by exactly the "
+                   "textGenerator config line")
+
+
+# --------------------------------------------------------------------------- #
+# check 11 -- weather test-image kit
+# --------------------------------------------------------------------------- #
+def check_kit(bundle, raw_name, pixel_enc, rep):
+    """Every kit script must be runnable as shipped.
+
+    A kit image whose blob is missing, mis-sized, or quantized against a
+    different encoding than the shipped ViT is not a test -- it is a device
+    session wasted on a bad input.
+    """
+    rep.head(11, "weather test-image kit (closure, size, encoding)")
+    scripts = sorted(bundle.glob("wx_*.script"))
+    if not scripts:
+        rep.fail("no wx_*.script in the bundle -- the test kit is missing")
+        return
+    before = len(rep.problems)
+    seen_raw = set()
+    for s in scripts:
+        stem = s.stem
+        body = strip_comments(s.read_text())
+        refs = {v for _, _, _, v in SET_RE.findall(body)}
+        refs |= {f for _, f in CFG_RE.findall(body)}
+        missing = sorted(r for r in refs if not (bundle / r).is_file())
+        if missing:
+            rep.fail(f"{s.name}: references missing file(s) {missing}")
+        own = [r for r in refs if r.endswith(".raw")]
+        if own != [f"{stem}.raw"]:
+            rep.fail(f"{s.name}: feeds {own}, expected ['{stem}.raw'] -- a kit "
+                     "script that points at another image tests the wrong scene")
+            continue
+        seen_raw.add(f"{stem}.raw")
+        blob = bundle / f"{stem}.raw"
+        if blob.is_file() and blob.stat().st_size != RAW_BYTES:
+            rep.fail(f"{blob.name}: {blob.stat().st_size} bytes != {RAW_BYTES}")
+        side = bundle / f"{stem}.json"
+        if not side.is_file():
+            rep.fail(f"{stem}.json: sidecar missing")
+            continue
+        try:
+            meta = json.loads(side.read_text())
+        except Exception as exc:                              # noqa: BLE001
+            rep.fail(f"{stem}.json: unparseable ({exc})")
+            continue
+        enc = meta.get("encoding") or {}
+        got = (float(enc.get("scale", 0)), int(enc.get("offset", 0)))
+        if pixel_enc and got != pixel_enc:
+            rep.fail(f"{stem}.json: encoding {got} != the shipped ViT's "
+                     f"pixel_values {pixel_enc} -- these bytes are not what the "
+                     "graph expects")
+        if meta.get("grid_thw") != [[1, 32, 32]]:
+            rep.fail(f"{stem}.json: grid {meta.get('grid_thw')} != [[1,32,32]]")
+    stray = sorted(p.name for p in bundle.glob("wx_*.raw")
+                   if p.name not in seen_raw)
+    if stray:
+        rep.fail(f"kit blob(s) no script feeds: {stray}")
+    if not (bundle / "TEST_IMAGES.md").is_file():
+        rep.fail("TEST_IMAGES.md missing -- the kit has no expected outputs")
+    if len(rep.problems) == before:
+        rep.ok(f"{len(scripts)} kit script(s), blobs closed and encoding-matched")
+
+
+# --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bundle", required=True, help="assembled bundle directory")
@@ -1021,6 +1183,8 @@ def main():
     else:
         check_chat_template(bundle, args.model, seg_files, meta, rep)
     check_genie_load(bundle, nodes, graphs_by_bin, rep)
+    check_fallback(bundle, nodes, graphs_by_bin, rep)
+    check_kit(bundle, raw_name, pixel_enc, rep)
 
     n = len(rep.problems)
     if n:
