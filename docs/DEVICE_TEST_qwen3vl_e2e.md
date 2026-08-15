@@ -1,17 +1,38 @@
-# Device test — Qwen3-VL-4B end-to-end pipeline (SA8797P)
+# Device test — Qwen3-VL-4B end-to-end pipeline v2 (SA8797P)
 
 **Nothing in this bundle has ever executed on an SA8797P.** HTP context binaries
 cannot run on x86, and this SDK has no x86 execution path for W8A16 either
 (`libQnnCpu` ships no 16-bit fixed-point kernels — see
-`docs/NOTES-genie-pipeline.md`). Every number below comes from numerical parity
-against HuggingFace at the ONNX level plus static contract checks on the
-finalised binaries. **This first device run is the real test.**
+`docs/NOTES-genie-pipeline.md`). Everything below comes from numerical parity
+against HuggingFace at the ONNX level, plus static contract checks on the
+finalised binaries. **This device run is the real test.**
 
-What *is* proven device-free: the full host-side path — image → ViT → splice →
-text tower under the runtime's exact feed pattern — reproduces
-`hf.generate` **token-for-token** on a real image+text prompt, across three
-independent chains including the all-decode path the device actually takes
-(`scripts/validate/parity_e2e_vl.py`).
+## What changed since the 2026-08-14 attempt
+
+That bundle **never loaded**. Node creation died with two `ShapeError`s on
+`attention_mask` (`Expected [1,128,2176]`, `Found [1,128,128]`) and a SIGSEGV,
+before a single token. Root cause in `docs/REFERENCE.md` §3.6: in a *split*
+tower, shard 0's prefill has no `logits`, so it classifies `DECODER_PREFILL`,
+its expected CL is rewritten to the cache-group maximum, and an AR==CL
+"bertcache" mask can never satisfy that.
+
+Two things are different now:
+
+1. **The text tower was rebuilt with a past-KV prefill.** `attention_mask` is
+   `[1,128,2176]` and `past_key_N_in` is `[1,8,128,2048]` — byte-for-byte what
+   the validator demanded. This is the same recipe as the device-proven 0.6B
+   `ladekv` build, not a new idea.
+2. **A load simulation now gates the build.** `lint_pipeline_bundle.py` check 9
+   replays libGenie's own `validateModel` — graph classification, AR/CL
+   derivation, the cache-group scatter/concat detection, the `DECODER_PREFILL`
+   CL rewrite, and every `checkShape` — against the shipped `info.json`s. It was
+   only accepted as a gate once it **reproduced the 2026-08-14 failure** on the
+   old binaries, with the device's exact message, on both shards. It passes on
+   what ships here.
+
+That closes the specific failure. It cannot close unknown ones: everything
+inside `libQnnHtp`/`libGenie` beyond shape validation is still unproven for this
+configuration.
 
 ## Run it
 
@@ -25,115 +46,116 @@ LD_LIBRARY_PATH=. ./genie-app -s genie_pipeline_qwen3vl.script
 The bundle is flat on purpose: Genie's loader resolves the `.so` files and every
 config-referenced path from the bundle root, not from a `lib/` subdirectory.
 
-## What success looks like
+## 1. Smoke test — the sample image
 
-The bundled `sample_image.png` is a red circle and a blue square on a white
-background — the same scene the parity gate used, so the outputs are directly
-comparable. The prompt is *"Describe this image in one sentence."*
+`sample_image.raw` is a red circle and a blue square on a white background, the
+same scene the parity gate used, so the output is directly comparable.
+Prompt: *"Describe this image in one sentence."*
 
-**Expected output**, recorded from the E2E gate's Tier-A chain (the exact
-configuration this bundle ships — deepstack fed zeros):
+**Expected output** (recorded from the gate's `tierB` chain — the past-KV
+prefill feed with deepstack zeroed, i.e. exactly what this bundle runs):
 
 > A red circle and a blue square are positioned side by side on a white background.
 
-**Do not expect a byte match.** That string came from an fp32 ONNX run of the
-text tower with fp32 ViT features. On device both towers are W8A16, so wording
-will drift. The success bar is **semantic**: the caption must correctly name
-both shapes, both colours, and the white background. Anything that does that is
-a pass. Fluent text that describes a *different* image is a failure — see triage.
+**Do not expect a byte match.** That came from an fp32 ONNX run; on device both
+towers are W8A16, so wording drifts. The bar is **semantic**: the caption must
+name both shapes, both colours, and the white background. Fluent text describing
+a *different* image is a failure — see triage.
 
-For reference, the same pipeline with real deepstack (not reachable through a
-stock Genie pipeline — see below) produces
-*"The image displays a simple composition of a red circle and a blue square on a
-white background."*, which is HF's exact output. Zeroing deepstack costs
-phrasing, not image understanding.
+## 2. Weather / road kit
 
-## ⛔ SUPERSEDED BY THE 2026-08-14 DEVICE ATTEMPT — this bundle does not load
+Six real photographs covering the deployment's scenes — road, surroundings,
+weather (rain, fog, snow, clear, overcast, traffic). Each has its own script:
 
-**Everything below about timing was written before the bundle met hardware, and
-the prediction was wrong.** The run never reached a first token: node creation
-died at load with
-
-```
-ShapeError : attention_mask — Expected [ 1, 128, 2176] bitwidth=*. Found [ 1, 128, 128] bitwidth=2   (x2, one per shard)
-Error validating model. Failed to create the Genie Node (-1).
-Segmentation fault
+```bash
+for s in wx_*.script; do
+  echo "== $s"; LD_LIBRARY_PATH=. ./genie-app -s "$s"
+done
 ```
 
-Cause: this is a **split** tower. The lm_head lives in the last shard, so
-`prefill_0` emits no `logits`, classifies `DECODER_PREFILL`
-(`nsp-graph.cpp:245-251`), and its expected CL is rewritten to the cache-group
-max (`nsp-model.cpp:604-605`) — so the `[1,128,128]` mask fails `validateModel`
-before any graph-selection logic runs. The reasoning below (bertcache graph
-silently skipped, slow but working) is correct **only for an unsplit tower**.
+`TEST_IMAGES.md` in the bundle carries, per image, the expected device-faithful
+caption **and** the HF fp32 reference. Same semantic bar: the weather and the
+scene contents must be right; wording will not match.
 
-**Do not re-run this bundle as shipped.** The fix is the past-KV prefill
-re-export — see `docs/superpowers/plans/2026-08-15-qwen3vl-prefillkv-rebuild.md`.
-A config-level escape hatch (`execute-select-graphs`) exists and is
-**unverified on hardware**; see `docs/REFERENCE.md` §3.6.
+Every kit image was checked against the ViT's calibrated input range — all six
+clip by at most 1.00 LSB, so none of them is out-of-domain for the encoder.
 
-Full mechanism: `docs/NOTES-genie-io.md` § "Split prefill is fatal at load",
-`docs/NOTES-genie-pipeline.md` § C1. Device record:
-`reports/qwen3vl-4b-e2e-deployment-status-2026-08-14.md`.
+## 3. Timing — what to measure, and what we can and cannot predict
 
-## Expected timing — *once a loadable bundle exists*
+A 273-token prompt is processed as **three AR=128 prefill calls**
+(`n_process` = 128, 128, 17 — the last padded), not as 273 sequential AR=1
+decode steps. That is a structural fact of qualla's strategy loop
+(`kvmanager.cpp:409,433`), verified in source and reproduced in the parity gate.
 
-With the past-KV prefill rebuild, the 273-token prompt processes as
-128 + 128 + 17 rows, so **TTFT should be ~3-4 s**, not 30.
+**We deliberately do not quote a TTFT number.** No Qwen3-VL graph has ever run
+on this device, and the only decode-step measurement we have is the 0.6B text
+model's 155 ms/step, against which this model carries roughly 4.5× the weight
+traffic across two shards. Extrapolating that into a promise would be inventing
+a number. What is defensible is the *ratio*: prefill replaces ~273 sequential
+graph executions with 3, so TTFT should be far shorter than the all-decode
+fallback below, and that difference is what we are asking you to measure.
 
-The ~30 s figure below applied to the all-decode fallback path (every prompt
-token through the AR=1 decode graph). It remains the expectation **if** you run
-with the `execute-select-graphs` decode-only config, since that deliberately
-drops the prefill graphs. At the 0.6B-measured ~10 tok/s that is ~27 s of
-prompt processing before generation starts.
+Please report: init→first-token, tokens/s during generation, and the same two
+numbers for the fallback if you end up running it. Compare cold-start numbers
+only like-for-like — an init→first-logits vs TTFT unit mismatch once produced a
+phantom "+134% regression" in this project.
+
+## 4. If — and only if — the primary fails at load
+
+Swap to the decode-only configuration. **One file, nothing else:**
+
+```bash
+LD_LIBRARY_PATH=. ./genie-app -s genie_pipeline_qwen3vl_decodeonly.script
+```
+
+It carries `load-select-graphs` / `execute-select-graphs: ["decode_0","decode_1"]`,
+which filters the prefill graphs out before they ever become variants
+(`nsp-model.cpp:314-318`), so nothing shape-validates them. The lint proves this
+config differs from the primary by exactly those two keys, and the script by
+exactly one line, so a failure here is not confounded by anything else.
+
+Cost: **all** prefill. Every prompt token goes through the AR=1 decode graph.
+Output should be unchanged — the gate's `chain0-alldecode` is exactly this path
+and is token-identical to HF — but expect it to be *much* slower to first token.
+
+**This fallback is untested on device and carries one unverified risk:** the same
+graph-name list is handed to *both* contexts, and whether HTP tolerates an
+enable-graphs name that is absent from a given binary is sealed inside
+`libQnnHtp`. If the fallback *also* fails, **stop and report the error text** —
+do not keep swapping configs.
 
 ## Triage
 
-| Symptom | First suspect | Check |
+| Symptom | Most likely cause | Action |
 |---|---|---|
-| `GENIE_STATUS_ERROR_JSON_SCHEMA` at load | a config declares `positional-encoding` **and** backend `pos-id-dim`/`rope-theta` | `Engine.cpp:159-161,677-680`. This exact bug shipped in the Stage 2 bundle. `lint_pipeline_bundle.py` check 3 |
-| Load error naming a tensor or quant params | split encodings lineage — identically-named tensors across splits must carry byte-identical quant params | `docs/NOTES-genie-splits.md` |
-| **`ShapeError: attention_mask Expected [1,AR,CL] Found [1,AR,AR]` → `Failed to create the Genie Node (-1)` + SIGSEGV** | **an AR==CL bertcache prefill in a SPLIT tower — OBSERVED 2026-08-14.** Shard 0's prefill has no logits → `DECODER_PREFILL` → expected CL rewritten to cache-group max → mask rejected at load | Not fixable by config alone. Rebuild with a past-KV prefill (`[1,AR,CL]`, `CL>AR`), or drop the prefill graphs via `execute-select-graphs` (untested). `REFERENCE.md` §3.6 |
-| SIGSEGV on the first token | a graph not listed in `graph_names`, silently compiled with backend defaults (O=0, 4 MB VTCM) | `qnn-context-binary-utility --json_file`, compare against **both** `htp_backend_ext_config_*.json`. Precedent: BUILD_GUIDE §5.4b |
-| Output is `!!!…` (token 0) | logits read past the end of a one-row buffer | prefill must emit all-position logits `[1,AR,vocab]` — `docs/NOTES-genie-io.md` |
-| `"Unsupported requantization operation"` | an fp16 tensor reached the embedding accumulator | the ViT ctx-bin must be W8A16 with UFIXED_16 IO, not the old fp16 one. `Quantization.cpp:163-192` |
-| Image encoder "succeeds" but the caption ignores the image | `setupInputFP16` silently discarded the pixels — you are running the **fp16** ViT | confirm `pixel_values` is `QNN_DATATYPE_UFIXED_POINT_16`; `nsp-image-model.cpp:526-530` |
-| Fluent caption, wrong/hallucinated content | image embeddings not spliced, or spliced at the wrong rows | the two `pipeline connect` lines; segment order in the script |
-| Caption degrades only when an image is present | MRoPE not engaging — `vision-param` missing, so `setVisionParam` is never called and image rows fall back to plain rope | `ImageEncoder.cpp:46-47,136-138`; `vision-param` must be `32`×`32` in **patch** units |
-| Garbled/blank image understanding, no error | the raw blob is not what the graph expects | `sample_image.raw` must be exactly 3,145,728 bytes of uint16, quantized with the graph's own `pixel_values` scale/offset |
-| Prompt appears to contain literal `\n` | segment files written with escapes, or via `node set text` instead of `node set textFile` | genie-app never unescapes (`main.cpp:655-658`); segment files must hold real newlines and **no trailing newline** |
+| **`ShapeError: attention_mask Expected [1,AR,CL] Found [1,AR,AR]` → `Failed to create the Genie Node (-1)` + SIGSEGV** | The 2026-08-14 failure. **This must not happen with this bundle** — check 9 gates exactly this, and the shipped graphs carry `[1,128,2176]` | If it happens anyway, the shipped binary is not the one that was gated. Capture the full log and the `info.json`s and stop; do not try the fallback first |
+| `Failed to create the Genie Node (-1)` with a *different* tensor named | A validateModel rule the load simulation does not model | Capture the exact `Expected/Found` line — it maps directly onto `nsp-model.cpp:844-917` and tells us which rule to add |
+| Loads, but the caption describes a different image | Image blob / encoding mismatch, or MRoPE not engaging | Confirm `.raw` is 3,145,728 bytes; check `vision-param` is present in the image-encoder config (its absence silently drops image rows to plain rope) |
+| Caption is fluent but generic ("a photo of a scene") | Image features not reaching the text tower | Check the ImageEncoder→TextGenerator connection line in the script and that the ViT ctx-bin loaded |
+| Repetition until `Context Size was exceeded` | Sampler config, not the model | The shipped generator is greedy with `context.size 2048`; report it and move on |
+| Fallback also fails at load | The cross-context enable-graphs risk above | Report the error text verbatim. This is the documented unknown |
 
 ## Known limitations of this bundle
 
-**Deepstack is fed zeros.** Genie's stock `ImageEncoder` node publishes exactly
-one output and throws on any other IO name (`ImageEncoder.cpp`), so the ViT's
-three `deepstack_visual_embed` tensors have no route into the text tower. Those
-graph inputs are explicitly memset to zero at load by qualla's
-`initializeUnconnectedInputs` (`nsp-model.cpp:1442-1489`), so this is a defined,
-intentional degradation — exactly HF-minus-deepstack — not undefined behaviour.
-
-⚠ **One latent hazard**: that memset is sized from the *last* variant's spec
-(`nsp-model.cpp:1481`), which for our graph order is `decode_0` at AR=1 — 5120
-bytes of a prefill-AR-sized allocation. It is harmless **only because** prompts
-over 128 tokens never touch the prefill graph. **A prompt shorter than 128
-tokens would select prefill and read uninitialised memory beyond the first 5120
-bytes.** If you test with a short prompt and see garbage, that is why. The fix
-is per-graph-distinct deepstack tensor names.
-
-**Single image, first turn only.** qualla's rope-delta continuation resets its
-base to the raw row index on a second image (`nsp-model.cpp:3827`), and
-`visionPos` is batch-local while the rope table is indexed by absolute KV
-position — so a second image, or an image in turn ≥2, lands at the wrong
-offsets. Details in `docs/NOTES-genie-pipeline.md` §B.
+- **Deepstack is fed zeros.** A stock Genie pipeline has no path to deliver the
+  ViT's three deepstack tensors to the text tower, so those graph inputs are
+  zero-filled at load (`initializeUnconnectedInputs`). This is a *defined*
+  degradation, not a bug: it costs phrasing, not image understanding. Every
+  expected caption in this bundle was generated **with the same degradation**,
+  so they are directly comparable.
+- The sub-128-token uninitialised-read hazard is **closed**: the prefill graph's
+  deepstack inputs were renamed (`..._p`) so they get their own allocations and
+  each is zero-filled at its own full size.
+- W8A16 throughout. Wording will differ from any fp32 reference.
+- `context.size` is 2048; prompts longer than that will be refused.
 
 ## What to capture on failure
 
-1. Full stdout, including everything before the first token.
-2. `adb logcat | grep -iE 'genie|qnn|qualla|htp'` from before the run.
-3. `qnn-context-binary-utility --context_binary <bin> --json_file out.json` for
-   whichever binary is implicated, and the exact script used.
-4. If it loads but the caption is wrong: re-run with a **text-only** prompt
-   through `genie-t2t-run` against `genie_dialog.json`. That isolates tower from
-   pipeline — but note it proves nothing about MRoPE, which is unreachable from
-   the dialog path (`TextGenerator.cpp:302,333` are the only callers of
-   `setVisionParam`, and there is no C API for it).
+1. The complete stdout/stderr, including everything before the first error.
+2. `adb logcat` around the run.
+3. Which script you ran, and whether the fallback was tried.
+4. The `*.info.json` files from the bundle you actually pushed — that is how we
+   confirm the gated bytes are the run bytes.
+
+Screen photographs are fine; they get transcribed to Markdown and the Markdown
+becomes the record.
