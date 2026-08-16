@@ -470,11 +470,17 @@ def cmd_scan(a):
     for r in rows:
         if r["md5"]:
             by_md5.setdefault(r["md5"], []).append((r["host"], r["name"], r["bytes"]))
+    # Classify on "does any ONE host hold this twice", not "is more than one host
+    # involved". A group can be both: the 4B splitkv tower is stored twice on
+    # this box AND once on tank, and testing set-size alone filed the whole
+    # group as expected-cross-host, hiding 4.51 GB of local waste inside a line
+    # that says everything is fine.
     same, cross = [], []
     for m, entries in sorted(by_md5.items()):
         if len(entries) < 2:
             continue
-        (same if len({h for h, _, _ in entries}) == 1 else cross).append((m, entries))
+        hosts = [h for h, _, _ in entries]
+        (same if len(hosts) != len(set(hosts)) else cross).append((m, entries))
 
     def show(title, groups):
         if not groups:

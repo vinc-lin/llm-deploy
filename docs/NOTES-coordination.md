@@ -85,10 +85,15 @@ recipe  md5  bytes  kind  name  state  location  host  utc  commit  note
 
 **Known latency:** a registry entry crosses worktrees only at commit + merge.
 Within a host that gap is covered by claims (§4), which are visible the instant
-they are taken. Across hosts it is covered by the fact that the two hosts have
-disjoint capabilities — tank cannot reach HF, this box cannot fit a 4B export —
-so the same derivation rarely starts in both places. Push before a remote build
-anyway; that was already the rule.
+they are taken.
+
+Across hosts there is no live channel at all, and the disjoint-capability
+argument — tank cannot reach HF, this box cannot fit a 4B export — is weaker
+than it looks: the 4B splitkv tower turned out to exist on **both** hosts
+(§7), so artifacts do cross even when the derivation cannot. Treat the registry
+as the cross-host mechanism and keep it current: push before a remote build
+(already the rule), and run `coord.py scan` on the far side afterwards, then
+bring the file back. That round trip is what makes tank's builds visible here.
 
 ## 4. Claims — advisory, self-healing
 
@@ -178,16 +183,35 @@ sent the device team to the confounded arm. The authority was right and everyone
 following instructions would still have done the wrong thing. A document nobody
 opens first cannot carry a correction by itself.
 
-## 7. What this found on its first run
+## 7. What this found on its first runs
 
-Backfilling 27 artifacts surfaced two byte-identical groups that had never been
-noticed:
+Backfilling 32 artifacts across both hosts surfaced three byte-identical groups
+that had never been noticed. All three are duplicated **within one host**, which
+is the waste case:
 
-| md5 | names | wasted |
+| md5 | copies on one host | size each |
 |---|---|---:|
-| `9c6024ad…` | `gqafix-ctrl-ladekv` == `gqafix-ladekv` | 1.09 GB, ~20 min, nearly a device arm |
-| `235e71af…` / `fd552818…` | `splitkv-flat/*` == `splitkv/{1,2}_of_2` | **4.3 GB**, a 4B tower that only builds on tank |
+| `9c6024ad…` | `gqafix-ctrl-ladekv` == `gqafix-ladekv` | 1.09 GB |
+| `235e71af…` | `splitkv-flat/…_1_of_2` == `splitkv/1_of_2` | 1.86 GB |
+| `fd552818…` | `splitkv-flat/…_2_of_2` == `splitkv/2_of_2` | 2.65 GB |
 
-Neither is deleted here — reclaiming is a separate, explicit decision. But both
-were invisible before, and the second is on the model whose export does not fit
-on this box at all.
+**5.60 GB**, all on the WSL box — and 4.51 GB of it is the 4B tower, whose
+export needs tank's 125 GB and cannot be rebuilt here at all. `tank` also holds
+that tower, which is correct; tank is its canonical home.
+
+Nothing is deleted here — reclaiming is a separate, explicit decision.
+
+### Two bugs the cross-host run exposed, worth keeping in mind
+
+Both were in the *reporting*, which is where a coordination tool fails quietly.
+
+1. **A legacy key was `legacy:<name>`, so tank skipped its own copies** of
+   `qwen3vl-4b-w8a16-splitkv` as already-known from this box's scan. A name on
+   two hosts is no evidence of the same bytes. Now `legacy:<host>:<name>`.
+   Real recipe keys stay host-agnostic on purpose — those are content-derived,
+   and a build on tank *should* spare this box from repeating it.
+2. **The alias report classified on "is more than one host involved"**, so the
+   4.51 GB group — duplicated locally *and* legitimately present on tank — was
+   filed entirely as expected-cross-host. The test has to be "does any one host
+   hold this twice". A report that hides waste inside a line saying everything
+   is fine is worse than no report.
