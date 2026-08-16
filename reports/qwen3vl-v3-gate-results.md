@@ -33,8 +33,9 @@ blobs, which is what blocked the device on 2026-08-15 with
 | Genie load simulation | PASS — replay clean | same |
 | fp32 grouped exports | PASS — `Expand=0` ×3, wrapper-vs-HF 2.587e-05 | `logs/vl_gqa_stage4.log` |
 | **`parity_e2e_vl.py` all 6 chains** | **PASS — 4/4 gated chains 20/20** | same |
-| Kit captions (6 images, tierB) | *running* | |
-| Bundle v3 lint | *pending* | |
+| Kit captions (6 images, tierB) | PASS — token counts identical to v2 | `logs/vl_gqa_stage5.log` |
+| Kit blobs padded | PASS — 6 × 3,149,824 B, ≤1.00 LSB clip | |
+| Bundle v3 lint | *running* | |
 
 ---
 
@@ -169,6 +170,29 @@ with zeroed deepstack, the deployed combination):
 Word-for-word identical to v2's, despite a completely new quantization
 lineage — a useful stability signal, and the string that goes verbatim into
 `DEVICE_TEST.md` as the expected result of the single smoke test.
+
+## Phase 5 — test kit on v3 numerics
+
+Six real weather/road photographs, each re-captioned through
+`tierB-prefillkv-zero-deep` (the deployed combination) on the v3 tower.
+
+⚠ **`--steps 64` is required and the default silently truncates.**
+`parity_e2e_vl.py` defaults to `STEPS = 24` and stops there whether or not EOS
+was reached. The first v3 attempt ran without it and every caption came back
+chopped mid-clause ("…while a woman in a pink jacket sits"), including the
+`hf_reference` field. That is the worst kind of reference: the device team
+cannot distinguish a truncated expectation from a real device defect. Re-run
+cost ~40 min.
+
+With `--steps 64`, generated-token counts came out **31, 45, 26, 46, 37, 29** —
+**identical to v2's**, image for image. Same stopping points on a completely
+new quantization lineage is a strong consistency signal.
+
+All six blobs rebuilt at **3,149,824 B** (payload + 4096 pad) with
+`pad_bytes: 4096` in each sidecar, quantized against the shipping ViT
+ctx-bin's own `pixel_values` encoding (`scale 3.051804379e-05`, `offset
+-32768`). Every image clips by at most **1.00 LSB**, i.e. none is out of
+domain for the encoder.
 
 ## DDR bandwidth: v2 vs v3
 
