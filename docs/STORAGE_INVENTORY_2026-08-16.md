@@ -47,10 +47,16 @@ Read-only survey. Nothing was deleted, moved or modified to produce it.
 > `work/ctxbin/qwen3-0.6b-w8a16qh` (1.8 GB) and `…qh-lade` (2.1 GB) existed in no
 > bundle and on no remote, and `REFERENCE.md` §8.2 cited them as the only known
 > specimens of a silently-unshared build. Rather than delete or keep them blind,
-> the question was **settled from their `info.json`** — `graphBlobInfoV2.constSize`
-> names an unshared graph directly, so file size was never the only symptom
-> (§8.2, resolved). The 4.0 GB of `.bin` then went; **the two `info.json` files
-> are retained at 541 KB as the evidence.**
+> the question was **settled from their `info.json`** — `graphBlobInfoV2`
+> reports the shared pool and each graph's private const block, so file size was
+> never the only symptom (§8.2, resolved). The 4.0 GB of `.bin` then went; **the
+> two `info.json` files are retained at 541 KB as the evidence.**
+>
+> ⚠ Superseded in part (301df8e, 2026-08-17): the signal is the **pooled
+> fraction**, not `constSize == 0`. These two bins are genuine specimens at 29%
+> and 62% pooled, so the release decision stands — but `gqafix_qh_ladekv` is
+> healthy at 95% while carrying 144 MB of private const, so a non-zero
+> `constSize` alone does not name an unshared graph.
 >
 > Generalisable: a ctx-bin's `info.json` is ~0.01% of its size and carries most
 > of what anyone later asks of it. Strip the `.bin`, keep the sidecar.
