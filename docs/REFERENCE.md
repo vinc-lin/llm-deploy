@@ -27,7 +27,8 @@ corrections #27–#32.***
 | Output correctness | ✅ since v2 (2026-08-10) |
 | Quantization | W8A16 (INT8 per-channel weights, FP16 activations) — the only recipe that works |
 | Ctx-bin, 0.6B | ~1.09 GB, 2 or 3 weight-shared graphs |
-| Device access | none from this machine — build + numerics only; device runs are done by a remote tester |
+| Device access | none from either build host — build + numerics only; device runs are done by a remote tester |
+| Build hosts | **two**: this WSL box (GPU, and the only one that can reach Hugging Face) and `tank` (44 cores / 125 GB RAM / no GPU / no HF). Tank builds, local publishes — `LOCAL_ENV.md` §Machines |
 | Blocked on hardware | tok/s, VTCM behavior, perf profiles, anything GVM. **Not** DDR bytes — those are build-time measurable (§6.9) |
 
 **What moves the needle next (revised 2026-08-16).** The GQA replication fix

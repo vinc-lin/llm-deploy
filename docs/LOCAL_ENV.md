@@ -2,7 +2,13 @@
 
 *Started 2026-08-10. Companion to `docs/superpowers/plans/2026-08-10-local-sa8797p-pipeline.md`.*
 
-## Machine
+## Machines
+
+There are **two** build hosts. Every doc written before 2026-08-16 says "this
+machine" and silently means the first one; treat those statements as
+WSL-specific unless they name tank.
+
+### 1. This WSL box — GPU, and the only host that can publish
 
 - WSL2 (kernel 6.6.87.2), Ryzen 9 5900X (24T), 47 GB RAM, RTX 4060 Ti 8 GB (CUDA passthrough OK)
 - Repo: `/mnt/x/code/llm-deploy` (drvfs/NTFS — Windows-visible; `~/code` is a symlink here)
@@ -10,6 +16,35 @@
   Free space moves constantly — check it live (`df -h`), and note `disk_guard`
   gates on **`/mnt/c`**, not on this path, because the vhdx lives on C:.
 - No sudo; `uv` manages Python toolchains. Proxy available at `http://127.0.0.1:17890` (`proxy-on`).
+
+### 2. `tank` — RAM, cores, disk; no GPU, no Hugging Face
+
+Reached as `ssh tank`. Verified 2026-08-16:
+
+| | |
+|---|---|
+| CPU / RAM | 44 cores / 125 GB (torch reports 22 threads) |
+| Disk | `/` 937 GB, ~325 GB free — **native LVM, no vhdx**, so the SIGBUS class below cannot occur here |
+| GPU | **none.** `torch.cuda.is_available()` → `False` (torch 2.13.0+cu130 installed anyway) |
+| SDK / envs | QAIRT `2.48.40.260702`, `qwen3-deploy` + `qairt-py312` — same versions as local |
+| Repo | `~/llm-deploy`, a real git clone since 2026-08-16 (`origin` = GitHub mirror, `receive.denyCurrentBranch=updateInstead`) |
+| Hugging Face | **unreachable.** DNS returns an IPv6 address only and there is no route (`curl -6` → `000` in 0.07 s); IPv4 times out |
+| GitHub | HTTPS ✓ (200); ssh ✗ `Permission denied (publickey)` — `~/.ssh/id_ed25519` exists but is not authorized |
+
+Data: `~/llm-local/work` (`quant` 167 GB, `onnx` 122 GB, `dlc` 25 GB, `ctxbin`
+8.4 GB), `models/` = Qwen3-VL-4B-Instruct + Qwen3-0.6B, `bundles/` 11 GB.
+
+**Why the split is what it is.** Tank exists because a 4B export peaks at
+63.5 GB and does not fit in 47 GB. It cannot take over publishing because HF is
+unreachable and the proxy is bound to localhost here. So: **tank builds, local
+publishes.** Before any remote build, re-sync it with
+`git push ssh://tank/home/vinc/llm-deploy main` — a stale copy there once
+predated the `ctxbin_variant.sh` compiled-value readback, and a knob that
+silently fails to bind reads as a measurement rather than an error.
+
+**Retention policy.** Keep `*.encodings`, the `.onnx` graphs and the calib
+`.npz`; treat `model.pth` / `.data` / `onnx__MatMul_*` as regenerable. Measured
+on the 0.6B set: 8 quant dirs = 69 GB on disk, 1.1 GB of actual lineage (1.6%).
 
 ## Divergences from the remote (jump-host) environment
 

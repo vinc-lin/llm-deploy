@@ -69,6 +69,15 @@ Reference machine: WSL2 (also fine: native Linux), 8 GB VRAM GPU (0.6B
 quantizes on GPU; 1.7B needs `QUANT_DEVICE=cpu`), ~60 GB free disk on the
 data volume.
 
+> **This project runs on two hosts** — the WSL box above and `tank`
+> (44 cores / 125 GB RAM / 937 GB native disk, **no GPU**, **no Hugging Face
+> access**). `scripts/env.sh` derives its paths from its own location, so every
+> recipe below runs unchanged on either. Two rules follow from the table in
+> `LOCAL_ENV.md` §Machines: anything needing >47 GB RAM (a 4B export peaks at
+> 63.5 GB) belongs on tank; anything touching HF — model download, bundle
+> upload — **cannot** run there. Re-sync tank before a remote build:
+> `git push ssh://tank/home/vinc/llm-deploy main`.
+
 ### 2.1 Directory layout
 
 Two roots, wired together by `scripts/env.sh` (edit it if your paths differ):

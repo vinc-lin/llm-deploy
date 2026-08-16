@@ -2,12 +2,59 @@
 
 Read-only survey. Nothing was deleted, moved or modified to produce it.
 
+> ## ⚠ Two same-day addenda — read these before quoting any number below
+>
+> ### A. The survey omitted a whole host
+>
+> It counts only the WSL box. `tank` — the second build host
+> (`LOCAL_ENV.md` §Machines) — holds another **355 GB**: `work/quant` 167,
+> `work/onnx` 122, `dlc` 25, `ctxbin` 8.4, `bundles` 11, `models` 8.3. True
+> project footprint at survey time was therefore **~982 GB**, not 627 — every
+> total below understated by ~36%. The per-root analysis is unaffected; the
+> headline is not.
+>
+> Tank's disk is **not** the constraint the local one is — 937 GB native LVM,
+> ~325 GB free, no vhdx indirection, so C: exhaustion cannot happen there.
+>
+> ### B. The local roots were cut by ~133 GB the same day
+>
+> This survey's central claim — *"~211 GB of regenerable fp32 tensors are being
+> retained as if they were outputs"* — was acted on within hours. **The tables
+> below are a pre-cleanup snapshot.** Current state:
+>
+> | | survey | now | note |
+> |---|---:|---:|---|
+> | `C:` free | 54 GB (95%) | **181 GB (82%)** | still rising; vhdx `discard` reclaims asynchronously |
+> | `llm-local` | 297 GB | **165 GB** | |
+> | `work/quant` | 70.5 GB | **3.0 GB** | regenerable tensors stripped, all `.encodings`/`.onnx` kept |
+> | `work/ctxbin` | 47 GB | **32 GB** | 11 pre-fix bins removed, each matched to a backing bundle first |
+> | `work/dlc` | 33 GB | **14 GB** | 8 pre-GQA-fix families |
+> | `bundles` | ~80 GB | **46 GB** | 20 unpacked dirs that duplicated their own `.tar.gz` |
+>
+> **What was kept, and why it is the whole policy in one line:** per quant dir,
+> `*.encodings` + `*.onnx` are lineage and everything else regenerates. Measured:
+> 8 dirs × 8.6 GB → 122–152 MB each, i.e. **1.6% is irreplaceable** — an
+> independent confirmation of this survey's own 97%-regenerable finding. The
+> retained 0.6B lineage is checksum-identical to tank's copy, so it now exists
+> twice.
+>
+> **Deletions were verified, not assumed.** A bundle tarball was confirmed to
+> hold the ctx-bin at identical byte size (1,106,276,352) before any unpacked
+> copy went; all 29 tarballs were indexed once and pre-fix ctx-bins matched by
+> exact byte size rather than by name.
+>
+> **Two artifacts were deliberately spared:**
+> `work/ctxbin/qwen3-0.6b-w8a16qh` (1.8 GB) and `…qh-lade` (2.1 GB) exist in no
+> bundle and on no remote. Their DLCs *were* removed, so regenerating them now
+> costs a full re-quantisation rather than a 20-minute ctx-bin build — the one
+> place this cleanup traded reversibility for space.
+
 ## 0. Headline
 
 | | |
 |---|---|
-| **Total project footprint** | **~585 GB** across three roots on two drives, plus ~42 GB of tool caches on the same C: vhdx (**~627 GB** all in) |
-| **The binding constraint** | **C: is 95% full — 54 GB free.** Everything under `/` (the WSL vhdx) is backed by C: |
+| **Total project footprint** | **~585 GB** across three roots on two drives, plus ~42 GB of tool caches on the same C: vhdx (**~627 GB** all in) — *local only; add ~355 GB on tank, see the addendum* |
+| **The binding constraint** | **C: was 95% full — 54 GB free.** Everything under `/` (the WSL vhdx) is backed by C:. *Resolved same day: now 181 GB free — addendum B* |
 | **Quantization intermediates** | **346 GB** — 59% of everything, spread across **three** locations with no shared convention |
 | **Of that, irreplaceable** | **~9.6 GB (2.8%).** The other **97%** is fp32 weights that `quantize_aimet.py` regenerates |
 | Bundles | 80 GB local, ~61 GB of it name-matched on HF |
@@ -16,19 +63,24 @@ Read-only survey. Nothing was deleted, moved or modified to produce it.
 The disk is 95% full because ~211 GB of regenerable fp32 tensors are being retained
 as if they were outputs. That is the whole problem in one sentence.
 
+> **This diagnosis was acted on the same day** — ~133 GB reclaimed, C: to 82%.
+> See addendum B. The sentence stayed true; only the numbers moved.
+
 ---
 
 ## 1. The map — three roots, two drives
 
 | Root | Physical drive | Size | What it is |
 |---|---|---|---|
-| `/home/vinc/llm-local` (`$LLMDEPLOY_DATA`) | **C:** (via the WSL ext4.vhdx) | **297 GB** | live working set: `work/` 192, `bundles/` 80, `models/` 14, `sdk/` 5.7, `envs/` 5.6 |
+| `/home/vinc/llm-local` (`$LLMDEPLOY_DATA`) | **C:** (via the WSL ext4.vhdx) | **297 GB** → **165 GB** | live working set: `work/` 192→49, `bundles/` 80→46, `models/` 14, `sdk/` 5.7, `envs/` 5.6 |
 | `/home/vinc/.cache` | **C:** (same vhdx) | **~42 GB** | `uv` 34, `huggingface` 4.7, `codebase-memory-mcp` 1.7, playwright/puppeteer 1.7 |
 | `/mnt/x/llm-archive` | X: | **134 GB** | `quant-consumed-2026-08-14` (77), `quant-2026-08-13` (57) |
 | `/mnt/x/llm-local-archive` | X: | **152 GB** | a mirror of the old `work/` layout: `quant` 142, `onnx` 11 |
 | `/mnt/x/code/llm-deploy` | X: | 2.3 GB | the repo — but 2.3 GB of that is **one file** (see §5) |
+| `tank:~/llm-local` | tank's own LVM | **355 GB** | the second build host, omitted from this survey's totals: `work/` 324 (`quant` 167, `onnx` 122, `dlc` 25, `ctxbin` 8.4), `bundles/` 11, `models/` 8.3, `sdk/` 5.7, `envs/` 5.6 |
 
-Free space: **C: 54 GB (95% used)** · X: 334 GB (83% used).
+Free space at survey time: **C: 54 GB (95% used)** · X: 334 GB (83% used).
+After the same-day cleanup: **C: 181 GB (82% used)**.
 
 The C: number is the one that matters. Per `CLAUDE.md`, a failed vhdx grow is **not**
 an ENOSPC — the guest still reports free space, the host write fails, every mmap'd page

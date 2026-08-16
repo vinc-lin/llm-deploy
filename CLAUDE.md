@@ -30,7 +30,41 @@ direction — has caused four incidents.
 - `source scripts/env.sh` FIRST in every shell (QAIRT_SDK, PY envs, LD_LIBRARY_PATH).
 - uv envs: `qwen3-deploy` (torch/aimet/onnx export+quant), `qairt-py312` (converter only).
 - Heavy data (SDK, models, work, bundles) lives in `/home/vinc/llm-local/` — never in the repo.
-- `QUANT_DEVICE=cpu` for models >0.6B (8 GB VRAM box).
+- `QUANT_DEVICE=cpu` for models >0.6B locally (8 GB VRAM box); **always** on `tank` (no GPU).
+
+### Two build hosts — know which one you are on
+
+`scripts/env.sh` derives its paths from its own location, so the repo and every
+build script run unchanged on either. What differs is what each host *can* do:
+
+| | this WSL box | `tank` (`ssh tank`) |
+|---|---|---|
+| CPU / RAM | 5900X 24T / 47 GB | **44 cores / 125 GB** |
+| GPU | RTX 4060 Ti 8 GB, CUDA ✓ | **none** — `torch.cuda.is_available()` is False |
+| Disk | C:-backed vhdx, the SIGBUS hazard | 937 GB native, **no vhdx indirection** |
+| Hugging Face | ✓ via `127.0.0.1:17890` | ✗ **unreachable** (IPv6-only DNS, no route) |
+| GitHub | ✓ ssh | HTTPS only — the ssh key is not authorized |
+
+**Consequences, not preferences:** anything needing >47 GB RAM (a 4B export peaks
+at 63.5 GB) or large scratch must run on tank; anything touching HF — model
+download, `bundle.sh` upload, `hf_upload_watchdog.sh` — **cannot** run there and
+stays local. The proxy is bound to localhost, so this is not a config fix.
+
+`tank:~/llm-deploy` is a real git repo (`origin` = the GitHub mirror). Re-sync it
+from here with `git push ssh://tank/home/vinc/llm-deploy main` — it has
+`receive.denyCurrentBranch=updateInstead`, so the working tree updates in place.
+**Do this before every remote build.** A stale copy there once predated the
+`ctxbin_variant.sh` readback gate, which is exactly the check that catches a knob
+silently failing to bind — an unbound knob looks like a measurement, not an error.
+
+### What lives where
+
+Tank holds the canonical `work/` for **Qwen3-VL-4B** (its export does not fit
+locally) and now the **Qwen3-0.6B** lineage. Retain **encodings + `.onnx` graphs
++ calib `.npz`** and let the heavy tensors be regenerable: one 0.6B quant dir is
+8.6 GB of which ~135 MB is irreplaceable, so the whole 0.6B lineage is 1.1 GB
+against 69 GB of source dirs. Same logic for ctx-bins — generation is
+deterministic, so **store the recipe, not the variant**.
 
 ## Build chain
 
