@@ -39,3 +39,50 @@ disk_guard() {
         echo "ABORT: $target free space ${free_gb}GB < ${need_gb}GB" >&2; exit 1
     fi
 }
+
+# Standing constraint: never derive the same artifact twice. Same shape as
+# disk_guard and here for the same reason -- a per-script rule gets forgotten,
+# and this one already was. The rule it replaces ("md5sum the candidate against
+# work/ctxbin/*/ first") could not be followed: the candidate does not exist
+# until you have paid the ~20 min and multiple GB it was meant to save.
+#
+# ctx-bin generation is deterministic, so the bytes are a pure function of
+# (DLCs, graph names, config, SDK). coord_guard hashes THOSE -- in milliseconds,
+# before anything is built -- and refuses if the registry already has that
+# recipe, or if another session on this host is deriving it right now.
+#
+#   coord_guard <label> <dlc_csv> <graphs_csv> <overrides_json> [eta_min]
+#
+# Advisory by design: COORD_FORCE=1 proceeds anyway (use it when deliberately
+# testing determinism). Fails OPEN -- if coord.py itself is broken or missing,
+# it warns and lets the build run, because a coordination bug must never be
+# able to block real work.
+coord_guard() {
+    local label=${1:?label} dlcs=${2:?dlc csv} graphs=${3:?graph csv}
+    local overrides=${4:-'{}'} eta=${5:-20}
+    local coord=$LLMDEPLOY_ROOT/scripts/util/coord.py
+    [ -f "$coord" ] || { echo "WARN: coord.py missing; skipping dedup check" >&2; return 0; }
+
+    COORD_RECIPE=$(python3 "$coord" hash --dlc "$dlcs" --graphs "$graphs" \
+                          --overrides "$overrides" 2>/dev/null) || {
+        echo "WARN: coord_guard could not hash the recipe; proceeding unguarded" >&2
+        COORD_RECIPE=""; return 0; }
+    export COORD_RECIPE
+
+    python3 "$coord" guard --recipe "$COORD_RECIPE" --label "$label" --eta-min "$eta"
+    local rc=$?
+    if (( rc != 0 )); then
+        echo "ABORT: coord_guard -- see above. Nothing was built." >&2
+        exit $rc
+    fi
+}
+
+# Record the finished artifact and drop the claim. Call at the end of a build.
+coord_done() {
+    local name=${1:?name} path=${2:-} kind=${3:-ctxbin} note=${4:-}
+    local coord=$LLMDEPLOY_ROOT/scripts/util/coord.py
+    [ -n "${COORD_RECIPE:-}" ] && [ -f "$coord" ] || return 0
+    python3 "$coord" record --recipe "$COORD_RECIPE" --name "$name" \
+            --kind "$kind" --path "$path" --note "$note" || true
+    python3 "$coord" release --recipe "$COORD_RECIPE" >/dev/null 2>&1 || true
+}

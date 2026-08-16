@@ -63,6 +63,12 @@ print("devices    :", {k: v for k, v in device.items() if k != "cores"})
 PYEOF
 
 disk_guard 6
+# This script exists to produce A/B variants, which is exactly where the same
+# recipe gets re-derived under a second name: gqafix_ctrl_ladekv and
+# gqafix_ladekv are one binary (md5 9c6024ad...) that cost two builds and nearly
+# two device arms. The recipe key is computed from the same three arguments this
+# script already takes, so the check is free.
+coord_guard "ctxbin $BIN_NAME" "$DLC_CSV" "$GRAPHS_CSV" "$OVERRIDES" 20
 cd "$CFGDIR"
 qnn-context-binary-generator \
     --model "$QAIRT_SDK/lib/x86_64-linux-clang/libQnnModelDlc.so" \
@@ -133,4 +139,5 @@ if bad:
              "\n  Any A/B built on this binary would be measuring nothing.")
 print("OK: compiled tuning values match the requested config")
 PYEOF
+coord_done "$BIN_NAME" "$OUT_DIR/$BIN_NAME.bin" ctxbin "$GRAPHS_CSV"
 echo "CTXBIN VARIANT READY: $OUT_DIR/$BIN_NAME.bin"

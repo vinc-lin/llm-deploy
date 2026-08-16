@@ -173,12 +173,21 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
   ext4 filesystem inside the vhdx (recently: 537 GB "free") while the C: drive
   actually backing it had **54 GB**. That gap is the SIGBUS crash, one command
   away. Check C: before any multi-GB step, not `/`.
-- **Before building a variant, check whether it already exists.** ctx-bin
-  generation is deterministic (same DLCs + config → byte-identical bin, verified
-  by md5 across independent rebuilds), so a "new" variant is often a ~20 min,
-  multi-GB re-derivation of something already on disk. `md5sum` the candidate
-  against `work/ctxbin/*/` first. Concurrent sessions have duplicated builds
-  this way.
+- **Never derive the same artifact twice — `coord_guard`, not `md5sum`.** ctx-bin
+  generation is deterministic (same DLCs + config → byte-identical bin), so a
+  "new" variant is often a ~20 min, multi-GB re-derivation of something already
+  on disk. The old rule here said to `md5sum` the candidate against
+  `work/ctxbin/*/` first; that is impossible — the candidate does not exist
+  until you have paid for it — which is why concurrent sessions duplicated
+  builds anyway. Determinism means you can hash the *inputs* instead:
+  `coord_guard` (in `scripts/env.sh`, same shape as `disk_guard`) keys on
+  DLCs + graph names + config + SDK in ~5 s cold, 0.3 ms warm, and refuses if
+  `state/artifacts.tsv` already has that recipe or another session on this host
+  is deriving it right now. Already wired into `ctxbin_variant.sh` and
+  `ladekv_build.sh`. `coord.py scan` lists byte-identical groups — it found
+  `ctrl` == baseline (1.09 GB) and `splitkv-flat` == `splitkv` (4.3 GB) on its
+  first run. `coord.py who` before starting work: another branch may be on it.
+  Full convention in `docs/NOTES-coordination.md`.
 - **`.gitignore` and `git status` are not evidence about what is public.** Photo
   drops sat in the public mirror's *history* for five days while the working
   tree looked clean (removed 2026-08-16 by delete-and-recreate). Verify with a
@@ -241,5 +250,7 @@ numbers, dead ends, open questions) · `docs/PLAN_0.6B_max_tps.md` (the current
 (multimodal pipeline contract: image-encoder dtype, MRoPE, deepstack-by-zeros) ·
 `docs/NOTES-htp-config-keys.md` (which HTP backend-extension keys are real,
 audited against the SDK's own `config.py` / `QnnHtpGraph.h`) ·
+`docs/NOTES-coordination.md` (how concurrent sessions avoid re-deriving the same
+artifact: recipe keys, the registry, claims, and the authority-document rule) ·
 `docs/SA8797P_HTP_v81_Hardware_and_Deployment_Quantization_Reference_EN.md`
 (device team's measured hardware truth, annotated).

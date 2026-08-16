@@ -106,6 +106,15 @@ grep -qE "^\| past_key_0_in" "$INFO" || {
   echo "FAIL: prefill has no past-KV inputs — wrong graph exported"; exit 1; }
 
 disk_guard
+# Unlike ctxbin_variant.sh this build reads the SHARED configs/ backend config,
+# so the config is not an argument and cannot be hashed from one. Fold its
+# content hash into the recipe instead -- otherwise editing configs/ would leave
+# the key unchanged and the registry would claim a stale bin is current.
+coord_guard "ladekv $NAME" \
+    "$DLCKV/prefill.dlc,$DLC/decode.dlc,$DLC/verify$VAR.dlc" \
+    "prefill,decode,verify$VAR" \
+    "{\"config_md5\": \"$(md5sum "$LLMDEPLOY_ROOT/configs/htp_backend_config.json" | cut -d' ' -f1)\"}" \
+    20
 echo "== [5/5] three-graph ctx-bin (prefill-kv + decode + verify$VAR) =="
 cd "$LLMDEPLOY_ROOT/configs"
 qnn-context-binary-generator \
@@ -126,4 +135,5 @@ for g in d["info"]["graphs"]:
           "outputs:", len(gi.get("graphOutputs", [])))
 PYEOF
 ls -lh "$CTXBIN"
+coord_done "${NAME}-ladekv" "$CTXBIN/${NAME}-ladekv_ctx.bin" ctxbin "prefill-kv+decode+verify$VAR"
 echo "LADEKV BUILD COMPLETE: $CTXBIN/${NAME}-ladekv_ctx.bin"
