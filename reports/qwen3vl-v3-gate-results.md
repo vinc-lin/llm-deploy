@@ -24,9 +24,12 @@ blobs, which is what blocked the device on 2026-08-15 with
 | Exported graph topology | **`Expand=0`** in prefill and decode | see below |
 | Bundle lint rejects unpadded blobs | 7 failures → 0 after padding | commit `be8cddd` |
 | GQA gate wired into ctx-bin build | present, fires both ways | commit `0db9643` |
-| Past-KV prefill export | *running* | |
-| 4 DLCs `lint_gqa_ops.py --layers 18` | *pending* | |
-| ctx-bin readback + Genie load sim | *pending* | |
+| Past-KV prefill export | PASS — 7:36 wall, 66.7 GB peak RSS | `logs/vl_gqa_stage33.log` |
+| Deepstack `_p` rename | PASS — 3 renamed, checker clean | same |
+| Weight unification ×2 | PASS — `0 left untouched`, samples `MATCH=True` | same |
+| Split at 18, no symlinks | PASS — 4 real graphs | `logs/vl_gqa_stage35.log` |
+| **4 DLCs `lint_gqa_ops.py --layers 18`** | **PASS — 0 failing, batch dim 8** | same |
+| ctx-bin readback + Genie load sim | *running* | |
 | `parity_e2e_vl.py` all chains | *pending* | |
 
 ---
@@ -70,6 +73,34 @@ Zero `Expand` is the whole point: the converter lowers each one into a
 broadcast MULTIPLY whose output is re-read by the attention MatMul every step.
 
 ---
+
+## Phase 3.6 — the topology gate, on the converted DLCs
+
+This is the check v2 never ran against this tower. It now runs automatically
+inside `vl_text_ctxbin_split.sh` (commit `0db9643`), on the DLCs just
+converted, before any ctx-bin exists. From `~/llm-local/logs/vl_gqa_stage35.log`
+(tank, 2026-08-16):
+
+```
+== GQA topology gate (grouped attention, per-shard) ==
+PASS  prefill_0.dlc   replication ops: 0 (expected 0)   MatMuls: 36, batch dim ['8']
+PASS  decode_0.dlc    replication ops: 0 (expected 0)   MatMuls: 36, batch dim ['8']
+PASS  prefill_1.dlc   replication ops: 0 (expected 0)   MatMuls: 36, batch dim ['8']
+PASS  decode_1.dlc    replication ops: 0 (expected 0)   MatMuls: 36, batch dim ['8']
+4 DLC(s) checked, 0 failing
+```
+
+The MatMul shapes show the change directly. Batch is now the 8 KV heads, and
+the query heads have folded into the row dimension as `rep * S`:
+
+| graph | v2 (replicating) | v3 (grouped) |
+|---|---|---|
+| `decode_0` | `1x32x1x2176` | `1x8x4x2176` |
+| `prefill_0` | — | `1x8x512x2176` (512 = 4 × 128) |
+
+v2 additionally carried 36 `Expand` ops per shard, each lowered by the
+converter into a broadcast MULTIPLY whose output the MatMul then re-read. Those
+are gone: **0**.
 
 ## DDR baseline to beat (v2, un-grouped)
 
