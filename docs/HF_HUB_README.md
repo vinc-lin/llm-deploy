@@ -37,6 +37,17 @@ tags:
 > carry a bertcache prefill and will report a flatteringly fast blended number.
 > The build-side gate is `scripts/validate/lint_bundle_topology.py`.
 >
+> ### 📦 Latest drop: [`2026-08-16-regime/`](2026-08-16-regime)
+>
+> **Start at [`2026-08-16-regime/DEPLOYMENT_AND_TEST_GUIDE.md`](2026-08-16-regime/DEPLOYMENT_AND_TEST_GUIDE.md)** —
+> one self-contained document: deployment, test procedure, the exact metrics to
+> record, and what every outcome means.
+>
+> Eight topologically-pure bundles that separate the two remaining performance
+> models, plus `kit-v2/` (the scripted form of the same procedure). The
+> `2026-08-14-gqafix/` drop's priorities 4 and 5 are **superseded — do not run
+> them**; six of its eight bundles are blended.
+>
 > Full analysis: `docs/MAX_TPS_QWEN3_0.6B_V4.md` §1–§2 and `docs/REFERENCE.md`
 > §6.8–§6.9 in the source repo.
 
