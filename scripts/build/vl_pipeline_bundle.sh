@@ -87,6 +87,10 @@ CONFIGS=(
   # from the primary by exactly the two select-graphs keys.
   genie_text_generator_qwen3vl_4b_decodeonly.json
   genie_pipeline_qwen3vl_decodeonly.script
+  # genie-t2t-run dialog config for the text tower alone: the 4B two-shard
+  # tower has never had its tok/s or TTFT measured, and this makes that
+  # measurement possible in the same device session, no second download.
+  genie_dialog_qwen3vl_4b.json
 )
 
 # Weather/road test kit: per-image blob + sidecar + jpg + its own script, all

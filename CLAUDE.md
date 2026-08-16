@@ -57,6 +57,12 @@ from here with `git push ssh://tank/home/vinc/llm-deploy main` — it has
 `ctxbin_variant.sh` readback gate, which is exactly the check that catches a knob
 silently failing to bind — an unbound knob looks like a measurement, not an error.
 
+**Scripts are not executable on tank.** This repo lives on a Windows-backed
+mount where every file reads `0777`, so the exec bit never enters git; on tank
+the same files land `0664` and `scripts/build/foo.sh` fails `Permission
+denied` (exit 126). Always invoke build scripts there as `bash
+scripts/build/foo.sh`. Verified, not theoretical — it bit this session.
+
 ### What lives where
 
 Tank holds the canonical `work/` for **Qwen3-VL-4B** (its export does not fit
@@ -92,6 +98,12 @@ are a fatal Genie load error (KV quant params must be byte-identical).
 `export_qwen3vl_vit.py` → `quantize_vit_aimet.py` → `vit_build_quant.sh` (vision)
 and `vl_text_build.sh` → `vl_text_ctxbin_split.sh` (text, 2-split ctx-bin),
 joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
+**`--grouped-gqa` is mandatory here too**: `vl_text_build.sh <name> <cl> <ctx>
+--grouped-gqa` passes it through, but it must ALSO reach the separate past-KV
+prefill export (`quantize_aimet.py --export-decode ... --grouped-gqa`) and
+`export_qwen3vl_text.py --grouped-gqa` for the fp32 gate exports — a graph
+that misses it silently ships old attention while the others look correct.
+v2 shipped exactly that: 36 replication ops per shard at a 4:1 head ratio.
 
 ## Hard contracts (violations = silent device garbage or SIGSEGV)
 
@@ -141,6 +153,14 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
   the 0.6B pattern does not transfer. See `docs/REFERENCE.md` §3.6.
 - Image-encoder configs need `vision-param: {height, width}` in **patch units**
   (pre-merge), or MRoPE never engages and image rows fall back to plain rope.
+- **Every shipped image blob needs 4096 bytes of zero padding past the
+  payload** (1024×1536×2 = 3,145,728 → 3,149,824 total). `GenieNode_setData`
+  allocates exactly `fileSize`; a consumer over-reads one byte past the end
+  into a Scudo guard page — `SIGSEGV (SEGV_ACCERR)` at `base+0x300000`, what
+  blocked the device on 2026-08-15. `preprocess_image.py` /
+  `build_test_kit.py` pad automatically; `lint_pipeline_bundle.py` enforces
+  the size. The runtime reads only the payload, so the pad is inert.
+  `docs/DEVICE_TEST_qwen3vl_imgenc_sigsegv.md` §1.2b/§4.
 
 ## Validation gates (run before shipping any bundle)
 
@@ -153,7 +173,12 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
 - Qwen3-VL: `scripts/validate/parity_e2e_vl.py` — full path (image → ViT →
   splice → text tower) vs `hf.generate`, token-for-token. `lint_pipeline_bundle.py`
   for bundle contracts. Run the gate with no `--chains` filter; a subset skips
-  the mutation checks.
+  the mutation checks. Also `lint_gqa_ops.py` on all four text DLCs with
+  **`--layers 18`** (the per-shard count) — the flag defaults to 28 (the 0.6B
+  tower), and since the lint's pass criterion is `len(matmuls) == 2 * layers`,
+  the default reports FAIL on a perfectly correct shard.
+  `vl_text_ctxbin_split.sh` now runs this automatically (commit `0db9643`) —
+  don't add a manual duplicate.
 
 ## Gotchas — environment & infrastructure
 
