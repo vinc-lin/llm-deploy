@@ -65,6 +65,10 @@ locally) and now the **Qwen3-0.6B** lineage. Retain **encodings + `.onnx` graphs
 8.6 GB of which ~135 MB is irreplaceable, so the whole 0.6B lineage is 1.1 GB
 against 69 GB of source dirs. Same logic for ctx-bins — generation is
 deterministic, so **store the recipe, not the variant**.
+A bundle `.tar.gz` already contains its ctx-bin, so `work/ctxbin/<v>/` is a pure
+duplicate for any bundled variant — verify by byte size, then drop it. And a
+bin's `info.json` is ~0.01% of its size while answering most later questions:
+**strip the `.bin`, keep the sidecar**.
 
 ## Build chain
 
@@ -102,6 +106,14 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
   (4 MB VTCM, 24 MB spill) — or, for lade, a null-pointer SIGSEGV on the first
   speculation step. Always convert straight to the final filename, and verify with
   `qnn-context-binary-utility --json_file` before bundling.
+- **Weight sharing is verifiable, and silently optional.** In the same
+  `--json_file` dump a healthy shared bin has `graphBlobInfoV2.constSize == 0`
+  on every graph; a graph carrying its own const block did not share (measured:
+  755 MB/graph on `w8a16qh` vs 0 on `gqafix_ladekv` — `REFERENCE.md` §8.2).
+  Bin size only says *something* is wrong; `constSize` names the graph.
+  ⚠ These key names are not guessable — `vtcmSize` (not `vtcmSizeInMB`),
+  `graphBlobInfoV2` (not `graphBlobInfo`). Grep the raw JSON before asserting on
+  one, or the assert silently passes on a field that never existed.
 - Read `docs/NOTES-genie-io.md` before touching graph topology or configs.
 - **A stock Genie pipeline cannot drive an FP16 image encoder.** `setupInputFP16`
   is an empty stub that discards the pixel blob and returns success, and the
@@ -167,6 +179,17 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
   multi-GB re-derivation of something already on disk. `md5sum` the candidate
   against `work/ctxbin/*/` first. Concurrent sessions have duplicated builds
   this way.
+- **`.gitignore` and `git status` are not evidence about what is public.** Photo
+  drops sat in the public mirror's *history* for five days while the working
+  tree looked clean (removed 2026-08-16 by delete-and-recreate). Verify with a
+  throwaway unauthenticated `git clone --bare https://github.com/...` then
+  `git rev-list --objects --all | grep -iE '\.(heic|jpg|png|pdf)$'`. Backups of
+  both pre-rewrite histories are at `/mnt/x/llm-deploy-backup-2026-08-16/`.
+  (`git filter-repo` prompts about a prior run — pipe `yes Y |`.)
+- No HEIC decoder on this box (`pillow-heif` absent; ffmpeg fails the HEIF
+  container), so a `reports/NNNN/*.HEIC` drop cannot be opened programmatically.
+  Ask for PNG/JPEG if one needs reading.
+
 ## Gotchas — build, config & measurement
 
 - W4A16 is a dead end on this SDK at any size: quality 0/4 at 0.6B, AND v81's
