@@ -127,8 +127,12 @@ apart:
 | Byte-bound: 961 MB ÷ 22.37 ms = 43.0 GB/s | 88% of your own 49 GB/s excl-wait ceiling |
 | Compute-bound: 88.2M residual cycles ÷ 4 HVX @ ~1 GHz = 22.06 ms | 1.4% |
 
-They imply completely different next years of work. They also predict **opposite
-orderings** for two cheap arms, which is what kit v2's priority 4 exploits:
+They imply completely different next years of work. **Kit v2's priority 1 is the
+arm that separates them without any assumption about clock or thread count:
+`hvx_threads: 8`, which varies compute while holding DDR bytes exactly
+constant.** The byte model predicts exactly 0.0% for it.
+
+Two further arms, read by magnitude rather than sign:
 
 | Arm | byte model | compute model |
 |---|---:|---:|

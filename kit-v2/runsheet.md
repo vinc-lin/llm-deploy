@@ -49,15 +49,17 @@ kit on the pure 3-graph past-KV topology.
 
 ### 0.3 What this session is actually deciding
 
-Post-fix, two performance models both fit the measurement exactly:
+Post-fix, both performance models fit the 22.37 ms/step measurement — but only
+at that one point, and they are **not** on equal footing:
 
-| | fits 22.37 ms/step? |
-|---|---|
-| **Byte model** — 961 MB/step ÷ 22.37 ms = 43.0 GB/s | yes, 88% of the 49 GB/s streaming ceiling |
-| **Compute model** — 88.2M residual DSP cycles ÷ 4 HVX @ ~1 GHz = 22.06 ms | yes, to 1.4% |
+| | fits 22.37 ms/step? | explains the 6.54× fix? |
+|---|---|---|
+| **Byte model** — 961 MB ÷ 22.37 ms = 43.0 GB/s | yes, 88% of the 49 GB/s ceiling | **no** — pre-fix and post-fix decode read *byte-identical* DDR traffic (961,130,496 either side), so a byte-bound step would have taken the same time |
+| **Compute model** — 88.2M residual cycles ÷ 4 HVX @ ~1 GHz = 22.06 ms | yes, to 1.4% | yes — 350.3M → 88.2M cycles |
 
-They are **degenerate at this operating point**. They stop being degenerate the
-moment you perturb the model, because they predict opposite orderings:
+So the *pre-fix* regime was compute-bound, settled. What is open is whether DDR
+binds **now**, at 88% of the streaming ceiling. The arms below perturb the
+operating point to find out:
 
 | Arm | Byte model says | Compute model says |
 |---|---:|---:|

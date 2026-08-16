@@ -18,14 +18,17 @@ ceiling), the other says it is bound by DSP cycles (88.2M ÷ 4 HVX ≈ 22.06 ms 
 22.37 measured). They are indistinguishable at this operating point, and they
 imply completely different next years of work.
 
-They stop being indistinguishable the moment you perturb the model. **Priority 4
-runs two arms whose predicted orderings are opposite** — W8 `lm_head` (+17.9%
-byte / +3.6% compute) and `cl512` (+10.1% / +26.0%). Whichever ordering the
-silicon picks is the answer, and it needs no assumption about clock speed or
-thread count.
+They stop being indistinguishable the moment you perturb the model.
 
-**Priority 5 is a free falsification test:** `hvx_threads: 8` changes zero DDR
-bytes by construction, so the byte model predicts exactly 0.0%.
+**Priority 1 is `hvx_threads: 8`** — ~10 minutes, and the only arm that varies
+compute while holding DDR bytes *exactly* constant. The byte model predicts
+exactly **0.0%** for it; anything above the rep spread falsifies that model
+outright. It needs no assumption about clock speed or thread count.
+
+**Priority 2 is `cl512`**, which discriminates by magnitude (+10.1% byte vs
++26.0% compute). **Priority 3 is the W8 head, and it is optional** — it changes
+bytes *and* is suspected of never reaching the device, so it confounds the
+question it was meant to answer.
 
 ## The one rule
 
