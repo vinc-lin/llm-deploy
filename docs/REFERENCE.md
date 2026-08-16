@@ -826,6 +826,17 @@ uploads. Use `scripts/util/hf_upload_watchdog.sh`, and:
    error, which reads exactly like a proxy drop and sends you chasing the wrong
    bug. `setsid nohup … & disown` survives; through the local proxy a 1.08 GB
    blob then uploads in well under a minute.
+5. **A stalled stream never raises, so `--retries` cannot save you.** Measured
+   2026-08-16: uploading 8 × ~926 MB hung for **~4 hours** on the first file,
+   frozen at 725/926 MB with the progress bar redrawing the same line 365 times.
+   No exception, no timeout, zero files landed. `hf_upload_file.py --retries`
+   only catches exceptions; a frozen socket just stops moving.
+   **Use `scripts/util/hf_upload_stallguard.sh`** for anything large — it kills
+   and retries a stream that stops advancing for `STALL_SECS` (default 180) and
+   drives single `upload_file` commits, so unlike `hf_upload_watchdog.sh` it
+   cannot touch repo settings. On the retry with that guard, all eight went
+   through on attempt 1 at ~1 min each, so the hang was transient proxy state
+   that only an external freeze detector breaks out of.
 
 **Environment.** `source scripts/env.sh` first in every shell. `QUANT_DEVICE=cpu`
 for anything >0.6B on this 8 GB-VRAM box. Hard pins: `onnx==1.19.0` in **both**
