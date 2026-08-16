@@ -43,11 +43,17 @@ Read-only survey. Nothing was deleted, moved or modified to produce it.
 > copy went; all 29 tarballs were indexed once and pre-fix ctx-bins matched by
 > exact byte size rather than by name.
 >
-> **Two artifacts were deliberately spared:**
-> `work/ctxbin/qwen3-0.6b-w8a16qh` (1.8 GB) and `…qh-lade` (2.1 GB) exist in no
-> bundle and on no remote. Their DLCs *were* removed, so regenerating them now
-> costs a full re-quantisation rather than a 20-minute ctx-bin build — the one
-> place this cleanup traded reversibility for space.
+> **Two artifacts were held back, then mined and released.**
+> `work/ctxbin/qwen3-0.6b-w8a16qh` (1.8 GB) and `…qh-lade` (2.1 GB) existed in no
+> bundle and on no remote, and `REFERENCE.md` §8.2 cited them as the only known
+> specimens of a silently-unshared build. Rather than delete or keep them blind,
+> the question was **settled from their `info.json`** — `graphBlobInfoV2.constSize`
+> names an unshared graph directly, so file size was never the only symptom
+> (§8.2, resolved). The 4.0 GB of `.bin` then went; **the two `info.json` files
+> are retained at 541 KB as the evidence.**
+>
+> Generalisable: a ctx-bin's `info.json` is ~0.01% of its size and carries most
+> of what anyone later asks of it. Strip the `.bin`, keep the sidecar.
 
 ## 0. Headline
 

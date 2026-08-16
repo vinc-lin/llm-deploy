@@ -866,16 +866,43 @@ describe what the prepared context streams. See `docs/VARIANT_PREDICTIONS.md`
 ### 8.2 What actually changed between v1 (1.52 GB) and v2 (1.09 GB)?
 
 *Scale reference: a 3-graph 0.6B bin with weight sharing **off** would be
-~3.2 GB (3 × ~1.07 GB). Working sharing is what makes it 1.09 GB, so bin size is
-the only symptom of a silently-unshared build — see also §6.10, where a
-bertcache graph forces one private 444 MB copy without disabling sharing.*
+~3.2 GB (3 × ~1.07 GB). Working sharing is what makes it 1.09 GB — see also
+§6.10, where a bertcache graph forces one private 444 MB copy without disabling
+sharing.*
 A ~430 MB shrink is far too large for the all-position-logits fix, which should
 have made the binary marginally *bigger*. Best candidate: **weight sharing became
-effective**. Supporting evidence found today — the qh intermediates still show the
-unshared signature: `qwen3-0.6b-w8a16qh_ctx.bin` is **1.84 GB** for 2 graphs and
-`qwen3-0.6b-w8a16qh-lade_ctx.bin` is **2.16 GB** for 3, against 1.09 GB when
-sharing works. Worth confirming, because it means a silently-unshared build is
-still possible today and the only symptom is file size.
+effective**.
+
+**RESOLVED 2026-08-16 — confirmed, and the "only symptom is file size" claim is
+withdrawn.** `graphBlobInfoV2` in the ctx-bin's own `info.json` reports it
+directly. Measured, from `qnn-context-binary-utility --json_file`:
+
+| bin | graphs | `sharedWeightsSize` (per graph) | `constSize` (per graph) | blob |
+|---|---:|---:|---:|---:|
+| `gqafix-ladekv` (healthy) | 3 | 1,067,499,520 | **0 / 256 / 0** | 1.087 GB |
+| `w8a16qh` | 2 | 311,791,616 | **755,250,944 each** | 1.838 GB |
+| `w8a16qh-lade` | 3 | 756,338,688 | 755,250,176 / 310,706,432 / 311,166,976 | 2.160 GB |
+| `gqafix-qh-ladekv` | 3 | 912,904,192 | 0 / **144,408,832** / 0 | 1.078 GB |
+
+A healthy 3-graph bin puts essentially everything in one shared pool and carries
+**`constSize == 0`**. The qh intermediates instead give every graph its own
+~755 MB private const block: 2 × 755 MB + 311 MB shared ≈ the observed 1.84 GB,
+and the lade variant's 1.377 GB of private const ≈ its 2.16 GB. So the
+hypothesis was right, but the **diagnostic is `constSize`, not file size** — it
+names the failing graph, whereas size only says something is wrong somewhere.
+
+Two consequences:
+1. **This is a cheap build gate.** `ctxbin_variant.sh` already reads back
+   `numHvxThreads`/`vtcmSize`/`optimizationLevel` from `info.json`; asserting
+   `constSize == 0` on every graph that should share would catch a silently
+   unshared build at build time, for free. Not yet implemented.
+2. The last row is the **independent confirmation of §8.1**: `gqafix-qh-ladekv`
+   shows exactly the 144,408,832 B of private decode const that §8.1 derived
+   from the other direction, reached here by a different route.
+
+The two specimen bins were deleted after this measurement (they were the last
+4.0 GB of a retired pre-fix family); their `info.json` files are retained at
+`work/ctxbin/qwen3-0.6b-w8a16qh{,-lade}/` as the evidence, at 541 KB.
 
 ### 8.3 Does `qh` help in AR-1 basic mode? — now the **primary discriminating experiment**
 The one configuration where the acceptance penalty does not apply. Post-fix this
