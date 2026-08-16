@@ -14,6 +14,11 @@ deleted once it is committed, so never treat a missing photo drop as lost data.
 Check `reports/` before trusting any performance or "does it load" claim — the
 2026-08-14 Qwen3-VL e2e attempt failed at load, and that is only recorded there.
 
+**Current state (device, 2026-08-15):** best 0.6B decode is **44.707 tok/s** —
+`gqafix_ladekv`, **basic** mode (`genie_dialog_basic.json`), TTFT 103 ms. LADE is
+**parked**: post-fix it is a 30% regression. Decode was compute-bound, not
+DDR-bound, so byte levers are demoted. `docs/REFERENCE.md` §0 is the live board.
+
 **Repo visibility is switched often and deliberately by the user — this file
 does not state it on purpose.** Read it live (`HfApi().repo_info(r).private`)
 if it matters; change it **only** when asked in that message; if a bulk upload
@@ -33,6 +38,13 @@ direction — has caused four incidents.
 (past-KV prefill, 3-graph) → `bundle.sh <bundlename> <ctxbin> [dialog_json]`.
 Extra flags after `full_build.sh <name> <cl> <ctx>` pass through to
 `quantize_aimet.py` (e.g. `--quant-head`, `--fuse-gate-up`).
+
+**`--grouped-gqa` is mandatory on every 0.6B build.** Without it you ship the
+pre-fix model — 6.836 tok/s instead of 44.707. `full_build.sh` takes it as a
+pass-through flag; `lade_build.sh` / `ladekv_build.sh` need
+`FUSE_FLAGS="--grouped-gqa"`, because they re-export verify32 and the past-KV
+prefill and will otherwise silently ship old attention in *those* graphs while
+the decode graph looks correct.
 
 Cross-graph rule: decode/verify/prefill DLCs must convert against the SAME
 encodings lineage (`--export-decode` / `--adopt-encodings`); mixed encodings
@@ -80,13 +92,16 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
 
 - `scripts/validate/parity_ladekv_read.py` (qualla feed pattern incl. chunking)
   and/or `parity_qualla_read.py` — argmax must match HF on all prompts.
+- `scripts/validate/lint_gqa_ops.py` — **0** replication ops in *every* graph.
+  Non-zero means `--grouped-gqa` was missed, usually in verify32 or the past-KV
+  prefill rather than decode.
 - `quantize_aimet.py --eval` reference is 3/4 last-token argmax agreement.
 - Qwen3-VL: `scripts/validate/parity_e2e_vl.py` — full path (image → ViT →
   splice → text tower) vs `hf.generate`, token-for-token. `lint_pipeline_bundle.py`
   for bundle contracts. Run the gate with no `--chains` filter; a subset skips
   the mutation checks.
 
-## Gotchas
+## Gotchas — environment & infrastructure
 
 - HF: proxy `http://127.0.0.1:17890` required, but it drops long upload streams —
   use `scripts/util/hf_upload_watchdog.sh` (set `SOCKET_CHECKS=999999`; the
@@ -118,12 +133,17 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
   multi-GB re-derivation of something already on disk. `md5sum` the candidate
   against `work/ctxbin/*/` first. Concurrent sessions have duplicated builds
   this way.
+## Gotchas — build, config & measurement
+
 - W4A16 is a dead end on this SDK at any size: quality 0/4 at 0.6B, AND v81's
   `htp_v2.json` ships zero INT4 matmul kernels — the converter folds s4→f16
   (`--lpbq`/`--seq-mse` stay only for a future SDK).
-- `--quant-head` (W8 lm_head) is a **net LADE regression**: −14% tok/s on device
-  (9.3 vs 10.8), because it costs ~10% n-gram acceptance. Quality is fine; the
-  DDR win does not survive spec-decode amortization. It pairs with
+- `--quant-head` (W8 lm_head) has bought nothing in any measurement so far:
+  −14% under LADE (9.3 vs 10.8, an n-gram-acceptance cost) and ≈−2% in basic
+  mode (6.70 vs 6.836, a pre-fix same-topology pair). Untested post-fix. Note
+  the DLC shrinks 151 MB but the ctx-bin only 12.5 MB — the head *is* correctly
+  halved in the shared pool; ~144 MB simply moves to a private const block on
+  decode (`REFERENCE.md` §8.1). It pairs with
   `filter_aimet_w8a16.py --keep-head-weight` — **not** a `quantize_aimet.py`
   flag; the build scripts add it to the filter automatically when they see
   `--quant-head`. Without it the filter strips the encoding and you silently get
