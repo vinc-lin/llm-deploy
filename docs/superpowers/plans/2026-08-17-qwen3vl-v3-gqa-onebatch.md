@@ -716,9 +716,21 @@ ssh tank 'cd ~/llm-deploy && source scripts/env.sh && \
 
 ---
 
-## Phase 4 — Numerical gates (local, runs in parallel with Phase 3, ~3 h)
+## Phase 4 — Numerical gates (**tank**, serialized after Phase 3.2, ~2.5 h)
 
-### Task 4.1: fp32 exports with the grouped topology (local, can start right after Phase 1)
+⚠ **Host correction.** This phase was originally scoped "local, in parallel";
+that is wrong on two counts. (a) The 4B fp32 export peaks around 63.5 GB
+(CLAUDE.md) against local's 47 GB, and v2 ran both the export and the gate on
+tank (`~/llm-local/logs/fp32-export.log`, `e2e-gate.log`, 2026-08-15).
+(b) It must NOT run *concurrently* with Phase 3's quantization either: AIMET's
+legacy `sim.export` holds four fp32 copies of the graph at once, so the quant
+job spikes well above its steady ~34 GB RSS and a 63.5 GB export alongside it
+would OOM-kill both. **Wait for `QUANTIZATION COMPLETE`, then run this.**
+
+v2 reference wall-times on tank: fp32 export ~30 min; e2e gate **4333 s
+(72 min)** for all 5 chains at n=273 prompt rows.
+
+### Task 4.1: fp32 exports with the grouped topology (tank)
 
 - [ ] **Step 1:** Re-export the gate's fp32 text ONNX — base pair AND the
   past-KV prefill — into a NEW dir (the old `qwen3vl-4b-text` stays as the v2
@@ -734,10 +746,12 @@ $PY_DEPLOY scripts/export/export_qwen3vl_text.py \
     --prefill-past 2048
 ```
 
-  (`disk_guard 40` first — ~31 GB of external data per run; ~40 GB peak RAM,
-  fits the 47 GB box; the second run adds `prefillkv/` beside `prefill/` and
-  `decode/`.) `--parity-check` gives the wrapper-vs-HF max|dlogits| gate for
-  free on the grouped topology.
+  (`disk_guard 40` first — ~31 GB of external data per run; the second run adds
+  `prefillkv/` beside `prefill/` and `decode/`.) `--parity-check` gives the
+  wrapper-vs-HF max|dlogits| gate for free on the grouped topology; it is
+  rejected for split exports, which is fine here since these are unsplit.
+  v2's export produced exactly these graph dirs: `prefillkv` (S=128,
+  past=2048), `decode` (S=1, past=2175), `prefill` (S=128, past=0).
 - [ ] **Step 2:** Structural check on the real export: zero Expand nodes.
 
 ```bash
@@ -763,10 +777,27 @@ $PY_DEPLOY scripts/validate/parity_e2e_vl.py \
     --caption-out $LLMDEPLOY_DATA/work/kit/captions/sample_image_v3.json
 ```
 
-  (prefillkv defaults to `<text-onnx>/prefillkv/prefillkv.onnx`.) Bar: every
-  gated chain token-for-token vs `hf.generate` (v2 scored 20/20 across 3
-  chains), mutation checks fire. Running the full chain list is mandatory — a
-  `--chains` subset skips the mutation checks (CLAUDE.md).
+  (prefillkv defaults to `<text-onnx>/prefillkv/prefillkv.onnx`.) Running the
+  full chain list is mandatory — a `--chains` subset skips the mutation checks
+  (CLAUDE.md).
+
+  **The gate has 5 chains, and only 4 are gated.** v2's verdict block
+  (`~/llm-local/logs/e2e-gate.log`, tank, 2026-08-15) is the bar to match:
+
+  | chain | v2 result |
+  |---|---|
+  | `chain0-alldecode` | 20/20 (100%) |
+  | `chain0b-prefillkv` | 20/20 (100%) |
+  | `chain1-hf-vit` | 20/20 (100%) |
+  | `chain2-onnx-vit` | 20/20 (100%) |
+  | `tierA-zero-deep` | **0/20 — expected, NOT a failure** |
+
+  `tierA-zero-deep` feeds zeroed deepstack, which is exactly what the device
+  pipeline does; the wording legitimately differs from HF and that gap *is* the
+  defined degradation. Do not "fix" a 0/20 there. Its printed text is the
+  device-faithful caption — v2's was:
+  `'A red circle and a blue square are positioned side by side on a white background.'`
+  Expect v3's to differ in wording (new quant lineage); judge it on semantics.
 - [ ] **Step 2:** Record the sample-image device-faithful caption from
   `--caption-out` — it goes into DEVICE_TEST.md as THE expected result of the
   single smoke test.
@@ -873,6 +904,16 @@ Structure (this doc ships in the bundle as DEVICE_TEST.md):
   just continues with the padded bundle it already has.
 
 ### Task 6.3: Cut bundle v3
+
+**Prerequisite already resolved (2026-08-17).** `vl_pipeline_bundle.sh` hard-
+requires `$LLMDEPLOY_DATA/bundles/qwen3vl_4b_vit_fp16/htp_backend_ext_config_vit.json`,
+but that directory had been reclaimed — only `qwen3vl_4b_vit_fp16.tar.gz`
+survived, so the script would have aborted at its source check. Restored with
+`tar xzf bundles/qwen3vl_4b_vit_fp16.tar.gz -C bundles/ qwen3vl_4b_vit_fp16/htp_backend_ext_config_vit.json`
+and verified byte-identical to the copy v2 shipped. The ViT ctx-bin itself
+(`work/ctxbin/qwen3vl-4b-vit-w8a16/qwen3vl-4b-vit-w8a16_ctx.bin`, 433,101,160 B)
+is present. If either goes missing again, both are recoverable from
+`hf-staging-v2/qwen3vl_4b_e2e_pipeline_v2/`.
 
 - [ ] **Step 1:** `disk_guard 16`, then:
 
