@@ -31,7 +31,9 @@ blobs, which is what blocked the device on 2026-08-15 with
 | **4 DLCs `lint_gqa_ops.py --layers 18`** | **PASS — 0 failing, batch dim 8** | same |
 | ctx-bin readback (shapes, HTP bind, shared weights) | PASS — 1.70 / 2.42 GB pooled | `logs/vl_gqa_stage35.log` |
 | Genie load simulation | PASS — replay clean | same |
-| `parity_e2e_vl.py` all 6 chains | *running* | |
+| fp32 grouped exports | PASS — `Expand=0` ×3, wrapper-vs-HF 2.587e-05 | `logs/vl_gqa_stage4.log` |
+| **`parity_e2e_vl.py` all 6 chains** | **PASS — 4/4 gated chains 20/20** | same |
+| Kit captions (6 images, tierB) | *running* | |
 | Bundle v3 lint | *pending* | |
 
 ---
@@ -130,6 +132,43 @@ Genie load simulation (replays `validateModel`, including the
   cache group 'past_': ctx=2176, concat, variants {(1,2176), (128,2176)}
 PASS: validateModel replay clean -- these ctx-bins would load
 ```
+
+## Phase 4 — numerical parity, all six chains
+
+`~/llm-local/logs/vl_gqa_stage4.log` (tank, 2026-08-16), wall 4638 s. Run with
+no `--chains` filter, because a subset silently skips the mutation checks.
+
+fp32 exports first: `Expand=0` in `prefill`, `decode` and `prefillkv`, and
+`--parity-check` gave `wrapper-vs-HF max|dlogits| = 2.587e-05` against a
+5e-3 tolerance. ViT deltas came out identical to v2 (`image_features`
+1.551e-04, deepstack 4.625e-05 / 2.002e-04 / 3.700e-04), confirming the vision
+tower is untouched by this rebuild.
+
+```
+== verdict ==
+  HF reference     : 'The image displays a simple composition of a red circle and a blue square on a white background.'
+  chain0-alldecode : 20/20 (100%)
+  chain0b-prefillkv: 20/20 (100%)      <- THE DEVICE PATH
+  chain1-hf-vit    : 20/20 (100%)
+  chain2-onnx-vit  : 20/20 (100%)      <- bar is >=75%; got 100%
+  tierA-zero-deep  : 0/20              <- expected, not gated
+  tierB-prefillkv-zero-deep: 0/20      <- expected, not gated
+PASS: full-path device-free parity (6 chains, n=273 prompt rows, 20 generated tokens)
+```
+
+Grouped attention is numerically exact end-to-end: image → ViT → splice → text
+tower reproduces `hf.generate` token-for-token on every gated chain, including
+`chain0b-prefillkv`, which replays qualla's real chunk plan (three AR=128
+prefill calls, `n_process` 128/128/17, the last padded).
+
+**The device-faithful caption for `sample_image`** (tierB — past-KV prefill
+with zeroed deepstack, the deployed combination):
+
+> `A red circle and a blue square are positioned side by side on a white background.`
+
+Word-for-word identical to v2's, despite a completely new quantization
+lineage — a useful stability signal, and the string that goes verbatim into
+`DEVICE_TEST.md` as the expected result of the single smoke test.
 
 ## DDR bandwidth: v2 vs v3
 
