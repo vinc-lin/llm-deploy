@@ -29,8 +29,10 @@ blobs, which is what blocked the device on 2026-08-15 with
 | Weight unification ×2 | PASS — `0 left untouched`, samples `MATCH=True` | same |
 | Split at 18, no symlinks | PASS — 4 real graphs | `logs/vl_gqa_stage35.log` |
 | **4 DLCs `lint_gqa_ops.py --layers 18`** | **PASS — 0 failing, batch dim 8** | same |
-| ctx-bin readback + Genie load sim | *running* | |
-| `parity_e2e_vl.py` all chains | *pending* | |
+| ctx-bin readback (shapes, HTP bind, shared weights) | PASS — 1.70 / 2.42 GB pooled | `logs/vl_gqa_stage35.log` |
+| Genie load simulation | PASS — replay clean | same |
+| `parity_e2e_vl.py` all 6 chains | *running* | |
+| Bundle v3 lint | *pending* | |
 
 ---
 
@@ -102,18 +104,56 @@ v2 additionally carried 36 `Expand` ops per shard, each lowered by the
 converter into a broadcast MULTIPLY whose output the MatMul then re-read. Those
 are gone: **0**.
 
-## DDR baseline to beat (v2, un-grouped)
+## ctx-bin readback gates
 
-Converter `read_total_bytes`, from `~/llm-local/logs/splitkv.log` (tank,
-2026-08-15), in convert order. These are converter estimates for a build that
-never ran on device — they bound byte traffic, they do not predict tok/s.
+From the same `vl_gqa_stage35.log`. Every structural gate the script enforces
+passed, and the weight-sharing figures land exactly on v2's:
 
-| graph | v2 `read_total_bytes` | v3 | delta |
+```
+1_of_2: ['decode_0', 'prefill_0']   in=43 out=37 each   sharedWeights=1.70 GB
+2_of_2: ['decode_1', 'prefill_1']   in=40 out=37 each   sharedWeights=2.42 GB
+BOTH BINARIES VERIFIED
+```
+
+Floors are `{0: 1.4, 1: 2.0}` GB, so 1.70 / 2.42 clear them. Sizes 1.8 G and
+2.5 G, unchanged from v2 — expected, since grouping changes op topology, not
+the weight set.
+
+Genie load simulation (replays `validateModel`, including the
+`DECODER_PREFILL` CL rewrite that shipped the 2026-08-14 failure):
+
+```
+  decode_0:  shard 0, AR=1,   CL=2176, DECODER_PREFILL
+  prefill_0: shard 0, AR=128, CL=2176, DECODER_PREFILL
+  decode_1:  shard 1, AR=1,   CL=2176, DEFAULT
+  prefill_1: shard 1, AR=128, CL=2176, DEFAULT
+  cache group 'past_': ctx=2176, concat, variants {(1,2176), (128,2176)}
+PASS: validateModel replay clean -- these ctx-bins would load
+```
+
+## DDR bandwidth: v2 vs v3
+
+Converter `read_total_bytes`, v2 from `~/llm-local/logs/splitkv.log`
+(2026-08-15), v3 from `~/llm-local/logs/vl_gqa_stage35.log` (2026-08-16), both
+on tank. Summaries appear in `--dlc_path` order within each ctx-bin, i.e.
+prefill then decode.
+
+| graph | v2 (replicating) | v3 (grouped) | delta |
 |---|---|---|---|
-| `prefill_0` | 3,637,106,688 | *pending* | |
-| `decode_0` | 3,609,839,616 | *pending* | |
-| `prefill_1` | 4,413,063,168 | *pending* | |
-| `decode_1` | 4,387,743,744 | *pending* | |
+| `prefill_0` | 3,637,106,688 | 2,820,626,432 | **−22.4%** |
+| `decode_0` | 3,609,839,616 | 2,237,399,040 | **−38.0%** |
+| `prefill_1` | 4,413,063,168 | 3,596,582,912 | **−18.5%** |
+| `decode_1` | 4,387,743,744 | 3,015,303,168 | **−31.3%** |
+
+Decode falls hardest, which is the expected shape of this fix: the replication
+ops produced a large intermediate that had to be written and re-read every
+step, and decode does the least useful work per step to amortise it.
+
+⚠ **These are converter estimates for a build that has never run on device.**
+They bound byte traffic; they do not predict tok/s. Whether VL-4B decode is
+byte-bound or compute-bound on this silicon is unmeasured — at ~4.3 GB of
+weights per token there is a byte floor near ~10 tok/s that no topology change
+crosses. Treat these as evidence the defect is gone, not as a speedup claim.
 
 ---
 
