@@ -781,23 +781,33 @@ $PY_DEPLOY scripts/validate/parity_e2e_vl.py \
   full chain list is mandatory — a `--chains` subset skips the mutation checks
   (CLAUDE.md).
 
-  **The gate has 5 chains, and only 4 are gated.** v2's verdict block
-  (`~/llm-local/logs/e2e-gate.log`, tank, 2026-08-15) is the bar to match:
+  **The gate has 6 chains and only 3 are gated token-exact.** Read from the
+  source (`ALL_CHAINS`, `GATED_EXACT`, `CHAIN2_MIN_AGREE` in
+  `parity_e2e_vl.py`), with v2's measured results
+  (`~/llm-local/logs/e2e-gate.log`, tank, 2026-08-15):
 
-  | chain | v2 result |
-  |---|---|
-  | `chain0-alldecode` | 20/20 (100%) |
-  | `chain0b-prefillkv` | 20/20 (100%) |
-  | `chain1-hf-vit` | 20/20 (100%) |
-  | `chain2-onnx-vit` | 20/20 (100%) |
-  | `tierA-zero-deep` | **0/20 — expected, NOT a failure** |
+  | chain | bar | v2 result |
+  |---|---|---|
+  | `chain0-alldecode` | token-exact | 20/20 |
+  | `chain0b-prefillkv` — **the device path** | token-exact | 20/20 |
+  | `chain1-hf-vit` | token-exact | 20/20 |
+  | `chain2-onnx-vit` | **≥75% step agreement**, text for human review | 20/20 |
+  | `tierA-zero-deep` | **not gated** — historical bertcache reference | 0/20 |
+  | `tierB-prefillkv-zero-deep` | **not gated** | (post-dates v2's gate run) |
 
-  `tierA-zero-deep` feeds zeroed deepstack, which is exactly what the device
-  pipeline does; the wording legitimately differs from HF and that gap *is* the
-  defined degradation. Do not "fix" a 0/20 there. Its printed text is the
-  device-faithful caption — v2's was:
-  `'A red circle and a blue square are positioned side by side on a white background.'`
-  Expect v3's to differ in wording (new quant lineage); judge it on semantics.
+  ⚠ **A 0/20 on the two tier chains is EXPECTED, not a failure.** They feed
+  zeroed deepstack because a stock Genie pipeline has no deepstack path; the
+  wording legitimately differs from HF and that gap *is* the defined
+  degradation. Never "fix" it. Equally, do not read `chain2`'s floor as
+  token-exact — it carries the ViT's own fp32 trace delta by design.
+
+  ⚠ **`tierB-prefillkv-zero-deep` — not tierA — is the caption the device
+  actually produces.** It is chain0b's real chunk plan (three AR=128 prefill
+  calls, `n_process` 128/128/17) with zeroed deepstack. tierA reaches a similar
+  place through the *bertcache* path and is kept only as the historical
+  reference; v2's gate log labels tierA as the device text because tierB did
+  not exist yet, and that label is now stale. Take the v3 sample caption and
+  every kit caption from **tierB**.
 - [ ] **Step 2:** Record the sample-image device-faithful caption from
   `--caption-out` — it goes into DEVICE_TEST.md as THE expected result of the
   single smoke test.
@@ -825,14 +835,18 @@ for j in $LLMDEPLOY_DATA/work/kit/wx_*.jpg; do
       --model $LLMDEPLOY_DATA/models/Qwen3-VL-4B-Instruct \
       --vit-onnx $LLMDEPLOY_DATA/work/onnx/qwen3vl-4b-vit/vit.onnx \
       --text-onnx $LLMDEPLOY_DATA/work/onnx/qwen3vl-4b-text-gqa \
-      --image "$j" --chains chain0b \
-      --caption-out $LLMDEPLOY_DATA/work/kit/captions/${s}_v3.json
+      --image "$j" --chains tierB-prefillkv-zero-deep \
+      --caption-out $LLMDEPLOY_DATA/work/kit/captions/${s}.json
 done
 ```
 
-  (Check the exact chain name for the caption path with `--help` first —
-  use whatever chain v2's caption generation used, recoverable from
-  `work/kit/captions/`; if wall-clock matters run the 6 in parallel on tank.)
+  **`tierB-prefillkv-zero-deep` is the chain** — confirmed against v2's
+  `~/llm-local/logs/kit-captions.log`, whose per-image output reads
+  `DEVICE-FAITHFUL (past-KV prefill + zero deepstack)` and shows the three
+  chunk calls (`n_process` 128/128/17). Runs on tank at **~6 min/image**, so
+  ~40 min for the six. Each run prints `PASS: ... (1 chains, n=273 prompt
+  rows, N generated tokens)` — that PASS refers to the chain executing, not to
+  matching HF, which tierB is deliberately not gated against.
 - [ ] **Step 2:** Assemble `device_captions.json` (same shape as the v2 file —
   `{stem: caption}`) from the 6 outputs; diff against v2's: wording drift is
   expected (new quant lineage), semantic drift (wrong weather/scene) = STOP
