@@ -106,14 +106,22 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
   (4 MB VTCM, 24 MB spill) — or, for lade, a null-pointer SIGSEGV on the first
   speculation step. Always convert straight to the final filename, and verify with
   `qnn-context-binary-utility --json_file` before bundling.
-- **Weight sharing is verifiable, and silently optional.** In the same
-  `--json_file` dump a healthy shared bin has `graphBlobInfoV2.constSize == 0`
-  on every graph; a graph carrying its own const block did not share (measured:
-  755 MB/graph on `w8a16qh` vs 0 on `gqafix_ladekv` — `REFERENCE.md` §8.2).
-  Bin size only says *something* is wrong; `constSize` names the graph.
+- **Weight sharing is verifiable, and silently optional.** The same `--json_file`
+  dump reports `graphBlobInfoV2.sharedWeightsSize` (the context's single pool,
+  printed identically on every graph — never sum it) and `constSize` (that
+  graph's *private* copy; the SDK header's own map calls it "Non-Shared (Const)").
+  The invariant is **pooled fraction**, not a hard zero: the pool should hold
+  essentially the whole weight set. Measured — `gqafix_ladekv` 100% (const 256 B),
+  `gqafix_qh_ladekv` 95%, vs **`w8a16qh` 29%** and `w8a16qh-lade` 62%, where each
+  graph re-carries ~755 MB and the bin inflates 1.09 → 1.84 GB (`REFERENCE.md` §8.2).
+  ⚠ **Non-zero `constSize` is not automatically a fault** — `--quant-head` moves
+  ~144 MB into a private decode block by design (§8.1) and a bertcache graph
+  forces a private 444 MB copy (§6.10). A gate demanding `constSize == 0` would
+  reject good bins; gate on pooled fraction with the known exceptions named.
   ⚠ These key names are not guessable — `vtcmSize` (not `vtcmSizeInMB`),
-  `graphBlobInfoV2` (not `graphBlobInfo`). Grep the raw JSON before asserting on
-  one, or the assert silently passes on a field that never existed.
+  `graphBlobInfoV2` (not `graphBlobInfo`; the V1 struct has no weight fields at
+  all). Grep the raw JSON before asserting on one, or the assert silently passes
+  on a field that never existed.
 - Read `docs/NOTES-genie-io.md` before touching graph topology or configs.
 - **A stock Genie pipeline cannot drive an FP16 image encoder.** `setupInputFP16`
   is an empty stub that discards the pixel blob and returns success, and the
