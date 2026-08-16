@@ -126,6 +126,22 @@ convert prefill_1 "$CL" "$PREFILL_PAST" 0 "$SPLIT" "$LAYERS" 1 "$P_TOTAL"
 convert decode_1  1     "$PAST"         0 "$SPLIT" "$LAYERS" 1 "$TOTAL"
 ls -lh "$DLC"
 
+# GQA topology gate. The v2 tower shipped with 36 KV-replication ops per shard
+# (4:1 head ratio) because --grouped-gqa could not reach the VL exporters at
+# all; nothing downstream notices -- the build succeeds, parity passes (the two
+# forms are numerically identical) and the ctx-bin loads. The only symptom is a
+# slow device. Assert it here, on the DLCs just converted.
+#
+# --layers is PER SHARD (each holds half of $LAYERS), and the lint's own default
+# is 28 (the 0.6B tower): omitting it demands 56 MatMuls and fails a correct
+# shard. GQA_EXPECT=replicating deliberately builds the old topology.
+echo "== GQA topology gate (grouped attention, per-shard) =="
+GQA_FLAGS=(--layers $((LAYERS / 2)) --n-kv "$NKV")
+[ "${GQA_EXPECT:-grouped}" = "replicating" ] && GQA_FLAGS+=(--expect-replicating)
+PATH="$(dirname "$PY_QAIRT"):$PATH" \
+$PY_DEPLOY "$LLMDEPLOY_ROOT/scripts/validate/lint_gqa_ops.py" "${GQA_FLAGS[@]}" \
+    "$DLC"/prefill_0.dlc "$DLC"/decode_0.dlc "$DLC"/prefill_1.dlc "$DLC"/decode_1.dlc
+
 # One ctx-bin per chunk, holding that chunk's two AR variants so its weights are
 # shared between them. Splitting prefill/decode into SEPARATE binaries instead
 # would defeat that and double the payload.
