@@ -11,7 +11,7 @@ authority if they disagree.
 | Runtime | QAIRT 2.48.40.260702 · QNN API v2.37.0 · libGenie 1.19.0 (built to match exactly) |
 | Model | Qwen3-0.6B, W8A16 (INT8 per-channel weights, FP16 activations), grouped-GQA attention |
 | Current baseline | **44.707 ± 0.030 tok/s** basic mode, `gqafix_ladekv` |
-| Session length | ~2 h for everything; ~30 min for the part that decides the plan (§4.2) |
+| Session length | ~2 h for everything; **~10 min for the arm that decides the plan** (§4.2) |
 
 ---
 
@@ -21,24 +21,34 @@ The GQA KV-replication fix shipped and measured **6.54×**: 6.836 → 44.707 tok
 on a like-for-like control. Basic mode beats LADE (31.342), so **basic is the
 ship configuration** and LADE is parked.
 
-What is *not* known is **why 44.707 is the number**, and the two candidate
-answers imply completely different next years of work:
+What is *not* known is **why 44.707 is the number**. Three models remain
+admissible and they imply completely different next years of work
+(`REFERENCE.md` §8.11):
 
-| Model | Claim | Fits 22.37 ms/step? |
+| Model | For | Against |
 |---|---|---|
-| **Byte-bound** | the step is limited by DDR traffic: 961 MB ÷ 22.37 ms = 43.0 GB/s | yes — 88% of the measured 49 GB/s streaming ceiling |
-| **Compute-bound** | the step is limited by DSP cycles: 88.2M ÷ 4 HVX @ ~1 GHz = 22.06 ms | yes — to 1.4% |
+| **Compute-bound** | Predicted the post-fix step **out-of-sample**: 88.2M cycles ÷ 4 HVX @ ~1 GHz ≈ 22.1 ms vs **22.37 measured**, written before the fix shipped. The divisor of 4 is now confirmed by reading `numHvxThreads` out of the ctx-bin | Clock is invisible under the GVM, so threads × clock is one product with two unknowns — 8 threads @ 0.5 GHz fits identically |
+| **Byte-bound** | Simple; post-fix ~43 GB/s is at least plausible | Predicted 18.1 tok/s pre-fix; reality was 44.7. **And the fix removed ~0 bytes yet gave 6.5×** |
+| **Access-pattern fragmentation** | The ~220 µs RPC / 30–60 µs inter-op costs are real and measured | Those costs survive the GQA fix unchanged, so they cannot explain a 6.5× change |
 
-**One piece of evidence already separates them.** The pre-fix and post-fix decode
-graphs read **byte-identical** DDR traffic — `read_total_bytes = 961,130,496`,
-`write_total_bytes = 419,840`, both sides. The replication ops never left VTCM.
-Identical bytes, 6.54× the throughput: a byte-bound step would have taken the
-same time, so **the pre-fix regime was compute-bound**.
+**The byte measurement is already done, and it is the strongest single result.**
+Pre-fix and post-fix decode graphs read **byte-identical** DDR traffic —
+`read_total_bytes = 961,130,496`, `write_total_bytes = 419,840`, both sides. The
+replication ops moved ~264 MB of intermediate tensor per step but **never
+reached DDR**; they were VTCM-resident, and `spill_bytes`/`fill_bytes` are 0.
 
-That does *not* settle the post-fix regime — at 43.0 GB/s we are now near the
+Identical bytes, 6.54× the throughput. A byte-bound step would have taken the
+same time, so **the pre-fix regime was compute-bound.**
+
+⚠️ Note also that "effective bandwidth rose from ~17.5 to ~43 GB/s" is
+**circular** if the byte count did not change — with bytes constant it is a
+restatement of "the step got 6.5× faster", not an explanation of why. Do not
+quote it as evidence.
+
+That does *not* settle the **post-fix** regime — at 43.0 GB/s we are near the
 streaming ceiling, so DDR could bind *now* even though it demonstrably did not
-before. This drop's job is to settle it, using arms whose predicted **orderings**
-are opposite.
+before. §4.2 is the arm that settles it, because it is the only one that varies
+compute while holding bytes exactly constant.
 
 ---
 
@@ -110,9 +120,9 @@ delete the tarball one bundle at a time** — do not push all eight first.
 ### 3.3 Push and extract
 
 ```sh
-adb push qwen3_06b_w8a16_gqafix_ctrl_ladekv.tar.gz /data/local/tmp/
-adb shell 'cd /data/local/tmp && tar xzf qwen3_06b_w8a16_gqafix_ctrl_ladekv.tar.gz \
-           && rm qwen3_06b_w8a16_gqafix_ctrl_ladekv.tar.gz'
+adb push qwen3_06b_w8a16_gqafix_hvx8_ladekv.tar.gz /data/local/tmp/
+adb shell 'cd /data/local/tmp && tar xzf qwen3_06b_w8a16_gqafix_hvx8_ladekv.tar.gz \
+           && rm qwen3_06b_w8a16_gqafix_hvx8_ladekv.tar.gz'
 ```
 
 Pushes >500 MB can trigger USB disconnects; `adb reconnect` restores it.
@@ -120,7 +130,7 @@ Pushes >500 MB can trigger USB disconnects; `adb reconnect` restores it.
 ### 3.4 Smoke test one bundle before measuring anything
 
 ```sh
-adb shell 'cd /data/local/tmp/qwen3_06b_w8a16_gqafix_ctrl_ladekv && \
+adb shell 'cd /data/local/tmp/qwen3_06b_w8a16_gqafix_hvx8_ladekv && \
   LD_LIBRARY_PATH=. ./genie-t2t-run -c genie_dialog_basic.json \
   --prompt_file /data/local/tmp/kit-v2/prompts/technical.txt'
 ```
@@ -148,41 +158,74 @@ resolve anything.
 | Cool-down | **30 s between arms**, temperature logged before and after |
 | Order | run `p0_rebaseline` **first**; every delta is computed against it |
 
-**Required precision.** The arms below differ by 14–16 percentage points, which
-at 44.707 tok/s is ~6 tok/s. For an arm to decide anything its **5-rep spread
-must be under ±2 tok/s (±4.5%)**. If it is not, that arm decided nothing —
-re-run it, do not interpret it.
+**Required precision.** The effects being separated are ~5–26%, i.e. ~2–12 tok/s
+at this baseline, and the smallest decision threshold in §6 is **+5%** (~2.2
+tok/s). For an arm to decide anything its **5-rep spread must be under ±2 tok/s
+(±4.5%)**. If it is not, that arm decided nothing — re-run it, do not interpret
+it. This is the single most likely way this session produces nothing: last time
+one binary spanned 23.43–44.54 tok/s.
 
-### 4.2 ⭐ Priority 1 — the pair that decides the plan (~30 min)
-
-Run **both**. The verdict is in the *ordering*, not the magnitudes, so either one
-alone is half an answer.
-
-| Arm | Bundle | Dialog | Byte model | Compute model |
-|---|---|---|---:|---:|
-| `p4_qh_ladekv` | `qwen3_06b_w8a16_gqafix_qh_ladekv` | `genie_dialog_basic.json` | **+17.9%** | +3.6% |
-| `p4_cl512_ladekv` | `qwen3_06b_w8a16_gqafix_cl512_ladekv` | `genie_dialog_basic.json` | +10.1% | **+26.0%** |
-
-⚠️ **`cl512` is the more trustworthy half.** The `qh` bundle's ctx-bin shrank only
-8.4 MB although the converter credits −146.1 MB, reproducing a known anomaly —
-the INT8 head is likely re-materialized to 16 bits at context-prepare time. If
-so `qh` measures **≈0%**, which is a *third* valid outcome (§6.1), not a failure.
-`cl512`'s saving is activation traffic and cannot be re-materialized away.
-
-### 4.3 ⭐ Priority 2 — the free falsification test (~10 min)
+### 4.2 ⭐ Priority 1 — the orthogonal test (~10 min, and it is the cheapest)
 
 | Arm | Bundle | Byte model | Compute model |
 |---|---|---:|---:|
-| `p5_ctrl` | `qwen3_06b_w8a16_gqafix_ctrl_ladekv` | — (the control) | — |
-| `p5_hvx8` | `qwen3_06b_w8a16_gqafix_hvx8_ladekv` | **0.0%, by construction** | up to large |
+| `p4_hvx8` | `qwen3_06b_w8a16_gqafix_hvx8_ladekv` | **0.0%, by construction** | up to large |
 
-`hvx8` is the same DLCs as the control with `hvx_threads: 8` at **build** time.
-It moves **zero DDR bytes** (verified: both report `read_total_bytes =
-961,130,496`), so the byte model predicts exactly 0.0%. Anything above the rep
-spread falsifies it outright.
+**This is the only proposed experiment that is orthogonal by construction.** It
+is the *same DLCs* as the baseline with `hvx_threads: 8` set at **build** time —
+so it changes compute capacity while holding DDR bytes *exactly* constant. The
+byte model predicts exactly 0.0%; anything above the rep spread falsifies it
+outright.
 
-> **Compare `hvx8` against `p5_ctrl`, not against `p0_rebaseline`.** The control
-> is built through the same config path, so it isolates the knob from the path.
+Verified device-free, two independent ways:
+
+- **Compiled-value readback**: `numHvxThreads` reads back as **8** out of the
+  finalized binary (every other bundle in this drop reads 4). The knob bound —
+  this is not inferred from file size.
+- **Byte accounting**: both it and the baseline report `read_total_bytes =
+  961,130,496`, `write_total_bytes = 419,840`. Identical.
+
+> ### Compare against `p0_rebaseline` — there is no separate control arm
+> `qwen3_06b_w8a16_gqafix_ctrl_ladekv` ships in this drop but is **byte-identical
+> to `qwen3_06b_w8a16_gqafix_ladekv`** (md5 `9c6024ad5b141137fbe22f3a4972eb96` on
+> both ctx-bins). ctx-bin generation is deterministic, so rebuilding the baseline
+> config reproduces the baseline bin exactly. **Running it as a separate arm
+> would burn ~10 minutes measuring the same binary twice.** It is included only
+> so the drop is self-contained; skip it.
+
+### 4.3 ⭐ Priority 2 — the CL arm (~15 min)
+
+| Arm | Bundle | Dialog | Byte model | Compute model |
+|---|---|---|---:|---:|
+| `p4_cl512_ladekv` | `qwen3_06b_w8a16_gqafix_cl512_ladekv` | `genie_dialog_basic.json` | +10.1% | **+26.0%** |
+
+Changes both bytes and cycles, but by *different ratios*, so it discriminates by
+magnitude rather than by sign. Its saving is activation traffic, which — unlike
+the W8 head — cannot be re-materialized away at context-prepare time.
+
+### 4.3b Priority 3 — the W8 head (optional; it is confounded)
+
+| Arm | Bundle | Dialog | Byte model | Compute model |
+|---|---|---|---:|---:|
+| `p4_qh_ladekv` | `qwen3_06b_w8a16_gqafix_qh_ladekv` | `genie_dialog_basic.json` | +17.9% | +3.6% |
+
+> ⚠️ **Demoted from priority 1 — this arm confounds the question it was meant to
+> answer.** It changes DDR bytes *and* is independently suspected of never
+> reaching the device. Two lines of evidence:
+>
+> - Its ctx-bin shrank only **8.4 MB** although the converter credits −146.1 MB,
+>   reproducing the same anomaly the 2026-08-12 build showed (DLC −151.3 MB,
+>   ctx-bin −12.5 MB). The likely cause is HTP re-materializing the INT8 head to
+>   16 bits at prepare time, since the `FullyConnected`'s input and output are
+>   both `Float_16`.
+> - **On-device corroboration:** decode PD footprint disagrees 1.8× between two
+>   near-identical bins — ~167 MB (ladekv) vs 304 MB (qh) — while prefill and
+>   verify32 agree within a percent. 167 + 144 = 311 ≈ 304, so the ~144 MB looks
+>   real and *resident on the device*.
+>
+> Expect **≈0%**. That is a valid, informative outcome (§6.1) — it closes a
+> two-session-old question — but it is not a discriminator. Run it after the
+> first two, or not at all if time is short.
 
 > ⚠️ **Every bundle's `htp_backend_ext_config.json` says `hvx_threads: 4`,
 > including `hvx8`. That is correct — do not "fix" it.** `hvx_threads` is
@@ -191,7 +234,7 @@ spread falsifies it outright.
 > bin is 2,277,376 bytes larger than the control. Changing the runtime value
 > would turn a clean single-variable test into a two-variable one.
 
-### 4.4 Priority 3 — the decode-only cycle profile
+### 4.4 Priority 4 — the decode-only cycle profile
 
 **Uses `qnn-net-run`, not `genie-t2t-run`.** Not in `run_all.sh`.
 
@@ -245,9 +288,9 @@ If the verifier passes and `qnn-net-run` still fails, the cause is environmental
 
 ⚠️ This profile **cannot settle byte-vs-compute on its own**: at 4 HVX threads
 ~88M reads compute-bound, at 8 it reads byte-bound, and the runtime reports 8
-while every build compiles for 4. §4.3 is what disambiguates it.
+while every build compiles for 4. §4.2 is what disambiguates it.
 
-### 4.5 Priority 4 — the variance question (8 reps)
+### 4.5 Priority 5 — the variance question (8 reps)
 
 | Arm | Bundle |
 |---|---|
@@ -258,9 +301,9 @@ currently bounds the resolution of every measurement either side can take. Init
 time tracked it weakly (873 / 811 / 854 ms — the fastest rep also initialised
 fastest), which is suggestive of thermal or DVFS state.
 
-### 4.6 Priority 5 — the cheap knobs (~5 min each)
+### 4.6 Priority 6 — the cheap knobs (~5 min each)
 
-Compare each against `p5_ctrl`.
+Compare each against `p0_rebaseline` (see §4.2 — `p5_ctrl` is a byte-identical copy of it and is not worth a separate arm).
 
 | Arm | Bundle | Tests | Offline evidence |
 |---|---|---|---|
@@ -272,7 +315,7 @@ Compare each against `p5_ctrl`.
 `dlbc` and `wpack` produced byte-identical binaries offline. Run only if time
 allows.
 
-### 4.7 Priority 6 — prompt distribution
+### 4.7 Priority 7 — prompt distribution
 
 | Arm | Prompt | Generated tokens |
 |---|---|---|
@@ -290,7 +333,7 @@ cd /data/local/tmp
 sh kit-v2/run_all.sh results-2026-08-16
 ```
 
-Runs §4.2, §4.3, §4.5, §4.6, §4.7 in priority order with the correct rep counts
+Runs §4.2, §4.3, §4.3b, §4.5, §4.6, §4.7 in priority order with the correct rep counts
 and cool-downs. Skips any absent bundle. §4.4 must be run by hand.
 
 ---
@@ -318,7 +361,7 @@ and cool-downs. Skips any absent bundle. §4.4 must be run by hand.
 | **spread** = (max − min) / median | ✅ | **must be < 4.5%**, else the arm decided nothing |
 | temperature before / after | ✅ | `/sys/class/thermal/thermal_zone*/temp` |
 | median TTFT, median init | ✅ | |
-| Δ vs its control, in % | ✅ | qh/cl512 vs `p0_rebaseline`; knobs vs `p5_ctrl` |
+| Δ vs its control, in % | ✅ | **every arm vs `p0_rebaseline`** — there is no separate control bundle (§4.2) |
 | quality verdict | ✅ | §5.3 |
 | dialog + backend config actually used | ✅ | `run_all.sh` copies these automatically |
 
@@ -381,23 +424,39 @@ it and stop — that is a finding too.
 | `p0_rebaseline` median is not ≈ 44.7 | Something environmental changed — report it; the session is not comparable to 2026-08-15 until explained |
 | any arm's first ~30 tokens diverge (except per §5.3) | **Quality failure — the speed number is meaningless.** Report the divergence, not the tok/s |
 
-### 6.1 The pair
+### 6.1 The arms, in priority order
 
-| `qh` | `cl512` | Verdict | Consequence |
-|---|---|---|---|
-| **≥ +12%** | ≤ +12% | **Byte-bound** | `qh` becomes the ship base; KV signed-INT8 and weight-stream compression lead; CL stays a product knob |
-| ≤ +8% | **≥ +19%** | **Compute-bound** | The CL ladder leads — build `cl768`, reopen `cl256` for short-context products. `qh` parked. Attention-side compute becomes the workstream |
-| **≈ 0%** | — | **Expected for `qh`** — the head's saving never reaches the device (ctx-bin shrank 8.4 MB against −146 MB of accounting) | Not wasted: it closes a two-session-old question. `cl512` then carries the whole discrimination |
-| both mid-band | both mid-band | **Mixed** | Do not guess a ladder — re-derive it from §4.4's per-op table |
-| **both < +5%** | | **Neither model holds** | Something outside both binds: per-op dispatch (~220 µs RPC × op count), DVFS, or whatever drives the variance. §4.4 becomes the only admissible input, and "is `llm_decode_burst` actually the maximum HTP/DDR clock?" escalates to the platform team |
+**`hvx8` (§4.2) is the decisive one** — it is the only arm that varies compute
+while holding DDR bytes exactly constant, so it needs no assumption about which
+model is right.
 
-### 6.2 The null test
+| `p4_hvx8` vs `p0_rebaseline` | Verdict | Consequence |
+|---|---|---|
+| **> +5%** | **Byte model falsified outright** — zero DDR bytes changed, so a byte-bound step could not have moved | Adopt `hvx_threads: 8` in every build immediately; it is free. Compute-bound is confirmed; the CL ladder and attention-side compute become the workstream. Re-read §4.4's cycle count at 8 threads, not 4 |
+| within the rep spread | Build-time 4 was not binding, or 8 units were already in use. **Does not confirm byte-bound** — it only removes one refutation | Keep 4. Fall through to `cl512` |
+| **negative beyond the spread** | Thread oversubscription on a single HTP | Keep 4 and record — first evidence that HVX scheduling is contended |
 
-| `hvx8` vs `p5_ctrl` | Meaning |
+Then `cl512`, which discriminates by magnitude rather than sign:
+
+| `p4_cl512_ladekv` | Reading |
 |---|---|
-| **> +5%** | **Byte model falsified outright** — zero DDR bytes changed. Adopt `hvx_threads: 8` everywhere; it is free. Re-read §4.4 at 8 threads |
-| within the spread | Build-time 4 was not binding, or 8 units already in use. Keep 4; interpret §4.4 at 8 threads |
-| **negative beyond the spread** | Thread oversubscription on one HTP. Keep 4 — first evidence HVX scheduling is contended |
+| **≥ +19%** | Consistent with compute-bound (predicted +26.0%). Build `cl768`, reopen `cl256` for short-context products |
+| ~+10% | Consistent with byte-bound (predicted +10.1%). KV signed-INT8 and weight-stream compression lead; CL stays a product knob |
+| between | Mixed regime — do not guess a ladder; re-derive it from §4.4's per-op table |
+| **< +5%** | **Neither model holds.** Something outside both binds: per-op dispatch (~220 µs RPC × op count), DVFS, or whatever drives the rep variance. §4.4 becomes the only admissible next input, and "is `llm_decode_burst` actually the maximum HTP/DDR clock?" escalates to the platform team |
+
+And `qh`, which is confounded and expected to be a null:
+
+| `p4_qh_ladekv` | Reading |
+|---|---|
+| **≈ 0%** | **The expected result.** Confirms the head's saving never reaches the device — closing a question open since 2026-08-12, and corroborating the 1.8× decode PD-footprint anomaly. Park `qh` permanently |
+| ≈ +18% | The converter accounting *is* what the device streams. Surprising; would reopen the byte model and make the PD-footprint anomaly need another explanation |
+| ≈ +4% | Compute-bound, and the head does reach the device | 
+
+### 6.2 The null test — see §6.1
+
+`hvx8` is now priority 1 and its outcomes are tabulated at the top of §6.1.
+Compare it against `p0_rebaseline`, not against a separate control.
 
 ### 6.3 The cycle profile
 
@@ -415,7 +474,7 @@ now sits at the top is the next round's target.
 
 | Observation | Action |
 |---|---|
-| any knob ≥ +5% vs `p5_ctrl` | Adopt immediately — zero build cost, zero risk |
+| any knob ≥ +5% vs `p0_rebaseline` | Adopt immediately — zero build cost, zero risk |
 | `udma` ≥ +5% | Fold into every future build **and** the 4B work — v81-and-above feature, never enabled before |
 | `socmodel72` ≥ +5% | Adopt as the default `soc_model` for all builds including the ViT and 4B tower |
 | `dlbc` / `wpack` flat | Expected — both were byte-identical offline. Record as tried; do not re-test |

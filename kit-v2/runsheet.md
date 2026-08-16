@@ -65,8 +65,12 @@ moment you perturb the model, because they predict opposite orderings:
 | **`cl512`** (`context.size` 512 → ctx-bin CL 640) | +10.1% | **+26.0%** |
 | **`hvx_threads: 8`** | **0.0%, by construction** | up to large |
 
-**Priority 1 is running the first two and seeing which ordering the silicon
-picks.** That is the whole session. Everything else is secondary.
+**Priority 1 is `hvx_threads: 8`** — the only arm that varies compute while
+holding DDR bytes *exactly* constant, so it needs no assumption about which
+model is right. It costs ~10 minutes. `cl512` is second (it discriminates by
+magnitude); the W8 head is **third and optional**, because it changes bytes *and*
+is independently suspected of never reaching the device, which confounds the
+question it was meant to answer (`REFERENCE.md` §8.11).
 
 ---
 
@@ -231,16 +235,20 @@ the baseline except for the one variable. The old `gqafix_qh` and
 | `p5_hvx8` | `qwen3_06b_w8a16_gqafix_hvx8_ladekv` | `genie_dialog_basic.json` | **pure** |
 
 Identical DLCs to the baseline; the only difference is `hvx_threads: 8` at build
-time (verified consumed — the binary is 2,277,376 bytes larger). It moves **zero
-DDR bytes**, so the byte model predicts exactly 0.0%. Anything above the rep
+time. **Verified two ways:** `numHvxThreads` reads back as **8** out of the
+finalized binary (every other bundle reads 4), and the bin is 2,277,376 bytes
+larger. It moves **zero DDR bytes** — both report `read_total_bytes =
+961,130,496` — so the byte model predicts exactly 0.0%. Anything above the rep
 spread falsifies it outright, and adopting it would be free.
 
-Compare against `p5_ctrl`, **not** against `p0_rebaseline` — the control is built
-through the same config path, so it isolates the knob rather than the path.
+Compare against **`p0_rebaseline`**. There is no separate control arm: the `ctrl`
+bundle is byte-identical to the baseline (md5 `9c6024ad…` on both ctx-bins —
+ctx-bin generation is deterministic), so running it would measure the same binary
+twice.
 
 | Arm | Bundle | Purpose |
 |---|---|---|
-| `p5_ctrl` | `qwen3_06b_w8a16_gqafix_ctrl_ladekv` | the control for every P5/P6 arm |
+| ~~`p5_ctrl`~~ | `qwen3_06b_w8a16_gqafix_ctrl_ladekv` | **skip** — byte-identical to the baseline; `p0_rebaseline` is the control |
 
 ### P6 — Cheap knobs, ~5 min each
 

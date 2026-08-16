@@ -18,12 +18,23 @@ not in here, record it and stop rather than improvising — that is a finding to
 
 ---
 
-## 1. P4 — the pair that decides the plan
+## 1. P4 — the arms that decide the plan
 
-Read the **ordering**, not the magnitudes. The models' absolute predictions are
-both upper bounds (the byte model holds 43 GB/s fixed while removing the largest
-contiguous read; the compute model assumes perfect thread scaling and zero
-stall), but they disagree about *which arm wins*, and that is robust.
+> **Reordered 2026-08-16.** `hvx8` is now priority 1 (§2 below): it is the only
+> arm that varies compute while holding DDR bytes *exactly* constant, so it
+> needs no assumption about which model is right. `qh` was demoted — it changes
+> bytes *and* is suspected of never reaching the device, so it confounds the
+> question it was meant to answer (`REFERENCE.md` §8.11).
+
+> **There is no `p5_ctrl` arm.** That bundle is byte-identical to the baseline
+> (md5 `9c6024ad…`); ctx-bin generation is deterministic. Compare everything
+> against `p0_rebaseline`.
+
+For the `qh`/`cl512` pair, read the **ordering**, not the magnitudes — both
+models' absolute predictions are upper bounds, but they disagree about which
+arm wins and that is robust. **`hvx8` (§2) is read differently and takes
+precedence:** it is a sign test, not an ordering test, because the byte model
+predicts exactly 0.0% for it by construction.
 
 | `p4_qh_ladekv` | `p4_cl512_ladekv` | Verdict | What happens next |
 |---|---|---|---|
@@ -35,7 +46,7 @@ stall), but they disagree about *which arm wins*, and that is robust.
 
 ## 2. P5 — the null test
 
-| `p5_hvx8` vs `p5_ctrl` | Meaning |
+| `p4_hvx8` vs `p0_rebaseline` | Meaning |
 |---|---|
 | **> +5%** | **The byte model is falsified outright** — zero DDR bytes changed. Adopt `hvx_threads: 8` in every build immediately; it is free. Also re-read P1's cycle count at 8 threads, not 4 |
 | within the rep spread | The build-time 4 was not binding, or 8 units were already in use. Interpret P1 at 8 threads. Keep 4; changing it buys nothing |
@@ -57,7 +68,7 @@ now sits at the top is the next round's target.
 
 | Observation | Action |
 |---|---|
-| any knob **≥ +5%** vs `p5_ctrl` | Adopt immediately — zero build cost, zero risk, no quality gate needed |
+| any knob **≥ +5%** vs `p0_rebaseline` | Adopt immediately — zero build cost, zero risk, no quality gate needed |
 | `p6_udma` ≥ +5% | Additionally: this is a **v81-and-above** feature that has never been enabled in any build we have shipped. Fold into every future build and note it for the 4B work |
 | `p6_dlbc` / `p6_wpack` flat | Expected. Both produced byte-identical binaries offline. Record as tried, move on — do not re-test |
 | `p6_socmodel72` ≥ +5% | Adopt as the default `soc_model` for all builds, including the ViT and the 4B tower |

@@ -95,16 +95,25 @@ log "=== P0b -- RE-BASELINE. Every delta below is computed against this. ==="
 run_arm p0_rebaseline    qwen3_06b_w8a16_gqafix_ladekv        genie_dialog_basic.json "$P_TECH" pure
 
 log ""
-log "=== P4 -- THE PAIR THAT DECIDES THE PLAN. Run BOTH; the verdict is in the ordering. ==="
-log "    byte model: qh +17.9% / cl512 +10.1%  compute model: qh +3.6% / cl512 +26.0%"
-run_arm p4_qh_ladekv     qwen3_06b_w8a16_gqafix_qh_ladekv     genie_dialog_basic.json "$P_TECH" pure
+log "=== P4a -- THE DECISIVE ARM. hvx8 varies compute with DDR bytes EXACTLY constant. ==="
+log "    byte model predicts 0.0%; anything above the rep spread falsifies it."
+log "    Compare against p0_rebaseline. numHvxThreads reads back as 8 from this bin."
+run_arm p4_hvx8          qwen3_06b_w8a16_gqafix_hvx8_ladekv   genie_dialog_basic.json "$P_TECH" pure
+
+log ""
+log "=== P4b -- the CL arm. Discriminates by magnitude: byte +10.1% / compute +26.0%. ==="
 run_arm p4_cl512_ladekv  qwen3_06b_w8a16_gqafix_cl512_ladekv  genie_dialog_basic.json "$P_TECH" pure
 
 log ""
-log "=== P5 -- THE NULL TEST. hvx8 changes zero DDR bytes; byte model predicts 0.0%. ==="
-log "    Compare hvx8 against p5_ctrl, NOT against p0_rebaseline (same config path)."
-run_arm p5_ctrl          qwen3_06b_w8a16_gqafix_ctrl_ladekv   genie_dialog_basic.json "$P_TECH" pure
-run_arm p5_hvx8          qwen3_06b_w8a16_gqafix_hvx8_ladekv   genie_dialog_basic.json "$P_TECH" pure
+log "=== P4c -- the W8 head. CONFOUNDED and expected to be ~0%; run last. ==="
+log "    Its ctx-bin shrank 8.4 MB against -146 MB of converter accounting, and the"
+log "    decode PD footprint anomaly (167 vs 304 MB) suggests the 144 MB is resident."
+run_arm p4_qh_ladekv     qwen3_06b_w8a16_gqafix_qh_ladekv     genie_dialog_basic.json "$P_TECH" pure
+
+# NOT RUN: qwen3_06b_w8a16_gqafix_ctrl_ladekv is byte-identical to the baseline
+# (md5 9c6024ad5b141137fbe22f3a4972eb96 on both ctx-bins -- ctx-bin generation is
+# deterministic). Running it would measure the same binary twice. p0_rebaseline
+# IS the control.
 
 log ""
 log "=== P2 -- rep-variance isolation (8 reps, temperature logged each side) ==="
