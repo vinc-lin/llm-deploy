@@ -898,23 +898,30 @@ actually consumed — `scripts/build/ctxbin_variant.sh` and
 `configs/htp_backend_config.json`, **not** the runtime config — and verify by
 reading `numHvxThreads` back out of the binary.
 
-**The A/B pair is built and waiting (2026-08-16).** Both regenerated from the
-same three gqafix DLCs, so the only difference is the compiled thread count:
+**The A/B pair already exists and is ready to push (2026-08-16):**
 
-| | `numHvxThreads` | ctx-bin | decode `read_total_bytes` | spill |
-|---|---:|---:|---:|---:|
-| `…-gqafix-ladekv-hvx4` (control) | **4** | 1,086,570,496 | 961,130,496 | 0 |
-| `…-gqafix-ladekv-hvx8` | **8** | 1,088,847,872 | 961,130,496 | 0 |
+| bundle | `numHvxThreads` | ctx-bin bytes | ctx-bin md5 | decode `read_total_bytes` | spill |
+|---|---:|---:|---|---:|---:|
+| `qwen3_06b_w8a16_gqafix_ladekv.tar.gz` (**control**, the shipping 44.707 bin) | **4** | 1,086,570,496 | `9c6024ad…` | 961,130,496 | 0 |
+| `qwen3_06b_w8a16_gqafix_hvx8_ladekv.tar.gz` | **8** | 1,088,847,872 | `b533db21…` | 961,130,496 | 0 |
 
-Three things this establishes without hardware: the knob **binds** (it is read
-back out of the finalized binary, not merely requested); the compiler really
-does emit different code for it (+2.28 MB, so it is not a metadata flag); and
-DDR traffic is **byte-identical** across the pair. That last point is what makes
-this the clean discriminator — it varies compute width while holding bytes
-exactly constant, which no other proposed experiment does.
+Three things this establishes without hardware: the knob **binds** (read back out
+of the finalized binary, not merely requested); the compiler really does emit
+different code for it (+2,277,376 B and a different md5, so it is not a metadata
+flag); and DDR traffic is **byte-identical** across the pair, with
+`spillFillBufferSize = 0` on all six graphs. That combination is what makes it
+the clean discriminator — it varies compute width while holding bytes exactly
+constant, which no other proposed experiment does. (Contrast the older
+`fuseqkvgu_hvx8` bundle, which *also* moved `spillFillBufferSize` on prefill and
+so was never single-variable despite its README's claim.)
 
-Both live in `$LLMDEPLOY_DATA/work/ctxbin/`. They still need bundling before a
-device run.
+**ctx-bin generation is deterministic.** Two independent rebuilds hours apart,
+from the same DLCs and config, produced **byte-identical** ctx-bins — and a
+rebuild of the shipping `gqafix-ladekv` reproduced its bin md5 exactly. That is
+worth knowing in its own right: it means "did this variant actually change
+anything?" is answerable by md5, and that a variant whose bin hashes equal to the
+baseline's did not bind. It is also why the byte accounting in §6.9, captured
+from a rebuild, is valid for the shipped binary.
 
 ### 8.10 n-gram acceptance at 4B
 Everything LADE buys at 4B hinges on acceptance holding near 0.6B's ~1.94

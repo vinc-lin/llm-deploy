@@ -105,8 +105,19 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
   floor, a 4B export writes 8.6 GB and asks 20. A flat 6 GB check passes and then
   still runs C: dry mid-step.
 - The vhdx is sparse and `/` is mounted `discard`, so deleting in-guest reclaims C:
-  with no compaction step. `ls` reports the ~448 GB virtual size and always will;
-  `du -h <vhdx>` (no `--apparent-size`) is the real consumption.
+  with no compaction step (asynchronously — free space does not jump immediately).
+  `ls` reports the ~448 GB virtual size and always will; `du -h <vhdx>` (no
+  `--apparent-size`) is the real consumption.
+- **`df /` lies about headroom — check `df -h /mnt/c`.** In-guest `df` reports the
+  ext4 filesystem inside the vhdx (recently: 537 GB "free") while the C: drive
+  actually backing it had **54 GB**. That gap is the SIGBUS crash, one command
+  away. Check C: before any multi-GB step, not `/`.
+- **Before building a variant, check whether it already exists.** ctx-bin
+  generation is deterministic (same DLCs + config → byte-identical bin, verified
+  by md5 across independent rebuilds), so a "new" variant is often a ~20 min,
+  multi-GB re-derivation of something already on disk. `md5sum` the candidate
+  against `work/ctxbin/*/` first. Concurrent sessions have duplicated builds
+  this way.
 - W4A16 is a dead end on this SDK at any size: quality 0/4 at 0.6B, AND v81's
   `htp_v2.json` ships zero INT4 matmul kernels — the converter folds s4→f16
   (`--lpbq`/`--seq-mse` stay only for a future SDK).
