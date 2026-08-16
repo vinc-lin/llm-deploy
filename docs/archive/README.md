@@ -22,7 +22,7 @@ the analysis had to be applied in four places and usually wasn't.
 | `MAX_TPS_QWEN3_0.6B_V1.md` | ~2026-08-11 | The original 10.8 tok/s LADE recipe | Its headline predates the 2026-08-13 measurement showing basic AR-1 at 11.72 on the same device. LADE is now parked entirely (`REFERENCE.md` §6.8) |
 | `MAX_TPS_QWEN3_0.6B_V2.md` | 2026-08-13 | Measured baselines, ctx-bin forensics, and **the compute model** | Superseded as a plan. **But its §1.2 was right**: it predicted the post-fix step at `88.5M ÷ 4 HVX @ ~1 GHz ≈ 22.1 ms` and the device measured **22.37 ms**. That out-of-sample hit is the strongest evidence for the compute model (`REFERENCE.md` §8.11); it was written off at the time because the prevailing view was "100% DDR-bound" |
 | `MAX_TPS_QWEN3_0.6B_V3.md` | 2026-08-14 | The gqafix trunk and its decision tree | The trunk shipped and was measured; the decision tree is resolved. Its §7 byte projection ("883 MB → ~18.1 tok/s") is the byte model's documented out-of-sample **failure** — reality was 44.7 |
-| `MAX_TPS_QWEN3_0.6B_V4.md` | 2026-08-16 | Byte-floor descent plan, never executed | Shipped as a self-declared DRAFT with four flagged errors. A fifth, larger one was found before any of it ran: its §1 anchors on `read_total_bytes = 961,130,496`, which is a **pre-GQA-fix** figure, and its whole direction (byte reduction, W8 head first) follows from a byte model the fix had already refuted. Its *structure* — device-free Part A with a byte gate, one pre-scripted Part B — survives in the current plan |
+| `MAX_TPS_QWEN3_0.6B_V4.md` | 2026-08-16, **rev 2** | Byte-floor descent plan, revised twice | The original draft anchored on a pre-fix `read_total_bytes` and led with byte reduction. **Rev 2 corrected itself** — the 11.72 blend, the zero-byte finding, the P1 retraction — and is the deepest analysis in the project: the byte-vs-compute degeneracy at the post-fix operating point, and the discriminator-pair design. Archived only because the *ladder* is retired, not because it is wrong. `docs/PLAN_0.6B_max_tps.md` is the acting plan; read this for the reasoning behind it |
 
 **The through-line worth remembering:** V2 contained the correct model and was
 overruled by consensus; V3 and V4 then built increasingly detailed plans on the
@@ -51,11 +51,11 @@ So the archive is never load-bearing, these were moved into `REFERENCE.md` first
 - `type:"lade"` + `max-num-tokens` → SIGSEGV, and the linter that blocks it → §3.4
 - `libQnnHtpQemu.so` → `Request feature arch with value 81 unsupported` → §4.1
 - `groupContext.share_resources`, `--preserve_io_datatype`, QAIRT 2.43 quantizer dead ends → §4.1
-- The four-tier perf-profile ladder in absolute tok/s (the basis for correction #25) → §1
+- The four-tier perf-profile ladder in absolute tok/s (the basis for correction #30) → §1
 - `adb push` >500 MB USB disconnects → §9
 - The `−100` vs `−1000` mask-constant caveat → §3.5
 - The DLC-mtime staleness gate → §5
-- The bertcache 444 MB private weight copy → §6.10
+- The bertcache 444 MB private weight copy → §6.11
 - The no-weight-sharing ~3.2 GB counterfactual → §8.2
 
 **Still only in `SA8797P_Deployment_Status_Summary.md`**, worth harvesting if

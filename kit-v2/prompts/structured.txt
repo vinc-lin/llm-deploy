@@ -1,0 +1,11 @@
+<|im_start|>system
+You are a helpful assistant who answers with consistent, repetitive structure.<|im_end|>
+<|im_start|>user
+List the first 12 chemical elements. For each one use exactly this format on its own line:
+
+Element N: <name> — symbol <symbol>, atomic number <number>, category <category>.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

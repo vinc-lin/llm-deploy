@@ -18,7 +18,7 @@ the ship configuration. LADE is parked as a regression.
 
 The GQA fix worked by removing **compute**, not bytes: 74.7% of decode DSP
 cycles, against ~0 DDR bytes (§6.9). That refuted the DDR-bound model every
-earlier version of this plan was built on (corrections #22–#25).
+earlier version of this plan was built on (corrections #27–#32).
 
 ## 2. The one question that sets the direction
 
@@ -27,7 +27,25 @@ earlier version of this plan was built on (corrections #22–#25).
 bet, not a plan — and the byte model has already mispredicted once (V3 §7 said
 18.1 tok/s; reality was 44.7).
 
-So the next two actions are *discriminating experiments*, not optimisations.
+The awkward part: **at the post-fix operating point the byte and compute models
+are numerically degenerate.** 961 MB ÷ 22.37 ms = 43.0 GB/s, and 88.2M residual
+cycles ÷ 4 HVX ≈ 22.06 ms — 1.4% apart. Neither is confirmed by the baseline
+itself, so no amount of re-reading it decides anything.
+
+What *does* decide it is a pair of arms whose predicted orderings **differ**
+(`docs/archive/MAX_TPS_QWEN3_0.6B_V4.md` §2 has the full derivation):
+
+| Arm | byte model predicts | compute model predicts |
+|---|---:|---:|
+| W8 head | **+19.3%** | +3.6% |
+| CL=512 | +8.3% | **+34.7%** |
+| `hvx_threads: 8` | **0%** by construction | large |
+
+The two models rank these in opposite orders, so one run separates them. That
+is why the hvx pair is priority 1 and why the W8 head is worth building despite
+having measured nothing so far — here it is an *instrument*, not a candidate.
+
+So the next actions are *discriminating experiments*, not optimisations.
 
 ## 3. Part A — device-free, do now
 
@@ -40,7 +58,7 @@ them is worth doing regardless of how they land.
 | ~~A2~~ | ✅ **DONE 2026-08-16.** Post-fix decode `read_total_bytes` = **961,130,496**, `write_total_bytes` = **419,840** — *byte-identical to pre-fix* (§6.9) | The GQA fix moved **zero** DDR bytes and won 6.5×. The byte model is refuted by measurement, not inference. `verify32`'s 745 MB spill is also gone | done |
 | **A3** | **`soc_model: 72`** variant | Shipping bins carry `socModel = 0`; the device team's own "verified working" build sets 72. Never A/B'd (§8.4) | ctx-bin regen |
 | **A4** | **Debug `gqafix_hybrid`'s degenerate output** | Blocks the TTFT product win (103 → ~40 ms). Reproducible device-free: drive the bertcache graph's exact I/O with a `parity_ladekv_read.py`-style feed and expect an argmax divergence. Suspects, in order: per-graph input naming, the position-id path under grouped attention, graph selection handing the wrong prefill its mask | half a day |
-| **A5** | **Re-diagnose why the P1 cycle profile did not run** | ⚠ **Not an input-format defect.** All 60 profiling inputs match the gqafix decode graph byte-for-byte (`REFERENCE.md` correction #27), so the recorded reason is wrong and regenerating them is wasted work. The real cause is unknown; start with the `graph_names` narrowing the profiling package warns about | ~1 h |
+| **A5** | **Re-diagnose why the P1 cycle profile did not run** | ⚠ **Not an input-format defect.** All 60 profiling inputs match the gqafix decode graph byte-for-byte (`REFERENCE.md` correction #32), so the recorded reason is wrong and regenerating them is wasted work. The real cause is unknown; start with the `graph_names` narrowing the profiling package warns about | ~1 h |
 | **A6** | **Fusion on the gqafix base** (`gqafix_fuseqkvgu_ladekv`) | The two winning changes have never been combined. **Genuinely uncertain**: fusion's +15% was measured pre-fix, and if it was dispatch-overhead recovery the GQA fix may already have collected it — the same reasoning that killed LADE | one build |
 | **A7** | **Byte-accounting gate** — record `read_total_bytes` / `write_total_bytes` per graph for every variant and check against prediction | A variant whose bytes did not move did not do what it claims. Device-free analogue of the `Unknown Key` rule | free, add to build scripts |
 

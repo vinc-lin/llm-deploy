@@ -34,13 +34,20 @@ python3 - "$CFGDIR" "$GRAPHS_CSV" "$OVERRIDES" <<'PYEOF'
 import json, sys
 cfgdir, graphs_csv, overrides = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
 ctx_over = overrides.pop("__context", {})
+dev_over = overrides.pop("__devices", {})
 graph = {"graph_names": graphs_csv.split(","), "O": 3, "vtcm_mb": 16, "hvx_threads": 4}
 graph.update(overrides)
+# soc_model defaults to 0 (generic). REFERENCE.md 8.4: the SDK maps SA8797 to
+# soc_id 72 and Qualcomm document extra O=3 algorithms behind naming it, but it
+# has never been A/B'd -- override with '{"__devices": {"soc_model": 72,
+# "soc_id": 72}}' to build that arm.
+device = {"dsp_arch": "v81", "soc_model": 0, "pd_session": "unsigned",
+          "cores": [{"core_id": 0, "perf_profile": "burst",
+                     "rpc_control_latency": 100, "rpc_polling_time": 9999}]}
+device.update(dev_over)
 backend = {
     "graphs": [graph],
-    "devices": [{"dsp_arch": "v81", "soc_model": 0, "pd_session": "unsigned",
-                 "cores": [{"core_id": 0, "perf_profile": "burst",
-                            "rpc_control_latency": 100, "rpc_polling_time": 9999}]}],
+    "devices": [device],
     # extended_udma lives in "context", NOT "memory" -- docs/NOTES-htp-config-keys.md
     "context": dict({"weight_sharing_enabled": True}, **ctx_over),
 }
@@ -52,6 +59,7 @@ json.dump({"backend_extensions": {
 print("graph_names:", graph["graph_names"])
 print("graph opts :", {k: v for k, v in graph.items() if k != "graph_names"})
 print("context    :", backend["context"])
+print("devices    :", {k: v for k, v in device.items() if k != "cores"})
 PYEOF
 
 disk_guard 6

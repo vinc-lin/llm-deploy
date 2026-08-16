@@ -59,6 +59,54 @@ Consequences for the report's recommendations:
   weight GEMMs 35.3% and `lm_head` 6.9% — so QKV/Gate-Up fusion is worth ~10% of
   real compute, not "~2.5% marginal", and `lm_head` is not negligible.
 
+### 0.4 Test 1's 11.72 tok/s is a phase blend, and it invalidates Tests 1, 3 and §6.3
+
+*Added 2026-08-16. This is the largest correction to this report, and it was
+found only after the 2026-08-15 measurements gave an independent control.*
+
+`qwen3_06b_w8a16_local` is a **bertcache** bundle (prefill AR=128, CL=128). In
+that topology Genie keeps generating *through the prefill graph*, re-processing
+the whole 128-wide window once per token, until the KV cache passes 128
+(`kvmanager.cpp:421-429`). Only then does the AR-1 decode graph take over. So
+Test 1 Arm A's 128 generated tokens did not all run at one rate:
+
+```
+prompt 56 tokens, 128 generated, 10,837 ms total
+  bertcache phase: tokens 1..72   (KV 56 -> 128) @ 40.1 ms  = 2,887 ms   <-- = this run's own TTFT
+  AR-1 phase     : tokens 73..128 (56 tokens)               = 7,950 ms
+                                             7,950 / 56     =  142.0 ms/step
+```
+
+**142.0 ms against 146.3 ms measured on 2026-08-15** for the pre-fix `ladekv`
+bin in basic mode — a 3% agreement between two numbers from different days,
+different bundles and different methods. The blend model closes, and the honest
+pre-fix AR-1 rate is **6.84 tok/s**, not 11.72.
+
+Consequences for this report:
+
+- **Test 1's "LADE is −22%" is an artifact.** It compares LADE on `ladekv`
+  against *blended* basic on `local`. Like-for-like on one bin and this same
+  prompt, **LADE was 9.18 vs 6.84 = +34%**. (LADE does lose post-fix — 31.342
+  vs 44.707 on 2026-08-15 — but for the different reason in `REFERENCE.md` §6.8,
+  and that could not be known from this report.)
+- **Test 3's "+51% faster than the device team's 7.79" is an artifact.**
+  Like-for-like our pre-fix AR-1 is 6.84, i.e. ~12% *slower*. `REFERENCE.md`
+  §8.8 is reopened rather than re-inverted, because their build's topology and
+  provenance were never audited either.
+- **§6.3's "~75% build gap between `local` and `ladekv`" does not exist.** The
+  two decode graphs are structurally identical and share weights within 4 MB.
+  Recommendation 2 ("investigate the build gap") should not be actioned.
+- **Test 4's qh baseline is the blended number**, so the −43% is overstated by
+  the blend on top of the confound §0.1 already flags.
+- Test 2 (the op-level cycle profile) is **unaffected** — it ran under
+  `qnn-net-run` on a single-graph decode-only bin, with no graph selection
+  involved. It remains the most valuable measurement in this report.
+
+Gate added so this cannot recur: `scripts/validate/lint_bundle_topology.py`
+classifies any ctx-bin as pure or blended from its own graph shapes, and derives
+the same 72/56 split independently. Full analysis in
+`docs/MAX_TPS_QWEN3_0.6B_V4.md` §1 and `REFERENCE.md` §6.9 / corrections #22–25.
+
 ### 0.2 The raw artifacts were never received
 
 `docs/test_artifacts/measurement_2026-08-13/` (the artifact index at the end of
@@ -75,7 +123,7 @@ bundles (fuseqkvgu, socmodel72, hvx8). Fixed 2026-08-14; the pair is now refused
 by `scripts/validate/lint_bundle_dialogs.py`, which runs in `bundle.sh` and in
 the documented hand-add recipe.
 
-### 0.4 Outcome, and two things later readers got wrong (added 2026-08-16)
+### 0.5 Outcome, and two things later readers got wrong (added 2026-08-16)
 
 **This report's headline finding was correct and acting on it worked.** Removing
 the 56 replication ops took decode from 6.836 → **44.707 tok/s**, +6.5%×, measured
@@ -87,7 +135,8 @@ Two cautions for anyone quoting it:
 1. **The step time is internally inconsistent.** §Test 2's preamble motivates the
    investigation against "approximately 155 ms per decode step", while the Note
    on Wall-Clock Time cites Genie at "~85 ms" and Test 1 measures 11.72 tok/s =
-   85.3 ms. 155 ms corresponds to the *superseded* 6.45 tok/s baseline. So the
+   85.3 ms — and per §0.4 that 85.3 ms is itself a *blend*, not a step time, so
+   neither figure is a clean AR-1 rate (the honest one is 146.3 ms). 155 ms corresponds to the *superseded* 6.45 tok/s baseline. So the
    "roughly 100 ms of previously unexplained decode time" in the Executive
    Summary is computed against a step time this same report invalidates —
    against 85.3 ms the residue is ~65 ms. This does not affect the cycle
@@ -98,7 +147,7 @@ Two cautions for anyone quoting it:
    nonetheless cited "hvx 4 vs 8: −0.1%, no effect" as though the build-time A/B
    had been run. It has not been, on any lineage. Every shipping ctx-bin is
    compiled `numHvxThreads=4` against 8 available HVX units — see `REFERENCE.md`
-   §8.9 and correction #24.
+   §8.9 and correction #29.
 
 Test 4's −43% W8-head result carries its own confound section in the body
 (different ctx-bins, different lineages) and should not be quoted as a clean

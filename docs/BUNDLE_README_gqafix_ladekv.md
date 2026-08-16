@@ -35,6 +35,31 @@ current 0.6B baseline and ship configuration.
 regression — because acceptance is only 1.61 tok/iter and there is no longer a
 slow step for speculation to amortise.
 
+> ## ✅ ANSWERED on device, 2026-08-15 — and this README's baselines are superseded
+>
+> | Arm (this bundle, one binary) | tok/s | |
+> |---|---:|---|
+> | **basic mode** | **44.707 ± 0.030** (22.37 ms/step) | ✅ **ship this** |
+> | LADE mode | 31.342, acceptance 1.61 tok/iter | ❌ parked |
+> | pre-fix `ladekv`, basic | 6.836 (146.3 ms/step) | the control → **6.54×** |
+>
+> **§5.4's decision matrix is closed: quadrant A.** Do not run it as an open
+> question.
+>
+> **⚠️ Every "11.72 tok/s" and "9.18 tok/s" baseline below is superseded, and
+> 11.72 was never an AR-1 rate to begin with.** It is a phase blend measured on
+> the bertcache `local` bundle — Genie generates through the CL=128 prefill
+> graph for the first ~72 tokens, then switches to AR-1 at ~142 ms/step. The
+> correct pre-fix control is **6.836**, and against it this bundle is 6.54×, not
+> 3.8×. §7's comparison table and the §5 kit arms inherit that error.
+>
+> **What is still live in this document:** §2 (contents and the verified ctx-bin
+> dump), §3 (deploy/run), §4 (the seven rules), §6 (sending results back) and §8
+> (build provenance and gates) are all unaffected and remain accurate.
+>
+> Successor: `docs/MAX_TPS_QWEN3_0.6B_V4.md` (rev 2) and the kit v2 runsheet.
+> Reasoning: `docs/REFERENCE.md` §6.8–§6.9, corrections #22–25.
+
 ## 2. Contents
 
 Flat layout — no `lib/` subdir, no `ADSP_LIBRARY_PATH` needed for Genie runs.
@@ -227,10 +252,11 @@ decisive; together they separate the two competing models of the machine.
 > `read_total_bytes = 961,130,496` as "the gqafix decode graph, unchanged from
 > pre-fix" and derived a ≈530 MB removed-traffic figure and an ≈18 tok/s
 > ceiling from it. Three errors: that figure is from `ctxbin-ws.log` dated
-> **2026-08-10**, i.e. pre-fix, and **no post-fix `read_total_bytes` has ever
-> been recorded**; the replication ops never wrote to DDR at all
+> **2026-08-10**, i.e. pre-fix. The post-fix figure was **measured 2026-08-16**
+> and is byte-identical (961,130,496 read / 419,840 write); the replication ops
+> never wrote to DDR at all
 > (`write_total_bytes` = 419,840 B); and the ≈18 tok/s ceiling was exceeded by
-> **2.5×**. See `REFERENCE.md` §6.9 and corrections #22–#25.
+> **2.5×**. See `REFERENCE.md` §6.10 and corrections #27–#32.
 
 **Sanity check before trusting any of the above:** the fixed decode graph must
 contain **zero** `Eltwise_Binary` ops with `operation: 13` whose output is

@@ -29,7 +29,7 @@ altered; §1–§7 below are a faithful transcription.
 > "destroyed and then restored the effective bandwidth of the whole step",
 > reasoning from a pre-fix byte count and a derived pre-fix total. Both inputs
 > were wrong. The original text is preserved in git history; what follows
-> replaces it. See `REFERENCE.md` §6.9 and corrections #22–#25.
+> replaces it. See `REFERENCE.md` §6.10 and corrections #27–#32.
 
 The kit's decision table derived its ceiling from `read_total_bytes` =
 961,130,496 per decode step and projected **≈18 tok/s** as the top of the range.
@@ -38,10 +38,10 @@ byte model it rests on does not describe this workload:
 
 1. **961,130,496 is a pre-fix figure.** It comes from `ctxbin-ws.log` dated
    2026-08-10, four days before `--grouped-gqa` existed. It was used here as if
-   it were the post-fix byte count. **No post-fix `read_total_bytes` has ever
-   been recorded** — the gqafix build directories retain the ctx-bins and
-   `info.json` but no build logs. Capturing it is a ~20-minute device-free job
-   and it is the single measurement that would settle this section.
+   it were the post-fix byte count. **Measured 2026-08-16** by regenerating the
+   ctx-bin and capturing the generator log: the post-fix decode graph reads
+   **961,130,496** B and writes **419,840** B — *byte-identical to pre-fix*.
+   The fix moved zero DDR bytes (`REFERENCE.md` §6.10).
 2. **The replication ops never wrote to DDR.** The same converter summary reports
    the decode graph writing **419,840 bytes** per step — 420 KB, not the 264 MB
    the "destroyed bandwidth" story assumed. That traffic was VTCM-resident, and
@@ -68,6 +68,31 @@ This remains the strongest argument for completing the P1 cycle profile (§6 rec
 experiments that decide it.
 
 ### 0.3 The P1 blocker is a build-side packaging defect, not a device-side failure
+
+> ### ⚠️ WITHDRAWN 2026-08-16 — this annotation was wrong, and so is §5's reason
+>
+> This section accepted §5's account at face value. Direct audit refutes it:
+>
+> - **The pre-fix and post-fix decode-only ctx-bins have byte-identical input
+>   contracts** — 60 inputs, identical names, shapes and dtypes. The GQA fix is
+>   graph-internal and the KV I/O was frozen by design (`MAX_TPS_V2` §3-B), so
+>   one set of profiling inputs feeds *both* bins and a shape mismatch between
+>   them was **impossible**.
+> - **The shipped inputs already match the gqafix graph exactly**, 60/60, by
+>   `scripts/validate/verify_profile_inputs.py`. Including the file §5 singles
+>   out: `position_ids_cos` is 128 bytes because it is `[1,1,64]` fp16 — 128 B
+>   *is* the correct size, and "64-dim" describes `position_ids`, not the KV
+>   cache (which is `[1,8,128,1151]` in both bins).
+>
+> **So there is no packaging defect, regenerating the inputs fixes nothing, and
+> the real cause of the P1 failure remains unknown.** Plausible candidates, in
+> the order worth checking: the `--retrieve_context` path not resolving after
+> extraction; `ADSP_LIBRARY_PATH` unset; a silently truncated extract (`/data`
+> runs 98–99% full and the package plus bin is ~1.1 GB); or the two *expected*
+> `Unknown Key` warnings being read as the error.
+>
+> `verify_profile_inputs.py` now ships in the package so the next attempt
+> reports the actual mismatch instead of inviting a guess.
 
 §5 records that P1 could not run because the shipped profiling inputs were
 pre-fix format. Those inputs (`decode_profile_inputs.tar.gz`) were generated on

@@ -1,38 +1,27 @@
-# Device session kit
+# Device session kit — superseded by `../kit-v2/`
 
-**The 2026-08-15 session has run. Its kit is in `archive/2026-08-15/` and is no
-longer live guidance** — every priority in it is resolved, blocked, or
-re-ranked, and its decision table is the origin of two numbers that later had to
-be retracted (`REFERENCE.md` §6.9).
+**Use [`../kit-v2/`](../kit-v2). This directory is history.**
 
-Reusable assets that carry forward:
+The 2026-08-15 session has run. Its kit is in `archive/2026-08-15/` and is no
+longer live guidance: every priority in it is resolved, blocked, or re-ranked,
+and its decision table is where two later-retracted numbers originated — the
+pre-fix `read_total_bytes` used as a post-fix figure, and the ≈18 tok/s ceiling
+derived from it (`REFERENCE.md` §6.10, corrections #27–#32).
 
-| Path | What it is |
+`kit-v2/` was rebuilt around the discriminating pair rather than a byte-descent
+ladder, and it carries the protocol change this session forced: **5 reps per
+arm, median reported, thermal state recorded, and an A/B whose delta falls
+inside the rep spread decides nothing.**
+
+## What is still here, and why
+
+| Path | Status |
 |---|---|
-| `prompts/` | the three prompt classes — `simple`, `structured`, `technical`. Every measurement in this project uses one of these; keep them byte-stable or results stop comparing |
-| `expected/` | reference outputs for the same three, for quality-checking a bundle before trusting its speed |
-| `archive/2026-08-15/run_all.sh` | the `run_arm()` harness — bundle/dialog presence checks, warm-up discard, per-rep `--profile` capture, non-fatal arm failures. Fork kit v2's runner from this rather than rewriting it |
+| `prompts/` | **Live.** The three prompt classes — `simple`, `structured`, `technical`. Every measurement in this project uses one of these; keep them byte-stable or results stop comparing. `kit-v2/prompts/` carries the same files |
+| `expected/` | **Live.** Reference outputs for quality-checking a bundle before trusting its speed |
+| `archive/2026-08-15/` | History. Its `run_all.sh` is the `run_arm()` harness that `kit-v2/run_all.sh` was forked from |
 
-## Building kit v2
-
-Do it when the device is next available, from `docs/PLAN_0.6B_max_tps.md` §4,
-not from the archived runsheet. Three things must change:
-
-1. **5 reps per arm, median reported, every raw value kept**, with thermal state
-   recorded before and after and a fixed cool-down between arms. The archived
-   script uses 3, and the `pastkv2g` arm it produced spread 23.43 / 44.54 /
-   29.34 tok/s on **one binary** — wider than most effects worth measuring. An
-   A/B whose delta falls inside the rep spread decides nothing.
-2. **Priority 1 is the `hvx_threads: 8` A/B**, not the byte arms. See
-   `REFERENCE.md` §8.9 and §8.11.
-3. **Regenerate `decode_profile_inputs` before shipping any profiling package.**
-   The 2026-08-15 cycle profile was lost because pre-fix inputs (128-dim KV)
-   were re-shipped against a 64-dim graph. Add "regenerate profiling inputs
-   whenever graph I/O changes" to the drop checklist.
-
-Two rules from the archived kit are still true and worth carrying verbatim:
-
-- **`hvx_threads` is build-time only.** Variants that change it are separate
-  ctx-bins, not config edits.
-- **Backend-config keys are silently ignored when misspelled or misplaced.** If
-  you see `Unknown Key` warnings, that arm is not testing what it claims.
+⚠ One caveat that outlived the kit: `simple.txt` is short enough that a
+bertcache bundle may never leave its prefill phase on it, so a decode rate
+measured on that prompt alone is a blend, not a rate (`REFERENCE.md` §6.9).
+`kit-v2` flags this inline.
