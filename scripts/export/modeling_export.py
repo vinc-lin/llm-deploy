@@ -335,7 +335,8 @@ class ExportQwen3(nn.Module):
 
     @staticmethod
     def from_hf_vl_text(hf_vl, fuse_gate_up=False, fuse_qkv=False, use_past=True,
-                        logits_last_only=False, n_deepstack=3, layer_range=None):
+                        logits_last_only=False, n_deepstack=3, layer_range=None,
+                        grouped_gqa=False):
         """Qwen3-VL text tower: embeddings-in + deepstack.
 
         Architecturally identical to plain Qwen3 text, so it reuses ExportQwen3
@@ -361,7 +362,8 @@ class ExportQwen3(nn.Module):
 
         m = ExportQwen3(cfg, fuse_gate_up, fuse_qkv, use_past, logits_last_only,
                         input_embeds=True, n_deepstack=n_deepstack,
-                        n_layers=end - start, is_first=is_first, is_last=is_last)
+                        n_layers=end - start, is_first=is_first, is_last=is_last,
+                        grouped_gqa=grouped_gqa)
         src = hf_vl.state_dict()
         p = "model.language_model."
         dst = {}

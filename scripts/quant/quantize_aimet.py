@@ -398,7 +398,8 @@ def main():
         if args.vl_text:
             return ExportQwen3.from_hf_vl_text(
                 hf, args.fuse_gate_up, args.fuse_qkv, use_past=use_past,
-                logits_last_only=False, n_deepstack=args.n_deepstack)
+                logits_last_only=False, n_deepstack=args.n_deepstack,
+                grouped_gqa=args.grouped_gqa)
         return ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
                                    use_past=use_past, logits_last_only=False,
                                    grouped_gqa=args.grouped_gqa)
