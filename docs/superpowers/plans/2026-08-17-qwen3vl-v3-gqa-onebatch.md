@@ -847,6 +847,17 @@ done
   ~40 min for the six. Each run prints `PASS: ... (1 chains, n=273 prompt
   rows, N generated tokens)` — that PASS refers to the chain executing, not to
   matching HF, which tierB is deliberately not gated against.
+
+  ⚠ **`--steps 64` is mandatory here and the default will silently truncate.**
+  `parity_e2e_vl.py` defaults to `STEPS = 24`, and it stops at that count
+  whether or not the model reached EOS. v2's kit runs generated **26, 29, 31,
+  37, 45 and 46 tokens** — every one past 24. Run without `--steps` and both
+  `device_caption` and `hf_reference` come back chopped mid-clause ("...while
+  a woman in a pink jacket sits"), which is the worst possible reference: the
+  device team cannot tell a truncated expectation from a real device defect.
+  Caught the hard way on the first v3 attempt; re-run cost ~40 min. The
+  synthetic `sample_image` caption is unaffected because it reaches EOS in 20
+  tokens, so the main gate's default is fine — this applies to the kit only.
 - [ ] **Step 2:** Assemble `device_captions.json` (same shape as the v2 file —
   `{stem: caption}`) from the 6 outputs; diff against v2's: wording drift is
   expected (new quant lineage), semantic drift (wrong weather/scene) = STOP

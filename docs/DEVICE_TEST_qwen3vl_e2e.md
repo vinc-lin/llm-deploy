@@ -1,4 +1,4 @@
-# Device test — Qwen3-VL-4B end-to-end pipeline v2 (SA8797P)
+# Device test — Qwen3-VL-4B end-to-end pipeline v3 (SA8797P)
 
 **Nothing in this bundle has ever executed on an SA8797P.** HTP context binaries
 cannot run on x86, and this SDK has no x86 execution path for W8A16 either
@@ -7,46 +7,111 @@ cannot run on x86, and this SDK has no x86 execution path for W8A16 either
 against HuggingFace at the ONNX level, plus static contract checks on the
 finalised binaries. **This device run is the real test.**
 
-## What changed since the 2026-08-14 attempt
+## What changed since v2
 
-That bundle **never loaded**. Node creation died with two `ShapeError`s on
-`attention_mask` (`Expected [1,128,2176]`, `Found [1,128,128]`) and a SIGSEGV,
-before a single token. Root cause in `docs/REFERENCE.md` §3.6: in a *split*
-tower, shard 0's prefill has no `logits`, so it classifies `DECODER_PREFILL`,
-its expected CL is rewritten to the cache-group maximum, and an AR==CL
-"bertcache" mask can never satisfy that.
+v2's load-time failure (a `ShapeError` on `attention_mask`, root-caused in
+`docs/REFERENCE.md` §3.6) is now history: v2 **did** load on device and
+generate tokens. It crashed one step later, on `node set image`. v3 fixes
+that crash and rebuilds the text tower on top of a defect found while
+chasing it. Two things are different now:
 
-Two things are different now:
+1. **The `node set image` SIGSEGV is fixed at the root.** v2 crashed with
+   `SIGSEGV (SEGV_ACCERR)` at `GenieNode_setData+572`, fault address exactly
+   `base + 0x300000` — 3,145,728, the blob size. Disassembly of the shipped
+   `libGenie.so` (`docs/DEVICE_TEST_qwen3vl_imgenc_sigsegv.md` §1.2b) showed
+   `setData` does a caller-sized heap allocation and a `memcpy`, not DMA — so
+   the fault is a Scudo guard page one byte past the end of the source buffer.
+   **Every `.raw` in v3 is now payload + 4096 zero bytes** (3,149,824 bytes).
+   The runtime still consumes only the first 3,145,728; the padding just moves
+   the guard page out of reach. `lint_pipeline_bundle.py` enforces the padded
+   size, so an unpadded blob cannot ship again.
+2. **The text tower was rebuilt with grouped-query attention.** v2's tower
+   replicated its 8 KV heads up to 32 query heads — 36 `Expand` ops per shard,
+   which the QNN converter lowers into broadcast MULTIPLY ops whose large
+   output the attention MatMul re-reads every step. The identical defect on
+   the Qwen3-0.6B text model cost 74.7% of decode DSP cycles, and removing it
+   took that model from 6.836 to 44.707 tok/s. The VL chain could never
+   produce the grouped form before now because `--grouped-gqa` was not
+   threaded through the VL exporter; it is now. Verified on the shipped DLCs:
+   `4 DLC(s) checked, 0 failing`, replication ops **0**, attention MatMul batch
+   dim **8** (was 32) — the decode MatMul shape went from `1x32x1x2176` to
+   `1x8x4x2176`.
 
-1. **The text tower was rebuilt with a past-KV prefill.** `attention_mask` is
-   `[1,128,2176]` and `past_key_N_in` is `[1,8,128,2048]` — byte-for-byte what
-   the validator demanded. This is the same recipe as the device-proven 0.6B
-   `ladekv` build, not a new idea.
-2. **A load simulation now gates the build.** `lint_pipeline_bundle.py` check 9
-   replays libGenie's own `validateModel` — graph classification, AR/CL
-   derivation, the cache-group scatter/concat detection, the `DECODER_PREFILL`
-   CL rewrite, and every `checkShape` — against the shipped `info.json`s. It was
-   only accepted as a gate once it **reproduced the 2026-08-14 failure** on the
-   old binaries, with the device's exact message, on both shards. It passes on
-   what ships here.
+Converter `read_total_bytes`, v2 → v3 — **converter estimates for a build that
+has never run on device.** They bound byte traffic; they do **not** predict
+tok/s:
 
-That closes the specific failure. It cannot close unknown ones: everything
-inside `libQnnHtp`/`libGenie` beyond shape validation is still unproven for this
-configuration.
+| graph | v2 | v3 | delta |
+|---|---|---|---|
+| `prefill_0` | 3,637,106,688 | 2,820,626,432 | −22.4% |
+| `decode_0` | 3,609,839,616 | 2,237,399,040 | −38.0% |
+| `prefill_1` | 4,413,063,168 | 3,596,582,912 | −18.5% |
+| `decode_1` | 4,387,743,744 | 3,015,303,168 | −31.3% |
+
+At roughly 4.3 GB of weights per token there is a byte floor near ~10 tok/s
+that no topology change crosses, and whether VL-4B decode is byte-bound or
+compute-bound on this silicon is unmeasured — so this table is not a tok/s
+forecast, and none is given below either.
+
+All device-free gates re-passed on the rebuilt tower: AIMET `--eval`
+last-token argmax agreement **4/4** (unchanged from v2's bar); the full
+6-chain `parity_e2e_vl.py` — all four gated chains **20/20** token-for-token
+identical to HF, including `chain0b-prefillkv` (the device path, replaying
+qualla's real three-call chunk plan); ctx-bin weight sharing 1.70 GB / 2.42 GB,
+above the 1.4 / 2.0 floors; and the Genie load simulation (`validateModel`
+replay) still **PASS**.
+
+The expected caption is **unchanged from v2**, despite a completely new
+quantization lineage — see the sample-image smoke test below.
+
+None of this closes unknown failures. Fixing the two specific defects above
+cannot rule out a third one: everything inside `libQnnHtp`/`libGenie` beyond
+shape validation, the setData path, and GQA correctness is still unproven for
+this configuration.
 
 ## Run it
 
 ```bash
 adb push qwen3vl_4b_e2e_pipeline /data/local/tmp/qwen3vl
 adb shell
-cd /data/local/tmp/qwen3vl && chmod +x genie-app
-LD_LIBRARY_PATH=. ./genie-app -s genie_pipeline_qwen3vl.script
+cd /data/local/tmp/qwen3vl && chmod +x genie-app genie-t2t-run
 ```
 
 The bundle is flat on purpose: Genie's loader resolves the `.so` files and every
 config-referenced path from the bundle root, not from a `lib/` subdirectory.
 
-## 1. Smoke test — the sample image
+## 1. Text-only first — tok/s and TTFT for the 4B text tower
+
+**Do this before touching the image path.** It is the one measurement in this
+session guaranteed to produce a result even if `node set image` still crashes,
+it takes minutes rather than the whole session, and it does not depend on the
+image path at all: no 4B two-shard W8A16 text tower has ever had its tok/s or
+TTFT measured, so the number is independently valuable on its own.
+
+```bash
+LD_LIBRARY_PATH=. ./genie-t2t-run -c genie_dialog_qwen3vl_4b.json \
+    -p "What is 2+2? Answer with one number." --profile qwen3vl_4b_text_profile.json
+```
+
+`-c` selects the dialog config, `-p` is the prompt string, and `--profile FILE`
+writes a JSON performance file containing `init`, TTFT, PPR (prompt-processing
+rate) and TGR (decode tok/s — the headline number) —
+`docs/SA8797P_HTP_v81_Hardware_and_Deployment_Quantization_Reference_EN.md`
+§10.3. That same section is why this is the invocation to use rather than
+reading timing off the console: on Android, `--log verbose` sends logs to
+`logcat`, not stdout, so `--profile` is the only way to get numbers directly
+in the shell. There is no `--max-tokens` flag (`max-num-tokens` would need to
+be set in the JSON, which this config does not set) and no `-n`; `-t` means
+`--embedding_table`, not timing.
+
+Report the `qwen3vl_4b_text_profile.json` contents verbatim alongside the
+console output.
+
+## 2. Smoke test — the sample image
+
+```bash
+LD_LIBRARY_PATH=. ./genie-app -s genie_pipeline_qwen3vl.script
+```
 
 `sample_image.raw` is a red circle and a blue square on a white background, the
 same scene the parity gate used, so the output is directly comparable.
@@ -62,7 +127,28 @@ towers are W8A16, so wording drifts. The bar is **semantic**: the caption must
 name both shapes, both colours, and the white background. Fluent text describing
 a *different* image is a failure — see triage.
 
-## 2. Weather / road kit
+## 3. If it still crashes on `node set image`
+
+v3 ships every `.raw` already padded (payload + 4096 zero bytes), which is the
+fix for v2's `SIGSEGV (SEGV_ACCERR)` at `GenieNode_setData+572`. If step 2
+crashed at the same call anyway, the discriminator no longer needs extra files
+pushed from the host — recreate the unpadded probe from the blob already on
+device:
+
+```bash
+head -c 3145728 sample_image.raw > nopad.raw
+```
+
+Then follow `docs/DEVICE_TEST_qwen3vl_imgenc_sigsegv.md` §3–§4 for the two-run
+procedure (that padded `sample_image.raw` you just ran stands in for its Run 2;
+`nopad.raw` gives you its Run 1) and its §6 decision tree. Branch C — the
+padded blob fixes it — is what v3 already ships, so reaching this section means
+you are past that. **If both the padded and unpadded blobs crash, that is
+branch D:** the overrun is past the destination, not host-fixable. Capture the
+tombstone (§5 of that doc) and stop rather than continue swapping things — this
+becomes a Qualcomm escalation, not another on-device experiment.
+
+## 4. Weather / road kit
 
 Six real photographs covering the deployment's scenes — road, surroundings,
 weather (rain, fog, snow, clear, overcast, traffic). Each has its own script:
@@ -80,12 +166,19 @@ scene contents must be right; wording will not match.
 Every kit image was checked against the ViT's calibrated input range — all six
 clip by at most 1.00 LSB, so none of them is out-of-domain for the encoder.
 
-## 3. Timing — what to measure, and what we can and cannot predict
+## 5. Timing — what to measure, and what we can and cannot predict
 
 A 273-token prompt is processed as **three AR=128 prefill calls**
 (`n_process` = 128, 128, 17 — the last padded), not as 273 sequential AR=1
 decode steps. That is a structural fact of qualla's strategy loop
 (`kvmanager.cpp:409,433`), verified in source and reproduced in the parity gate.
+
+That structural fact makes the e2e run's own wall-clock a **prefill-selection
+probe**, independent of whatever number it produces: a 273-token prompt should
+be three AR=128 prefill calls, so a fast TTFT means prefill was selected as
+designed, and a ~30 s one means it silently fell back to all-decode instead.
+Which of those happens has never been observed on this device — report it
+either way, it is a finding regardless of the raw number.
 
 **We deliberately do not quote a TTFT number.** No Qwen3-VL graph has ever run
 on this device, and the only decode-step measurement we have is the 0.6B text
@@ -100,7 +193,7 @@ numbers for the fallback if you end up running it. Compare cold-start numbers
 only like-for-like — an init→first-logits vs TTFT unit mismatch once produced a
 phantom "+134% regression" in this project.
 
-## 4. If — and only if — the primary fails at load
+## 6. If — and only if — the primary fails at load
 
 Swap to the decode-only configuration. **One file, nothing else:**
 
@@ -130,7 +223,8 @@ do not keep swapping configs.
 |---|---|---|
 | **`ShapeError: attention_mask Expected [1,AR,CL] Found [1,AR,AR]` → `Failed to create the Genie Node (-1)` + SIGSEGV** | The 2026-08-14 failure. **This must not happen with this bundle** — check 9 gates exactly this, and the shipped graphs carry `[1,128,2176]` | If it happens anyway, the shipped binary is not the one that was gated. Capture the full log and the `info.json`s and stop; do not try the fallback first |
 | `Failed to create the Genie Node (-1)` with a *different* tensor named | A validateModel rule the load simulation does not model | Capture the exact `Expected/Found` line — it maps directly onto `nsp-model.cpp:844-917` and tells us which rule to add |
-| Loads, but the caption describes a different image | Image blob / encoding mismatch, or MRoPE not engaging | Confirm `.raw` is 3,145,728 bytes; check `vision-param` is present in the image-encoder config (its absence silently drops image rows to plain rope) |
+| **`SIGSEGV (SEGV_ACCERR)` at `GenieNode_setData+572` on `node set image`** | The v2 failure. **Should not happen with this bundle** — every shipped `.raw` is now padded | See §3, "If it still crashes on `node set image`" |
+| Loads, but the caption describes a different image | Image blob / encoding mismatch, or MRoPE not engaging | Confirm `.raw` is **3,149,824 bytes** (payload + 4096-byte pad) — an unpadded blob is itself a finding, not just a size check; check `vision-param` is present in the image-encoder config (its absence silently drops image rows to plain rope) |
 | Caption is fluent but generic ("a photo of a scene") | Image features not reaching the text tower | Check the ImageEncoder→TextGenerator connection line in the script and that the ViT ctx-bin loaded |
 | Repetition until `Context Size was exceeded` | Sampler config, not the model | The shipped generator is greedy with `context.size 2048`; report it and move on |
 | Fallback also fails at load | The cross-context enable-graphs risk above | Report the error text verbatim. This is the documented unknown |
