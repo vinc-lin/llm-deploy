@@ -669,6 +669,7 @@ the index of what changed.
 | 30 | Decode runs at **~88% of the 49 GB/s streaming ceiling**, so little headroom remains | MAX_TPS V4 §1 | Apples-to-oranges. The 49–67 GB/s microbenchmark ran under `qnn-net-run`, whose `--perf_profile` flag is a documented no-op, i.e. at the GVM **default** clock — the slowest of four tiers, with a 1.95× swing to `llm_decode_burst`, which is what decode actually uses. The figure is a floor on the burst-clock ceiling, not the ceiling (§1). |
 | 31 | The SDK's `examples/Genie/.../src/qualla` tree is **the source of the shipped `libGenie.so`** | implicitly, wherever that tree is cited as runtime behaviour | It is not. The device rejects unknown `QnnHtp` config keys, and **no unknown-key validation exists anywhere in that source tree**. A decode-only fallback derived from it failed on device (2026-08-15). The source remains the best available guide to runtime *contracts*, but any claim about what the binary does needs that caveat. |
 | 32 | The 2026-08-15 P1 cycle profile failed because **the shipped profiling inputs were pre-fix format** (128-dim KV vs the gqafix graph's 64-dim) | 08-15 report §5 and §0.3; this file §6.8 and `PLAN_0.6B_max_tps.md` A5 until 2026-08-16 | **The inputs are correct.** All 60 files match the gqafix decode graph byte-for-byte (`past_key_0_in [1,8,128,1151]` = 2,357,248 B, file 2,357,248 B; `attention_mask [1,1,1152]` = 2,304 B, file 2,304 B). 128 is `head_dim`, 64 is `rope_dim` — both correct — and gqafix vs pre-fix `ladekv` decode I/O is byte-identical, since `--grouped-gqa` changes attention internals and not the KV contract. Regenerating them is wasted work; the real cause of the P1 failure is **still unknown**, most likely `graph_names` narrowing. |
+| 33 | A ctx-bin with **`constSize > 0` on any graph did not share weights** | this file §8.2 and `CLAUDE.md`, first draft of 2026-08-16 (commit `d8fe487`), corrected same day | Too strong, and it would have produced a gate that rejects good bins. `constSize` is genuinely the *non-shared* region (SDK-confirmed: `QnnHtpSystemContext_GraphBlobInfoV2_t`, whose memory map labels it "Non-Shared (Const)"), but a non-zero value has documented legitimate causes — `--quant-head` moves ~144 MB into a private decode block by design (§8.1), and a bertcache graph forces a private 444 MB copy with sharing still enabled (§6.10). `gqafix-qh-ladekv` is a healthy shipping bin with 144,408,832 B of private const. The real invariant is the **pooled fraction** (100% / 95% healthy vs 29% / 62% broken), not a hard zero. |
 
 ---
 
@@ -877,28 +878,53 @@ effective**.
 withdrawn.** `graphBlobInfoV2` in the ctx-bin's own `info.json` reports it
 directly. Measured, from `qnn-context-binary-utility --json_file`:
 
-| bin | graphs | `sharedWeightsSize` (per graph) | `constSize` (per graph) | blob |
-|---|---:|---:|---:|---:|
-| `gqafix-ladekv` (healthy) | 3 | 1,067,499,520 | **0 / 256 / 0** | 1.087 GB |
-| `w8a16qh` | 2 | 311,791,616 | **755,250,944 each** | 1.838 GB |
-| `w8a16qh-lade` | 3 | 756,338,688 | 755,250,176 / 310,706,432 / 311,166,976 | 2.160 GB |
-| `gqafix-qh-ladekv` | 3 | 912,904,192 | 0 / **144,408,832** / 0 | 1.078 GB |
+**Field semantics are SDK-confirmed**, not inferred: `QnnHtpSystemContext.h`
+(`QnnHtpSystemContext_GraphBlobInfoV2_t`) defines `constSize` as "size of const
+data in the graph" and `sharedWeightsSize` as "shared weights size", and the
+memory map in the comment above the struct labels the two regions
+**`Shared (name)`** and **`Non-Shared (Const)`**. Note `sharedWeightsSize`
+describes the context's single pool and is printed **identically on every
+graph** — summing it across graphs is meaningless. The V1 struct
+(`graphBlobInfo`) carries neither field, which is why it reads back as `None`.
 
-A healthy 3-graph bin puts essentially everything in one shared pool and carries
-**`constSize == 0`**. The qh intermediates instead give every graph its own
-~755 MB private const block: 2 × 755 MB + 311 MB shared ≈ the observed 1.84 GB,
-and the lade variant's 1.377 GB of private const ≈ its 2.16 GB. So the
-hypothesis was right, but the **diagnostic is `constSize`, not file size** — it
-names the failing graph, whereas size only says something is wrong somewhere.
+| bin | graphs | pool (once) | private `constSize` (total) | `opData` | blob | **pooled** |
+|---|---:|---:|---:|---:|---:|---:|
+| `gqafix-ladekv` (healthy) | 3 | 1,067,499,520 | **256** | 34,651,392 | 1,086,521,344 | **100%** |
+| `w8a16qh` | 2 | 311,791,616 | 1,510,501,376 | 28,960,000 | 1,837,723,648 | **29%** |
+| `w8a16qh-lade` | 3 | 756,338,688 | 1,377,123,584 | 52,169,216 | 2,160,381,952 | 62% |
+| `gqafix-qh-ladekv` | 3 | 912,904,192 | 144,408,832 | 37,509,120 | 1,078,136,832 | 95% |
+
+pool + private + opData accounts for the blob to within 1.5% in all four, so
+these three fields *are* the binary.
+
+**The clincher.** In `w8a16qh`, one graph's footprint is 311,791,616 shared +
+755,250,944 private = **1,067,042,560** — the healthy bin's entire pool
+(1,067,499,520) to within 0.04%. Identical weight set, identical total; the only
+difference is *where it was put*. The healthy bin pools all of it once; `w8a16qh`
+pools 29% and duplicates the rest into each graph, which is what turns 1.09 GB
+into 1.84 GB. So the hypothesis holds, and the **diagnostic is the pooled
+fraction, not file size** — size says something is wrong somewhere, the pool
+says what.
+
+⚠ **`constSize > 0` is NOT automatically a fault**, and an earlier draft of this
+section said otherwise. Two legitimate causes are already documented here:
+`--quant-head` moves ~144 MB into a private decode block **by design** (§8.1),
+and a bertcache graph forces a private 444 MB copy without sharing being
+disabled (§6.10). Row 4 is a healthy, shipping, priority-1 device arm *with*
+144,408,832 B of private const.
 
 Two consequences:
-1. **This is a cheap build gate.** `ctxbin_variant.sh` already reads back
-   `numHvxThreads`/`vtcmSize`/`optimizationLevel` from `info.json`; asserting
-   `constSize == 0` on every graph that should share would catch a silently
-   unshared build at build time, for free. Not yet implemented.
-2. The last row is the **independent confirmation of §8.1**: `gqafix-qh-ladekv`
-   shows exactly the 144,408,832 B of private decode const that §8.1 derived
-   from the other direction, reached here by a different route.
+1. **This is a cheap build gate, if written correctly.** `ctxbin_variant.sh`
+   already reads back `numHvxThreads`/`vtcmSize`/`optimizationLevel` from
+   `info.json`. The assertion to add is **pooled fraction ≥ expected**, with the
+   §8.1/§6.10 exceptions named per build — *not* `constSize == 0`, which would
+   reject every `--quant-head` and every bertcache bin we ship. Not yet
+   implemented.
+2. Row 4 is the **independent confirmation of §8.1**: the pool drops
+   1,067,499,520 → 912,904,192 = **154,595,328** (the halved lm_head, 99.4% of
+   the 155,582,464 ideal) while decode gains 144,408,832 private — net bin change
+   only −8,384,512. That is the "DLC shrinks 151 MB, ctx-bin barely moves"
+   puzzle, closed from a second direction.
 
 The two specimen bins were deleted after this measurement (they were the last
 4.0 GB of a retired pre-fix family); their `info.json` files are retained at
