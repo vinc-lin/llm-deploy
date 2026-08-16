@@ -1,7 +1,15 @@
 # 2026-08-16 — the regime drop
 
-Everything from this drop lives in this folder. **Start at
-[`kit-v2/README.md`](kit-v2/README.md), then `kit-v2/runsheet.md`.**
+Everything from this drop lives in this folder.
+
+> ## 👉 Start at [`DEPLOYMENT_AND_TEST_GUIDE.md`](DEPLOYMENT_AND_TEST_GUIDE.md)
+>
+> That one document is self-contained: deployment, the full test procedure, the
+> exact metrics to record and report, what every outcome means, and the gotcha
+> table. `kit-v2/` is the scripted form of the same procedure — the guide is the
+> authority if they ever disagree.
+>
+> This README is just the drop's inventory and rationale.
 
 ## What this drop is for
 
