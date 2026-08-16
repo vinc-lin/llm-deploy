@@ -192,10 +192,13 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
   DLCs + graph names + config + SDK in ~5 s cold, 0.3 ms warm, and refuses if
   `state/artifacts.tsv` already has that recipe or another session on this host
   is deriving it right now. Already wired into `ctxbin_variant.sh` and
-  `ladekv_build.sh`. `coord.py scan` lists byte-identical groups — it found
-  `ctrl` == baseline (1.09 GB) and `splitkv-flat` == `splitkv` (4.3 GB) on its
-  first run. `coord.py who` before starting work: another branch may be on it.
-  Full convention in `docs/NOTES-coordination.md`.
+  `ladekv_build.sh`. `coord.py scan` lists byte-identical groups **and separates
+  real duplicates from hard links by inode** — equal md5 is not two copies, and
+  `splitkv-flat` was hardlinked to `splitkv`, so 4.51 GB of apparent waste was
+  worth 0 B. Only `ctrl` == baseline was real (1.09 GB, deleted 2026-08-17).
+  Quote `actually reclaimable`, never the group sizes. `coord.py who` before
+  starting work: another branch may be on it. Full convention in
+  `docs/NOTES-coordination.md`.
 - **`.gitignore` and `git status` are not evidence about what is public.** Photo
   drops sat in the public mirror's *history* for five days while the working
   tree looked clean (removed 2026-08-16 by delete-and-recreate). Verify with a

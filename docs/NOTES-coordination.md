@@ -186,20 +186,42 @@ opens first cannot carry a correction by itself.
 ## 7. What this found on its first runs
 
 Backfilling 32 artifacts across both hosts surfaced three byte-identical groups
-that had never been noticed. All three are duplicated **within one host**, which
-is the waste case:
+that had never been noticed. **Only one of them was real:**
 
-| md5 | copies on one host | size each |
-|---|---|---:|
-| `9c6024ad…` | `gqafix-ctrl-ladekv` == `gqafix-ladekv` | 1.09 GB |
-| `235e71af…` | `splitkv-flat/…_1_of_2` == `splitkv/1_of_2` | 1.86 GB |
-| `fd552818…` | `splitkv-flat/…_2_of_2` == `splitkv/2_of_2` | 2.65 GB |
+| md5 | names on the WSL box | size each | reclaimable |
+|---|---|---:|---:|
+| `9c6024ad…` | `gqafix-ctrl-ladekv` == `gqafix-ladekv` | 1.09 GB | **1.09 GB** |
+| `235e71af…` | `splitkv-flat/…_1_of_2` == `splitkv/1_of_2` | 1.86 GB | 0 — hard link |
+| `fd552818…` | `splitkv-flat/…_2_of_2` == `splitkv/2_of_2` | 2.65 GB | 0 — hard link |
 
-**5.60 GB**, all on the WSL box — and 4.51 GB of it is the 4B tower, whose
-export needs tank's 125 GB and cannot be rebuilt here at all. `tank` also holds
-that tower, which is correct; tank is its canonical home.
+### Equal md5 is not two copies
 
-Nothing is deleted here — reclaiming is a separate, explicit decision.
+The first version of this report claimed 5.60 GB. It was worth **1.09 GB**. The
+`splitkv-flat` bins share inodes 109473 / 169230 with `splitkv/{1,2}_of_2` —
+one object under two names — so deleting a name returns nothing.
+
+An md5 index answers "same bytes", which is the right question for *don't ship
+these as two arms* but the wrong one for *reclaim space*. Those need different
+tests, and conflating them produces a report that promises 5× what it can
+deliver. `scan` now stats each local row and groups by `(st_dev, st_ino)`,
+prints hard links in a separate section that says deleting frees nothing, and
+ends with a single `actually reclaimable` figure. **Quote that line, never the
+group sizes.** Inode identity is only decidable for present files on this host;
+anything else is reported as unknown rather than guessed.
+
+**Resolved 2026-08-17.** `gqafix-ctrl-ladekv` deleted (1.09 GB; its bytes
+survive in `gqafix-ladekv`, and the bundle tarball is on disk and on the hub —
+it is now registered `bundled` against that tarball, so the alias warning still
+fires if anyone tries to rebuild it). The `splitkv-flat` names were removed too
+as namespace hygiene — `splitkv/` is the canonical layout, matches tank, and
+carries the per-shard `info.json` and configs that flat lacked — but that freed
+0 bytes and was never the point. Verified after: both `splitkv` bins retain
+inodes 109473 / 169230 at full size with link count 1, and `gqafix-ladekv` still
+hashes `9c6024ad…`.
+
+`scan` also prunes: a row for a file that is gone would answer "already built"
+for something absent, sending a session hunting for a bin instead of building
+it — a worse failure than the duplicate build this file exists to prevent.
 
 ### Two bugs the cross-host run exposed, worth keeping in mind
 

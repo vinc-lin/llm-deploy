@@ -438,6 +438,20 @@ def cmd_scan(a):
             units.append((stem(d), None, d))
 
     host = socket.gethostname()
+
+    # Reconcile: scan re-derives this host's rows from disk, so a row for a file
+    # that is gone is stale and must go. Left in, it would answer "already built"
+    # for something that is not there -- a false negative that sends a session
+    # looking for a bin instead of building it, which is worse than the duplicate
+    # build this file exists to prevent. Never prune another host's rows; their
+    # absence here is not evidence.
+    gone = [r for r in rows
+            if r["host"] == host and r["state"] == "present"
+            and not Path(r["location"]).exists()]
+    for r in gone:
+        print(f"  PRUNED (file no longer on disk): {r['name']}")
+    rows = [r for r in rows if r not in gone]
+
     seen = 0
     for name, b, d in units:
         recipe = f"legacy:{host}:{name}"
@@ -470,30 +484,72 @@ def cmd_scan(a):
     for r in rows:
         if r["md5"]:
             by_md5.setdefault(r["md5"], []).append((r["host"], r["name"], r["bytes"]))
-    # Classify on "does any ONE host hold this twice", not "is more than one host
-    # involved". A group can be both: the 4B splitkv tower is stored twice on
-    # this box AND once on tank, and testing set-size alone filed the whole
-    # group as expected-cross-host, hiding 4.51 GB of local waste inside a line
-    # that says everything is fine.
-    same, cross = [], []
-    for m, entries in sorted(by_md5.items()):
-        if len(entries) < 2:
-            continue
-        hosts = [h for h, _, _ in entries]
-        (same if len(hosts) != len(set(hosts)) else cross).append((m, entries))
+    # Equal md5 does NOT mean two copies. A hard link is one inode under two
+    # names, and reporting it as reclaimable promises space that deleting cannot
+    # return: work/ctxbin/qwen3vl-4b-w8a16-splitkv-flat is hardlinked to
+    # splitkv/{1,2}_of_2, so the 4.51 GB this report first claimed was worth 0 B.
+    # A report that overstates what it can recover is worse than no report, so
+    # stat the files and let the inode decide. Only decidable for rows on this
+    # host whose file is still present; anything else is reported as unknown
+    # rather than guessed.
+    return _report_duplicates(rows)
 
-    def show(title, groups):
+
+def _identity(row):
+    """(dev, ino) for a local, present file -- else None (undecidable)."""
+    if row["host"] != socket.gethostname() or row["state"] != "present":
+        return None
+    try:
+        st = Path(row["location"]).stat()
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+
+def _report_duplicates(rows):
+    by_md5 = {}
+    for r in rows:
+        if r["md5"]:
+            by_md5.setdefault(r["md5"], []).append(r)
+
+    dup, link, cross = [], [], []
+    for m, group in sorted(by_md5.items()):
+        if len(group) < 2:
+            continue
+        here = [r for r in group if r["host"] == socket.gethostname()]
+        ids = {}
+        for r in here:
+            ids.setdefault(_identity(r), []).append(r)
+        # distinct inodes on one host = real copies; one inode, many rows = links
+        real = [v for k, v in ids.items() if k is not None]
+        if len(real) > 1:
+            dup.append((m, group, sum(int(v[0]["bytes"] or 0) for v in real[1:])))
+        elif any(len(v) > 1 for v in real):
+            link.append((m, group, 0))
+        elif len({r["host"] for r in group}) > 1:
+            cross.append((m, group, 0))
+
+    def show(title, groups, note=""):
         if not groups:
             return
         print(f"\n== {title} ==")
-        for m, entries in groups:
-            gb = int(entries[0][2] or 0) / 1e9
-            print(f"  {m}  ({gb:.2f} GB each)")
-            for h, n, _ in sorted(entries):
-                print(f"    {h}:{n}")
+        if note:
+            print(f"   {note}")
+        for m, group, gain in groups:
+            each = int(group[0]["bytes"] or 0) / 1e9
+            tail = f"  -> {gain/1e9:.2f} GB reclaimable" if gain else ""
+            print(f"  {m}  ({each:.2f} GB each){tail}")
+            for r in sorted(group, key=lambda r: (r["host"], r["name"])):
+                ident = _identity(r)
+                tag = f"  inode {ident[1]}" if ident else ""
+                print(f"    {r['host']}:{r['name']}{tag}")
 
-    show("byte-identical ON ONE HOST -- each group is ONE binary stored twice", same)
-    show("same bytes on BOTH hosts -- expected for tank-canonical lineages", cross)
+    show("REAL duplicates on one host -- distinct inodes, deleting one frees space", dup)
+    show("hard links -- one inode, several names", link,
+         "deleting a name here frees NOTHING; the data survives via the other link")
+    show("same bytes on both hosts -- expected for tank-canonical lineages", cross)
+    total = sum(g for _, _, g in dup)
+    print(f"\nactually reclaimable on {socket.gethostname()}: {total/1e9:.2f} GB")
     return 0
 
 
