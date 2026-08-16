@@ -395,10 +395,19 @@ def cmd_scan(a):
     """Backfill the registry from what is on disk.
 
     Pre-convention artifacts have no recoverable recipe -- the DLC set that
-    produced them was never recorded -- so they enter as recipe 'legacy:<name>'.
-    That is deliberately not a real key: it will never match a future lookup, so
-    it cannot cause a false 'already built'. What it DOES give immediately is
-    the md5 index, which is what surfaces aliases like ctrl == baseline.
+    produced them was never recorded -- so they enter as recipe
+    'legacy:<host>:<name>'. That is deliberately not a real key: it will never
+    match a future lookup, so it cannot cause a false 'already built'. What it
+    DOES give immediately is the md5 index, which is what surfaces aliases like
+    ctrl == baseline.
+
+    The host belongs in a LEGACY key and must NOT go in a real one. A legacy key
+    is a name-shaped placeholder, and the same name on two hosts is no evidence
+    of the same bytes -- unscoped, tank's scan skipped its own copies of
+    qwen3vl-4b-w8a16-splitkv as "already known" from this box's scan, hiding
+    exactly the cross-host divergence worth knowing about. A real recipe key is
+    derived from content and must stay host-agnostic, so that a build on tank
+    does spare this box from repeating it.
     """
     rows = load_registry()
     known = {(r["recipe"], r["name"]) for r in rows}
@@ -428,9 +437,10 @@ def cmd_scan(a):
         elif any(d.glob("*.json")):
             units.append((stem(d), None, d))
 
+    host = socket.gethostname()
     seen = 0
     for name, b, d in units:
-        recipe = f"legacy:{name}"
+        recipe = f"legacy:{host}:{name}"
         if (recipe, name) in known and not a.rehash:
             continue
         if b is not None:
@@ -451,15 +461,33 @@ def cmd_scan(a):
     save_registry(rows)
     print(f"\nscanned {seen} artifact dirs into {REGISTRY.relative_to(REPO)}")
 
+    # Same-host and cross-host duplicates are NOT the same finding. Two copies on
+    # one host are waste. A copy on each host is often correct -- tank is the
+    # canonical home for the 4B lineage precisely because that export does not
+    # fit here -- so reporting them identically would train people to ignore the
+    # report, which costs more than the duplicates do.
     by_md5 = {}
     for r in rows:
         if r["md5"]:
-            by_md5.setdefault(r["md5"], []).append(r["name"])
-    aliases = {m: n for m, n in by_md5.items() if len(n) > 1}
-    if aliases:
-        print("\n== byte-identical groups (each is ONE binary, not several) ==")
-        for m, names in sorted(aliases.items()):
-            print(f"  {m}  {'  ==  '.join(sorted(names))}")
+            by_md5.setdefault(r["md5"], []).append((r["host"], r["name"], r["bytes"]))
+    same, cross = [], []
+    for m, entries in sorted(by_md5.items()):
+        if len(entries) < 2:
+            continue
+        (same if len({h for h, _, _ in entries}) == 1 else cross).append((m, entries))
+
+    def show(title, groups):
+        if not groups:
+            return
+        print(f"\n== {title} ==")
+        for m, entries in groups:
+            gb = int(entries[0][2] or 0) / 1e9
+            print(f"  {m}  ({gb:.2f} GB each)")
+            for h, n, _ in sorted(entries):
+                print(f"    {h}:{n}")
+
+    show("byte-identical ON ONE HOST -- each group is ONE binary stored twice", same)
+    show("same bytes on BOTH hosts -- expected for tank-canonical lineages", cross)
     return 0
 
 
