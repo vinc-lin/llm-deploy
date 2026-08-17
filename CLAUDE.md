@@ -182,9 +182,23 @@ v2 shipped exactly that: 36 replication ops per shard at a 4:1 head ratio.
 
 ## Gotchas — environment & infrastructure
 
-- HF: proxy `http://127.0.0.1:17890` required, but it drops long upload streams —
-  use `scripts/util/hf_upload_watchdog.sh` (set `SOCKET_CHECKS=999999`; the
-  socket detector false-positives through the proxy).
+- HF: proxy `http://127.0.0.1:17890` required (export `https_proxy`/`http_proxy`
+  yourself — neither `env.sh` nor the watchdog sets them), but it drops long
+  upload streams — use `scripts/util/hf_upload_watchdog.sh`.
+  ⚠ **`SOCKET_CHECKS=999999` disables the only detector that catches the common
+  stall.** Measured 2026-08-17 on the VL v3 upload: all sockets CLOSE-WAIT,
+  `/proc/PID/io` flat for minutes, `Files:` frozen at `8/26` — yet the *log kept
+  growing* because interleaved per-file progress bars redraw forever, so the
+  progress-freeze detector never fires either and the watchdog waits
+  indefinitely. All-CLOSE-WAIT **plus zero IO** is a true stall, not the
+  false positive the old note assumed. Use a finite `SOCKET_CHECKS` (9 ≈ 3 min)
+  and confirm with `/proc/PID/io` before killing; `hf upload-large-folder`
+  is resumable, so a restart re-uses cached hashing and already-uploaded files
+  (`pre-uploaded: 8/26` carried over) and picks up files added since.
+- **Nothing is visible in the repo until the commit phase.** `upload-large-folder`
+  pre-uploads every blob first and commits at the end, so `list_repo_files`
+  returning 0 mid-run is normal, not a failure. A *hung* commit phase with all
+  blobs uploaded is the 429 case below.
 - Hub limit: 128 repo commits/hour. "Hung" commit phase with all blobs
   pre-uploaded = 429; diagnose with one foreground `HfApi().upload_file`,
   recover with spaced single-file commits after ~1h.
