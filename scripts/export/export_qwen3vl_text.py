@@ -247,6 +247,10 @@ def main():
                          "(3.5 GiB per-graph serialization limit).")
     ap.add_argument("--parity-check", action="store_true",
                     help="compare wrapper logits vs HF forward before export")
+    ap.add_argument("--grouped-gqa", action="store_true",
+                    help="batch the attention MatMuls over the 8 KV heads "
+                         "instead of replicating them to 32 (4x). MANDATORY "
+                         "for any shipping VL build; lint_gqa_ops.py gates it.")
     args = ap.parse_args()
 
     from transformers import Qwen3VLForConditionalGeneration
@@ -309,7 +313,8 @@ def main():
         model = ExportQwen3.from_hf_vl_text(
             hf, use_past=True, logits_last_only=False,
             n_deepstack=args.n_deepstack if s == 0 else 0,
-            layer_range=(s, e) if split else None)
+            layer_range=(s, e) if split else None,
+            grouped_gqa=args.grouped_gqa)
         if args.parity_check:
             parity_check(model, hf, cfg, args.n_deepstack)
         for c, rng, nd, tag, seq, past in todo:

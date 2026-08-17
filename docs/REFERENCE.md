@@ -1,6 +1,6 @@
 # SA8797P LLM Deployment — Consolidated Reference
 
-*Current truth as of **2026-08-16**. Supersedes conflicting statements anywhere
+*Current truth as of **2026-08-17**. Supersedes conflicting statements anywhere
 else in this repo. Every number here is either device-measured, tool-measured on
 this machine, or cited to SDK source — claims that could not be verified are
 marked as such rather than repeated. 2026-08-13: reconciled against the device
@@ -9,7 +9,9 @@ team's measured-only characterization,
 ("the HTP doc" below) — corrections #14–18 and open questions §8.8–8.10 came
 out of that reconciliation. **2026-08-16: the GQA-fix device result (44.707
 tok/s) inverted this document's central performance claim — see §1 and
-corrections #27–#32.***
+corrections #27–#32.** **2026-08-17: the Qwen3-VL-4B text tower shipped through
+v2 without grouped attention — same defect class, fixed device-free in v3, not
+yet device-run — see §0 and correction #34.***
 
 **Read this first.** Then `docs/BUILD_GUIDE.md` for step-by-step recipes and
 `docs/NOTES-genie-io.md` for the line-cited Genie contract.
@@ -30,6 +32,7 @@ corrections #27–#32.***
 | Device access | none from either build host — build + numerics only; device runs are done by a remote tester |
 | Build hosts | **two**: this WSL box (GPU, and the only one that can reach Hugging Face) and `tank` (44 cores / 125 GB RAM / no GPU / no HF). Tank builds, local publishes — `LOCAL_ENV.md` §Machines |
 | Blocked on hardware | tok/s, VTCM behavior, perf profiles, anything GVM. **Not** DDR bytes — those are build-time measurable (§6.9) |
+| Qwen3-VL-4B, v3 (multimodal) | Text tower rebuilt with grouped attention (`--grouped-gqa` now reaches `from_hf_vl_text`) and image blobs padded to 3,149,824 B. All device-free gates pass — `lint_gqa_ops.py --layers 18` 0/4 failing, full 6-chain `parity_e2e_vl.py` (device path `chain0b-prefillkv` 20/20), Genie load-sim PASS. **Awaiting its first device run** — `reports/qwen3vl-v3-gate-results.md` (correction #34) |
 
 **What moves the needle next (revised 2026-08-16).** The GQA replication fix
 shipped and measured 6.54× (6.84 → 44.707 tok/s), so the picture has changed
@@ -382,15 +385,19 @@ shipping anything.
 | Ctx-bin | `qnn-context-binary-utility --json_file` | all graphs listed, logits dims per §3.1, ~1.09 GB for 0.6B |
 | **ViT fixed-point I/O** | `vit_build_quant.sh` step 3 (fails the build itself) | `pixel_values` + all 4 outputs `QNN_DATATYPE_UFIXED_POINT_16`, scale/offset byte-equal to `model.encodings`, one graph named `vit`, O=3 / vtcm 16 / 4 HVX read back out of the binary |
 | **ViT quant numerics** | `parity_vit_quant.py` | min cos ≥ 0.99 on all four outputs (measured 0.9975 / 0.9998 / 0.9986 / 0.9977) |
-| **Qwen3-VL e2e** (image → ViT → splice → text tower) | `parity_e2e_vl.py` (no `--chains` filter, or the mutation checks are skipped) | chain0/chain1 token-identical vs `hf.generate` (measured **20/20**); chain2 ≥ 75% step agreement |
+| **Qwen3-VL e2e** (image → ViT → splice → text tower), 6 chains | `parity_e2e_vl.py` (no `--chains` filter, or the mutation checks are skipped) | `chain0-alldecode` / `chain0b-prefillkv` (**device path**) / `chain1-hf-vit` token-identical vs `hf.generate`; `chain2-onnx-vit` ≥ 75% step agreement — all measured **20/20** (v3, `reports/qwen3vl-v3-gate-results.md`). `tierA-zero-deep` / `tierB-prefillkv-zero-deep` (the zeroed-deepstack path that actually ships) are **not gated by design**, 0/20 expected — semantic bar, not token-exact, applies on device (note below) |
+| **VL text-tower GQA lint** | `lint_gqa_ops.py --layers 18` on all four text DLCs (`prefill_0/1`, `decode_0/1`) | **0** replication ops, attention MatMul batch dim 8 — measured v3, `4 DLC(s) checked, 0 failing`. ⚠️ default `--layers` is 28 (the 0.6B tower); the pass criterion includes `len(matmuls) == 2 * layers`, so the default **false-FAILs** a correct 18-layer shard |
 
 ⚠ **The 20/20 is a real-deepstack number and the shipped bundle does not
-reproduce it.** All three gated chains feed *real* deepstack; the configuration
-that actually ships — `tierA-zero-deep` — is **not gated**
-(`parity_e2e_vl.py:16-35`), because a stock Genie pipeline has no deepstack path
-and `initializeUnconnectedInputs` zeroes those three inputs
-(`NOTES-genie-pipeline.md` §A). Zeroing costs phrasing, not image understanding:
-HF's exact sentence vs the Tier-A sentence are both correct descriptions
+reproduce it.** All four gated chains feed *real* deepstack; the configuration
+that actually ships — `tierB-prefillkv-zero-deep`, chain0b's chunk plan (three
+AR=128 prefill calls, `n_process` 128/128/17) with deepstack zeroed — is **not
+gated** (`parity_e2e_vl.py:16-35`), because a stock Genie pipeline has no
+deepstack path and `initializeUnconnectedInputs` zeroes those three inputs
+(`NOTES-genie-pipeline.md` §A). `tierA-zero-deep` reaches a similar end state
+through the *bertcache* path and is kept only as a historical reference — see
+correction #21. Zeroing costs phrasing, not image understanding: HF's exact
+sentence vs the Tier-B sentence are both correct descriptions
 (`DEVICE_TEST_qwen3vl_e2e.md`). So on device the bar is **semantic, not
 token-exact** — do not quote 20/20 as the expected device behaviour, and do not
 read a wording difference on device as a regression.
@@ -657,7 +664,7 @@ the index of what changed.
 | 18 | Unfused W8A16 at vtcm 16 spills **1.49 GB** at build time | HTP doc §4.2 ("older optctx2" row) | *Probable, not proven:* the graph-names-mismatch artifact — an unlisted graph gets 4 MB VTCM, and that exact failure measured 1.446 GB of spill here (`docs/NOTES-vit-htp-config.md`). Every correctly-configured vtcm-16 build, theirs and ours, spills ~0. |
 | 19 | An oversized ctx-bin means **weight sharing is disabled** (check `weight_sharing_enabled`) | this file §8.2; MAX_TPS §2 A.4 as originally written | Incomplete. Weight sharing can be **on and working** and the bin still inflate, because dedup needs the graphs' exported **weights to be byte-identical**, and a *calibrated* export is not byte-identical to an `--export-decode` export of the same model — see §6.7. Check which export path each graph came from before touching the config. |
 | 20 | An AR==CL prefill graph is **harmless dead weight — silently skipped, correctness unaffected** | `NOTES-genie-pipeline.md` probe C; §2.2/§3.3 as read until 2026-08-14 | True **unsplit** only. In a split tower shard 0's prefill has no logits, classifies `DECODER_PREFILL`, and its expected CL is rewritten to the cache-group max — the graph then **fails validation and the node never loads** (§3.6). Probe C also mis-stated that our prefill classifies `DEFAULT`: that holds for `prefill_1`, not `prefill_0`. |
-| 21 | The Qwen3-VL e2e gate's **20/20 token-identical** describes what the shipped bundle does | 2026-08-14 status report §3–§4 | The three gated chains run *real* deepstack; the configuration that ships (`tierA-zero-deep`) is explicitly **not gated**. On device the bar is semantic, not token-exact (§5). The report's own "HF exactness drops 0→20/20" is the same point, written backwards. |
+| 21 | (revised 2026-08-17) The Qwen3-VL e2e gate's **20/20 token-identical** describes what the shipped bundle does | 2026-08-14 status report §3–§4; this file's own correction of it, until 2026-08-17 | The gated chains run *real* deepstack; the configuration that ships is explicitly **not gated** — that part stands. But this entry originally named the shipped configuration `tierA-zero-deep` (bertcache path), which is also wrong: the tower has never shipped a bertcache prefill (§3.6 makes one fatal in a split tower). The actual shipped path is `chain0b-prefillkv`'s chunk plan — three AR=128 prefill calls, `n_process` 128/128/17 — with deepstack zeroed, i.e. **`tierB-prefillkv-zero-deep`**. `tierA-zero-deep` is kept only as a historical reference to the bertcache path. On device the bar remains semantic, not token-exact (§5). |
 | **22** | **11.72 tok/s is the best sustained AR-1 decode rate** | this file §0 (twice) and §6.1; `MAX_TPS_V2` §0; 08-13 report Test 1/Test 3 | **It is a phase blend**, not a decode rate: ~72 bertcache steps at ~40 ms plus ~56 AR-1 steps at ~142 ms (§6.9). The honest pre-fix AR-1 rate is **6.84 tok/s**, measured 2026-08-15. §6.1's own rule — "any tok/s number for topology A is meaningless without saying which phase" — is what this violated. Gated now by `lint_bundle_topology.py`. |
 | **23** | **LADE is −22% vs basic on the technical prompt** | 08-13 report Test 1 + §6.2; this file §0 | Compares LADE on `ladekv` against **blended** basic on `local`. Like-for-like on one bin and one prompt, **pre-fix LADE was 9.18 vs 6.84 = +34%**. LADE's loss is real but is a *post-fix* phenomenon (44.707 vs 31.342), first measurable 2026-08-15, and its cause is the break-even shift in §6.8 — not prompt-dependence. |
 | **24** | **A ~75% build gap / 3-graph penalty exists between `local` and `ladekv`** | 08-13 report §6.3 + rec 2; `MAX_TPS_V2` §2.2; `MAX_TPS_V3` §7 item 4 ("64 ms unexplained term") | Same artifact as #22. The two decode graphs are structurally identical (CL=1152, spill 0, same vtcm/O/hvx) and share weights within 4 MB. **No graph-count or graph-switching penalty is in evidence, and the 64 ms term does not exist.** |
@@ -670,6 +677,7 @@ the index of what changed.
 | 31 | The SDK's `examples/Genie/.../src/qualla` tree is **the source of the shipped `libGenie.so`** | implicitly, wherever that tree is cited as runtime behaviour | It is not. The device rejects unknown `QnnHtp` config keys, and **no unknown-key validation exists anywhere in that source tree**. A decode-only fallback derived from it failed on device (2026-08-15). The source remains the best available guide to runtime *contracts*, but any claim about what the binary does needs that caveat. |
 | 32 | The 2026-08-15 P1 cycle profile failed because **the shipped profiling inputs were pre-fix format** (128-dim KV vs the gqafix graph's 64-dim) | 08-15 report §5 and §0.3; this file §6.8 and `PLAN_0.6B_max_tps.md` A5 until 2026-08-16 | **The inputs are correct.** All 60 files match the gqafix decode graph byte-for-byte (`past_key_0_in [1,8,128,1151]` = 2,357,248 B, file 2,357,248 B; `attention_mask [1,1,1152]` = 2,304 B, file 2,304 B). 128 is `head_dim`, 64 is `rope_dim` — both correct — and gqafix vs pre-fix `ladekv` decode I/O is byte-identical, since `--grouped-gqa` changes attention internals and not the KV contract. Regenerating them is wasted work; the real cause of the P1 failure is **still unknown**, most likely `graph_names` narrowing. |
 | 33 | A ctx-bin with **`constSize > 0` on any graph did not share weights** | this file §8.2 and `CLAUDE.md`, first draft of 2026-08-16 (commit `d8fe487`), corrected same day | Too strong, and it would have produced a gate that rejects good bins. `constSize` is genuinely the *non-shared* region (SDK-confirmed: `QnnHtpSystemContext_GraphBlobInfoV2_t`, whose memory map labels it "Non-Shared (Const)"), but a non-zero value has documented legitimate causes — `--quant-head` moves ~144 MB into a private decode block by design (§8.1), and a bertcache graph forces a private 444 MB copy with sharing still enabled (§6.10). `gqafix-qh-ladekv` is a healthy shipping bin with 144,408,832 B of private const. The real invariant is the **pooled fraction** (100% / 95% healthy vs 29% / 62% broken), not a hard zero. |
+| 34 | The shipped Qwen3-VL-4B text tower runs grouped-query attention, or at least attention comparable in cost to the 0.6B post-fix tower | implicitly, wherever VL-4B was assumed to inherit the 0.6B GQA fix, and every VL performance/DDR expectation formed before 2026-08-17 | v2's text tower replicated its 8 KV heads up to 32 query heads — **36 `Expand` ops per shard at a 4:1 ratio**, which the QNN converter lowers into broadcast MULTIPLY ops whose large output the attention MatMul re-reads every step. Structural, not a missed flag: `quantize_aimet.py` had `--grouped-gqa` and forwarded it on the non-VL branch, but `ExportQwen3.from_hf_vl_text` had no such parameter, so the VL chain **could not produce grouped attention at all**. Fixed in `900db5a`; `lint_gqa_ops.py` now runs automatically inside `vl_text_ctxbin_split.sh` (`0db9643`) and reports **0** replication ops on all four v3 DLCs, attention MatMul batch dim **8** (was 32), decode MatMul shape `1x32x1x2176` → `1x8x4x2176`. Every VL performance expectation formed before this fix was formed on a tower doing 4× the attention work it needed to — the same defect class that gave the 0.6B fix 6.54× (§0, corrections #22–#27). See `reports/qwen3vl-v3-gate-results.md`. |
 
 ---
 
@@ -1234,7 +1242,8 @@ cross-variant `load_encodings`).
 | **`docs/DEVICE_MEASUREMENT_REPORT_2026-08-15.md`** | **current device truth** | the GQA-fix result: **44.707 tok/s basic**, LADE a regression, hybrid degenerate. The headline numbers this project runs on |
 | `docs/DEVICE_MEASUREMENT_REPORT_2026-08-13.md` | current device truth | the 5-test run that found the 74.7% `Expand` cycles — the measurement that led to the fix. Two later-misread points flagged in its §0.4 |
 | `docs/DROP_README_2026-08-14-gqafix.md` | current | the GQA replication fix (`--grouped-gqa`) and the bundles it produced |
-| `reports/qwen3vl-4b-e2e-deployment-status-2026-08-14.md` | current device truth | the Qwen3-VL e2e attempt — **failed at load**, see §3.6 |
+| `reports/qwen3vl-4b-e2e-deployment-status-2026-08-14.md` | current device truth | the 2026-08-14 Qwen3-VL e2e attempt — **failed at load** (split-prefill `ShapeError`, §3.6). Superseded at load by v2 (2026-08-15), which loaded and generated text, then crashed later at `node set image` (`docs/DEVICE_TEST_qwen3vl_imgenc_sigsegv.md`) |
+| `reports/qwen3vl-v3-gate-results.md` | current, device-free | the v3 record: grouped-attention text tower (correction #34) + padded image blobs, all device-free gates passing — **awaiting its first device run** |
 | `docs/NOTES-genie-io.md` | current, SDK-cited | the Genie/qualla contract — read before touching graph I/O |
 | `docs/NOTES-vit-htp-config.md` | current | why graph names must appear in the backend config |
 | `docs/NOTES-genie-splits.md` | current, SDK-cited | the multi-ctx-bin (split) contract — required for any graph over the 3.5 GiB serialization limit, i.e. every text tower ≳2B |

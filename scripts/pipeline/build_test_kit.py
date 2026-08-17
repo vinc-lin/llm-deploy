@@ -36,7 +36,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from preprocess_image import (  # noqa: E402
-    EDGE, RAW_BYTES, load_encoding, preprocess, quantize, CLIP_EXCESS_LSB_MAX)
+    EDGE, RAW_BYTES, PAD_BYTES, load_encoding, preprocess, quantize,
+    CLIP_EXCESS_LSB_MAX)
 
 SAMPLE_LINE = "sample_image.raw"
 
@@ -81,10 +82,11 @@ def main():
             problems.append(f"{stem}: pixels fall up to {excess:.1f} LSB outside "
                             "the ViT's calibrated range")
         raw = out / f"{stem}.raw"
-        raw.write_bytes(q.tobytes())
-        assert raw.stat().st_size == RAW_BYTES, raw.stat().st_size
+        raw.write_bytes(q.tobytes() + b"\x00" * PAD_BYTES)
+        assert raw.stat().st_size == RAW_BYTES + PAD_BYTES, raw.stat().st_size
         (out / f"{stem}.json").write_text(json.dumps(
             {"shape": list(pv.shape), "dtype": "uint16", "bytes": RAW_BYTES,
+             "pad_bytes": PAD_BYTES,
              "grid_thw": grid.tolist(), "edge": EDGE,
              "encoding": {"scale": scale, "offset": offset, "bitwidth": bw},
              "clipped": clipped, "clip_excess_lsb": excess,

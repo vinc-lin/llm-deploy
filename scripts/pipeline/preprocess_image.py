@@ -39,6 +39,12 @@ import numpy as np
 EDGE = 512
 N_PATCH, N_FEAT = 1024, 1536
 RAW_BYTES = N_PATCH * N_FEAT * 2          # uint16
+# +4 KB of zero padding on every shipped blob. GenieNode_setData allocates
+# exactly fileSize bytes and a consumer over-reads one byte past 0x300000 into
+# Scudo's guard page -> SIGSEGV (SEGV_ACCERR) on device, 2026-08-15. The
+# runtime consumes only the first RAW_BYTES; the padding just moves the guard
+# page out of reach. See docs/DEVICE_TEST_qwen3vl_imgenc_sigsegv.md §1.2b/§4.
+PAD_BYTES = 4096
 TENSOR = "pixel_values"
 # Gate on how FAR values fall outside the calibrated range, in LSBs -- never on
 # how MANY do. Those are very different failures and only one matters.
@@ -154,11 +160,12 @@ def main():
         "them. Recalibrate with images like this one.")
 
     out = Path(args.out)
-    out.write_bytes(q.tobytes())
+    out.write_bytes(q.tobytes() + b"\x00" * PAD_BYTES)
     got = out.stat().st_size
-    assert got == RAW_BYTES, f"{got} bytes != {RAW_BYTES}"
+    assert got == RAW_BYTES + PAD_BYTES, f"{got} bytes != {RAW_BYTES}+{PAD_BYTES}"
     out.with_suffix(".json").write_text(json.dumps(
         {"shape": [N_PATCH, N_FEAT], "dtype": "uint16", "bytes": RAW_BYTES,
+         "pad_bytes": PAD_BYTES,
          "grid_thw": grid.tolist(), "edge": EDGE,
          "encoding": {"scale": scale, "offset": offset, "bitwidth": bw},
          "clipped": clipped, "clip_excess_lsb": excess,

@@ -57,6 +57,12 @@ from here with `git push ssh://tank/home/vinc/llm-deploy main` — it has
 `ctxbin_variant.sh` readback gate, which is exactly the check that catches a knob
 silently failing to bind — an unbound knob looks like a measurement, not an error.
 
+**Scripts are not executable on tank.** This repo lives on a Windows-backed
+mount where every file reads `0777`, so the exec bit never enters git; on tank
+the same files land `0664` and `scripts/build/foo.sh` fails `Permission
+denied` (exit 126). Always invoke build scripts there as `bash
+scripts/build/foo.sh`. Verified, not theoretical — it bit this session.
+
 ### What lives where
 
 Tank holds the canonical `work/` for **Qwen3-VL-4B** (its export does not fit
@@ -92,6 +98,12 @@ are a fatal Genie load error (KV quant params must be byte-identical).
 `export_qwen3vl_vit.py` → `quantize_vit_aimet.py` → `vit_build_quant.sh` (vision)
 and `vl_text_build.sh` → `vl_text_ctxbin_split.sh` (text, 2-split ctx-bin),
 joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
+**`--grouped-gqa` is mandatory here too**: `vl_text_build.sh <name> <cl> <ctx>
+--grouped-gqa` passes it through, but it must ALSO reach the separate past-KV
+prefill export (`quantize_aimet.py --export-decode ... --grouped-gqa`) and
+`export_qwen3vl_text.py --grouped-gqa` for the fp32 gate exports — a graph
+that misses it silently ships old attention while the others look correct.
+v2 shipped exactly that: 36 replication ops per shard at a 4:1 head ratio.
 
 ## Hard contracts (violations = silent device garbage or SIGSEGV)
 
@@ -141,6 +153,14 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
   the 0.6B pattern does not transfer. See `docs/REFERENCE.md` §3.6.
 - Image-encoder configs need `vision-param: {height, width}` in **patch units**
   (pre-merge), or MRoPE never engages and image rows fall back to plain rope.
+- **Every shipped image blob needs 4096 bytes of zero padding past the
+  payload** (1024×1536×2 = 3,145,728 → 3,149,824 total). `GenieNode_setData`
+  allocates exactly `fileSize`; a consumer over-reads one byte past the end
+  into a Scudo guard page — `SIGSEGV (SEGV_ACCERR)` at `base+0x300000`, what
+  blocked the device on 2026-08-15. `preprocess_image.py` /
+  `build_test_kit.py` pad automatically; `lint_pipeline_bundle.py` enforces
+  the size. The runtime reads only the payload, so the pad is inert.
+  `docs/DEVICE_TEST_qwen3vl_imgenc_sigsegv.md` §1.2b/§4.
 
 ## Validation gates (run before shipping any bundle)
 
@@ -153,13 +173,38 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
 - Qwen3-VL: `scripts/validate/parity_e2e_vl.py` — full path (image → ViT →
   splice → text tower) vs `hf.generate`, token-for-token. `lint_pipeline_bundle.py`
   for bundle contracts. Run the gate with no `--chains` filter; a subset skips
-  the mutation checks.
+  the mutation checks. Also `lint_gqa_ops.py` on all four text DLCs with
+  **`--layers 18`** (the per-shard count) — the flag defaults to 28 (the 0.6B
+  tower), and since the lint's pass criterion is `len(matmuls) == 2 * layers`,
+  the default reports FAIL on a perfectly correct shard.
+  `vl_text_ctxbin_split.sh` now runs this automatically (commit `0db9643`) —
+  don't add a manual duplicate.
 
 ## Gotchas — environment & infrastructure
 
-- HF: proxy `http://127.0.0.1:17890` required, but it drops long upload streams —
-  use `scripts/util/hf_upload_watchdog.sh` (set `SOCKET_CHECKS=999999`; the
-  socket detector false-positives through the proxy).
+- HF: proxy `http://127.0.0.1:17890` required (export `https_proxy`/`http_proxy`
+  yourself — neither `env.sh` nor the watchdog sets them), but it drops long
+  upload streams — use `scripts/util/hf_upload_watchdog.sh`.
+  ⚠ **`upload-large-folder` transfers the bytes fine and then hangs at the
+  COMMIT.** Measured 2026-08-17 on the VL v3 bundle: five watchdog attempts,
+  each ending with every socket CLOSE-WAIT and `/proc/PID/io` flat, `Files:`
+  stuck at `pre-uploaded: 8/26, committed: 0/60`. It looks like a transfer
+  failure and is not: a later per-file `upload_file` of each 1.85 GB / 2.63 GB
+  ctx-bin reported **`New Data Upload: 0.00B`** and committed in 9–11 s,
+  i.e. the 4.5 GB was already server-side the whole time. Do not diagnose this
+  from the progress bars — they reach 99–100% and keep redrawing forever, which
+  also defeats the watchdog's progress-freeze detector, and `SOCKET_CHECKS=999999`
+  disables the socket detector, so the watchdog waits indefinitely.
+  **Working recipe when it stalls:** `HfApi().upload_folder(..., ignore_patterns=[<big files>])`
+  for the bulk (58 files, one commit, 9 s) then one `upload_file` per file
+  ≳1 GB. Four commits total, well inside the 128/h limit. Confirm a suspected
+  stall with `/proc/PID/io` (zero delta) before killing anything.
+- **Nothing is visible in the repo until the commit phase.** `upload-large-folder`
+  pre-uploads every blob first and commits at the end, so `list_repo_files`
+  returning 0 mid-run is normal, not a failure.
+- Verify an upload against the **re-downloaded** bytes, never the local ones:
+  `hf_hub_download` the `info.json`s + node config and re-run
+  `scripts/validate/genie_load_check.py` on them.
 - Hub limit: 128 repo commits/hour. "Hung" commit phase with all blobs
   pre-uploaded = 429; diagnose with one foreground `HfApi().upload_file`,
   recover with spaced single-file commits after ~1h.

@@ -87,6 +87,10 @@ CONFIGS=(
   # from the primary by exactly the two select-graphs keys.
   genie_text_generator_qwen3vl_4b_decodeonly.json
   genie_pipeline_qwen3vl_decodeonly.script
+  # genie-t2t-run dialog config for the text tower alone: the 4B two-shard
+  # tower has never had its tok/s or TTFT measured, and this makes that
+  # measurement possible in the same device session, no second download.
+  genie_dialog_qwen3vl_4b.json
 )
 
 # Weather/road test kit: per-image blob + sidecar + jpg + its own script, all
@@ -146,6 +150,10 @@ for f in "${CONFIGS[@]}"; do cp "$LLMDEPLOY_ROOT/configs/$f" "$OUT/"; done
 # README (docs/HF_HUB_README_qwen3vl.md), which is where they are.
 cp "$LLMDEPLOY_ROOT/docs/BUNDLE_README_qwen3vl_4b_e2e.md" "$OUT/README.md"
 cp "$LLMDEPLOY_ROOT/docs/DEVICE_TEST_qwen3vl_e2e.md" "$OUT/DEVICE_TEST.md"
+# Single entry point for the device operator: usage, ordered test procedure,
+# the metric definitions to use verbatim, and a fill-in results table. The
+# other two docs go deeper; this one is runnable on its own.
+cp "$LLMDEPLOY_ROOT/docs/BUNDLE_OPERATOR_GUIDE_qwen3vl_4b_v3.md" "$OUT/OPERATOR_GUIDE.md"
 if [ -d "$KIT" ] && compgen -G "$KIT/wx_*.raw" >/dev/null; then
     cp "$KIT"/wx_*.{raw,json,jpg,script} "$KIT/TEST_IMAGES.md" "$OUT/"
     echo "   test kit: $(ls "$KIT"/wx_*.raw | wc -l) image(s) from $KIT"

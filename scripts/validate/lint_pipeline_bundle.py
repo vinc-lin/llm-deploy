@@ -63,8 +63,9 @@ Each check maps to a specific silent-failure mode with a known precedent:
      must itself pass the load simulation.
  11. test kit closure -- every `wx_*.script` must be runnable as shipped: all
      referenced files present, each script feeding its OWN blob, each `.raw`
-     exactly 1024*1536*2 bytes, each sidecar's encoding equal to the shipped
-     ViT's `pixel_values` quantizeParams, and no orphan blobs.
+     exactly 1024*1536*2 bytes plus the 4 KB guard-page pad, each sidecar's
+     encoding equal to the shipped ViT's `pixel_values` quantizeParams, and no
+     orphan blobs.
 
 Checks 9-11 are mutation-tested by `test_genie_load_sim.py` and by the
 procedure in the plan doc: dropping a kit blob, reverting a prefill mask to
@@ -91,6 +92,9 @@ LUT_ROWS, LUT_DIM = 151936, 2560
 LUT_BYTES = LUT_ROWS * LUT_DIM * 4
 N_PATCH, N_FEAT = 1024, 1536
 RAW_BYTES = N_PATCH * N_FEAT * 2
+# guard-page padding every shipped blob carries -- see preprocess_image.py's
+# PAD_BYTES (imgenc runbook §1.2b/§4).
+PAD_BYTES = 4096
 IMG_ROWS = 256                      # merged ViT output rows == <|image_pad|> count
 EDGE = 512
 SPATIAL_MERGE = 2
@@ -471,12 +475,12 @@ def check_sample_image(bundle, raw_name, pixel_enc, rep):
     if not raw.is_file():
         return None                                     # check 1 reports the miss
     got = raw.stat().st_size
-    if got != RAW_BYTES:
-        rep.fail(f"{raw_name}: {got} bytes != {N_PATCH}*{N_FEAT}*2 = {RAW_BYTES} "
-                 "(node set image is an opaque blob; the size is never checked "
-                 "against the tensor)")
+    if got != RAW_BYTES + PAD_BYTES:
+        rep.fail(f"{raw_name}: {got} bytes != {RAW_BYTES}+{PAD_BYTES} "
+                 "(payload + the 4 KB guard-page padding; an unpadded blob "
+                 "re-ships the GenieNode_setData SIGSEGV -- imgenc runbook §4)")
     else:
-        rep.ok(f"{raw_name}: {got} bytes == {N_PATCH}*{N_FEAT}*2")
+        rep.ok(f"{raw_name}: {got} bytes == payload+{PAD_BYTES} pad")
     meta_path = raw.with_suffix(".json")
     if not meta_path.is_file():
         rep.fail(f"{meta_path.name}: missing sidecar for {raw_name}")
@@ -1179,8 +1183,10 @@ def check_kit(bundle, raw_name, pixel_enc, rep):
             continue
         seen_raw.add(f"{stem}.raw")
         blob = bundle / f"{stem}.raw"
-        if blob.is_file() and blob.stat().st_size != RAW_BYTES:
-            rep.fail(f"{blob.name}: {blob.stat().st_size} bytes != {RAW_BYTES}")
+        if blob.is_file() and blob.stat().st_size != RAW_BYTES + PAD_BYTES:
+            rep.fail(f"{blob.name}: {blob.stat().st_size} bytes != "
+                     f"{RAW_BYTES}+{PAD_BYTES} (unpadded blob re-ships the "
+                     "setData SIGSEGV)")
         side = bundle / f"{stem}.json"
         if not side.is_file():
             rep.fail(f"{stem}.json: sidecar missing")
