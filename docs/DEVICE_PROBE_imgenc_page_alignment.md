@@ -19,9 +19,9 @@ cheap test remains before vendor escalation
 | Symptom | `SIGSEGV (SEGV_ACCERR)` on `node set image`, inside `GenieNode_setData` |
 | Runtime | libGenie 1.19.0, BuildId `f6899695c925325c` |
 | Tried | unpadded (v2), +4096 (v3), +1 byte (probe) — **all three crash** |
-| Established | the faulting buffer is **page-granular and file-derived**; the fault is always at exactly `user_buffer + buffer_size` |
-| Consequence | **no padding scheme can ever work** — see §3 |
-| Remaining ambiguity | one test, §4 |
+| Established | the fault has landed at exactly `user_buffer + roundDown(file_size, page)` in all three runs |
+| Two live theories | **A:** one-past-the-end of a page-granular buffer → no padding can ever work (§3). **C:** a fixed `tensor + 4096` overshoot → a 771-page blob FIXES it (§4) |
+| Decides between them | **one 30-second test, §4 — run it before believing §3** |
 | Not implicated | the GQA text tower, the ViT ctx-bin, the bundle layout |
 
 ---
@@ -79,10 +79,16 @@ outcomes:
 
 ---
 
-## 3. Why no amount of padding can fix this
+## 3. Why, under theory A, no amount of padding can fix this
 
-This is the load-bearing conclusion, and it is stronger than "padding didn't
-help."
+⚠ **This section is conditional on theory A** (the access is one-past-the-end
+of the buffer itself). Theory C — a fixed `tensor + 4096` overshoot that every
+run so far has happened to sit exactly at — survives all three data points and
+is *fixed* by a larger blob. §4's test separates them; do not act on this
+section until it has run. A reader who stops here would skip the one cheap
+thing that might clear the blocker.
+
+Under theory A, the conclusion is stronger than "padding didn't help":
 
 Slack only appears when a buffer ends *partway* through its last page. A buffer
 whose size is always a whole number of pages **never** does. So:
@@ -101,24 +107,34 @@ whose size is always a whole number of pages **never** does. So:
 | +4096 | 3,149,824 | 3,149,824 | **0** |
 | +1 MB | 4,194,304 | 4,194,304 | **0** |
 
-The slack column is zero for every possible input. **Stop trying to fix this
-from the host side with blob sizes.** The original hypothesis in this document
-assumed a byte-granular buffer, where non-page padding would have produced
-4,095 bytes of slack. That assumption was wrong.
+The slack column is zero for every possible input. The original hypothesis in
+this document assumed a byte-granular buffer, where non-page padding would
+have produced 4,095 bytes of slack. That assumption was wrong.
 
 ---
 
-## 4. The one test left before escalation
+## 4. The one test left — and under theory C it IS the fix
 
-Two theories still fit the two precise data points, and they differ by a
-suspicious coincidence: the observed buffer is `tensor_size + exactly one page`
-(3,145,728 + 4,096 = 3,149,824).
+The suspicious coincidence: the observed buffer is `tensor_size + exactly one
+page` (3,145,728 + 4,096 = 3,149,824), and **every input tested so far has put
+the buffer end exactly at that address**. So a fixed overshoot of the *tensor*
+by 4,096 bytes (theory C) predicts the same three crashes as a one-past-the-end
+of the *buffer* (theory A). They have never been separated.
 
-- **(a) page-granular file-derived** — §2's rule
-- **(b) tensor-derived** — buffer fixed by a graph property, the file-size match
-  in v2/v3 being coincidence
+- **Theory A** — access at `buffer_end`. Fault follows the buffer wherever it
+  goes. Not host-fixable (§3).
+- **Theory C** — access at `tensor + 4096` = `user + 0x301000`, fixed. Any
+  buffer bigger than that contains the access harmlessly. **Host-fixable by
+  re-cutting the blobs at 771 pages.**
 
-Set the file to a size the two theories disagree about — exactly 771 pages:
+Scorekeeping honesty: A fits all three runs; C mispredicts v2's fault address
+by one page — but v2's tombstone is the least reliable of the three (no memory
+map; its stated allocation is inconsistent with the header-page layout the
+probe tombstone shows). Call it **~1-in-4 that C is right**. Thirty seconds
+for a 25% chance of clearing the blocker outright.
+
+Set the file to a size the two theories disagree about — exactly 771 pages,
+which gives 8,192 bytes of headroom past `tensor + 4096`:
 
 ```bash
 truncate -s 3158016 sample_image.raw     # 3,158,016 B = 771 pages exactly
@@ -126,15 +142,17 @@ ls -l sample_image.raw                   # must read 3158016
 LD_LIBRARY_PATH=. ./genie-app -s genie_pipeline_qwen3vl.script
 ```
 
-| observed fault offset | verdict |
-|---|---|
-| `user + 0x303000` (moved) | **(a)** — page-granular file-derived buffer, confirmed. Escalate with that exact description. |
-| `user + 0x301000` (unchanged) | **(b)** — tensor-derived. The `tensor + 1 page` relationship becomes the thing to chase. |
+| outcome | verdict | next action |
+|---|---|---|
+| **no crash — you get a caption** | **Theory C** — fixed `tensor+4096` overshoot, contained by the larger buffer | **Blocker cleared.** We re-cut every blob at 771 pages (v3.1, ~1 h) and the full image path opens. Run the kit while you have the board |
+| crash at `user + 0x303000` (moved with the buffer) | **Theory A** — one-past-the-end, padding dead across a three-point spread | Escalate with the precise sizing rule; proceed to `qnn-net-run` bisection |
+| crash at `user + 0x301000` (unchanged) | buffer truly capped at `tensor + 1 page` regardless of file | Redirects again — the cap itself becomes the escalation question |
 
 `truncate` zero-fills, so the first 3,145,728 bytes — everything the tensor
 reads — are untouched. Revert with `truncate -s 3149824 sample_image.raw`.
 
-One command, and it removes the last ambiguity from the vendor report.
+One command; either it clears the blocker or it removes the last ambiguity
+from the vendor report.
 
 ---
 
@@ -221,7 +239,8 @@ decides whether this is even the right question.
   rebuilt split tower works, and it is independent of this blocker.
 - **The ViT ctx-bin.** Loads cleanly. Not implicated.
 - **The image blob encoding.** `UFIXED_POINT_16` is correct and required.
-- **The blob sizes.** §3 — padding cannot help, in either direction.
+- **The blob sizes — until §4 has run.** Under theory A padding cannot help
+  (§3); under theory C the 771-page size is the fix. §4 decides which.
 - **The bundle layout, runtime libraries, configs, scripts, tokenizer.** All
   validated, MD5s match.
 
