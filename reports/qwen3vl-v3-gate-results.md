@@ -35,7 +35,8 @@ blobs, which is what blocked the device on 2026-08-15 with
 | **`parity_e2e_vl.py` all 6 chains** | **PASS — 4/4 gated chains 20/20** | same |
 | Kit captions (6 images, tierB) | PASS — token counts identical to v2 | `logs/vl_gqa_stage5.log` |
 | Kit blobs padded | PASS — 6 × 3,149,824 B, ≤1.00 LSB clip | |
-| Bundle v3 lint | *running* | |
+| Bundle v3 lint (11 checks) | PASS — exit 0 | 60 files, 4.7 GB tar |
+| Uploaded + verified on HF | PASS — sizes exact, load-sim clean on re-downloaded bytes | `qwen3vl_4b_e2e_pipeline_v3/` |
 
 ---
 

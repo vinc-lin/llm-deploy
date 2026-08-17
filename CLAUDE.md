@@ -185,20 +185,26 @@ v2 shipped exactly that: 36 replication ops per shard at a 4:1 head ratio.
 - HF: proxy `http://127.0.0.1:17890` required (export `https_proxy`/`http_proxy`
   yourself — neither `env.sh` nor the watchdog sets them), but it drops long
   upload streams — use `scripts/util/hf_upload_watchdog.sh`.
-  ⚠ **`SOCKET_CHECKS=999999` disables the only detector that catches the common
-  stall.** Measured 2026-08-17 on the VL v3 upload: all sockets CLOSE-WAIT,
-  `/proc/PID/io` flat for minutes, `Files:` frozen at `8/26` — yet the *log kept
-  growing* because interleaved per-file progress bars redraw forever, so the
-  progress-freeze detector never fires either and the watchdog waits
-  indefinitely. All-CLOSE-WAIT **plus zero IO** is a true stall, not the
-  false positive the old note assumed. Use a finite `SOCKET_CHECKS` (9 ≈ 3 min)
-  and confirm with `/proc/PID/io` before killing; `hf upload-large-folder`
-  is resumable, so a restart re-uses cached hashing and already-uploaded files
-  (`pre-uploaded: 8/26` carried over) and picks up files added since.
+  ⚠ **`upload-large-folder` transfers the bytes fine and then hangs at the
+  COMMIT.** Measured 2026-08-17 on the VL v3 bundle: five watchdog attempts,
+  each ending with every socket CLOSE-WAIT and `/proc/PID/io` flat, `Files:`
+  stuck at `pre-uploaded: 8/26, committed: 0/60`. It looks like a transfer
+  failure and is not: a later per-file `upload_file` of each 1.85 GB / 2.63 GB
+  ctx-bin reported **`New Data Upload: 0.00B`** and committed in 9–11 s,
+  i.e. the 4.5 GB was already server-side the whole time. Do not diagnose this
+  from the progress bars — they reach 99–100% and keep redrawing forever, which
+  also defeats the watchdog's progress-freeze detector, and `SOCKET_CHECKS=999999`
+  disables the socket detector, so the watchdog waits indefinitely.
+  **Working recipe when it stalls:** `HfApi().upload_folder(..., ignore_patterns=[<big files>])`
+  for the bulk (58 files, one commit, 9 s) then one `upload_file` per file
+  ≳1 GB. Four commits total, well inside the 128/h limit. Confirm a suspected
+  stall with `/proc/PID/io` (zero delta) before killing anything.
 - **Nothing is visible in the repo until the commit phase.** `upload-large-folder`
   pre-uploads every blob first and commits at the end, so `list_repo_files`
-  returning 0 mid-run is normal, not a failure. A *hung* commit phase with all
-  blobs uploaded is the 429 case below.
+  returning 0 mid-run is normal, not a failure.
+- Verify an upload against the **re-downloaded** bytes, never the local ones:
+  `hf_hub_download` the `info.json`s + node config and re-run
+  `scripts/validate/genie_load_check.py` on them.
 - Hub limit: 128 repo commits/hour. "Hung" commit phase with all blobs
   pre-uploaded = 429; diagnose with one foreground `HfApi().upload_file`,
   recover with spaced single-file commits after ~1h.
