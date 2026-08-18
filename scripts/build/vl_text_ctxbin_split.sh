@@ -130,6 +130,14 @@ convert() {
 # which also explains why --preserve_io_datatype is NOT the way (it pins I/O to
 # float32 and the converter then emits a QNN_Convert the backend cannot create).
 #
+# deepstack_* are deliberately NOT grafted, and this is load-bearing rather than
+# an omission. They are zero-filled (deepstack-by-zeros; nsp-model.cpp:1481), and
+# a memset-0 buffer only MEANS zero for a float type. On an asymmetric uFxp_16
+# grid with offset -32927 the raw zero decodes to (0 + -32927) * scale = -11.65,
+# i.e. grafting them would silently feed the tower a large negative constant
+# where it currently gets a clean zero. inputs_embeds has no such hazard: its pad
+# region is explicitly quantized from the pad/EOS embedding, never memset.
+#
 # RANGE: inputs_embeds carries BOTH text-LUT rows and spliced image features, so
 # the encoding must cover both. VIT_INFO defaults to the built vision bin's
 # info.json, whose image_features encoding is unioned in -- covering only the LUT
