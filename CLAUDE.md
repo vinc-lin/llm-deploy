@@ -141,6 +141,25 @@ v2 shipped exactly that: 36 replication ops per shard at a 4:1 head ratio.
   ship W8A16 with `UFIXED_POINT_16` IO.
 - `pos-id-dim` (backend block) alongside `positional-encoding` is a **hard
   load-time schema error**, not a warning. Declare one. Same for `rope-theta`.
+- **An embeddings-fed `inputs_embeds` must never be `FLOAT_16`.** `quantizeInput`
+  advances its destination by `tensorOffset` **elements** for UFIXED_8/16 and
+  FLOAT_32 but by **bytes** for FLOAT_16 (`nsp-model.cpp:3144`), while
+  `setupInputEmbeddings` passes an element count when padding a partially-filled
+  prefill chunk (`:1813`) — so the pad write lands halfway into the real prompt
+  and overwrites its back half. Fires only when `variant > n_process`, i.e. the
+  last partial chunk, so decode looks fine and host parity (20/20) never sees it.
+  This is the 2026-08-15 Qwen3-VL text-garbage defect. AIMET writes no encoding
+  for that tensor (it quantizes module *outputs*; this is a graph *input*), so
+  the converter defaults it to fp16 — graft one with
+  `scripts/quant/graft_input_encoding.py` to get `uFxp_16`, and gate with
+  `lint_embedding_dtype.py`. ⚠ **Not `--preserve_io_datatype`** — it pins the
+  input to fp32 and graph-prepare then dies with `could not create op:
+  q::QNN_Convert` (`vit_build_quant.sh`'s header says so; it was ignored once).
+  ⚠ For a VL tower cover the ViT's `image_features` range too
+  (`--cover-ctxbin-info`), not just the LUT: text spans ±0.24, image ±11.6.
+  ⚠ **Do NOT graft `deepstack_*`** — they are zero-filled, and a memset-0 buffer
+  only means zero for a float type; on that uFxp_16 grid raw zero decodes to
+  −11.65.
 - A prefill graph whose `attention_mask` is `[1,AR,AR]` registers `ctx_size ==
   AR` (bertcache) and is **never selected** for prompts longer than AR — the
   whole prompt goes through the AR=1 decode graph, silently and slowly.
