@@ -45,6 +45,16 @@ FUSE=()
 # (nsp-model.cpp:668 matches the name literally).
 EMBEDS=0
 for f in "${FUSE[@]:-}"; do [ "$f" = "--input-embeds" ] && EMBEDS=1; done
+# Same contract as full_build.sh: an embeddings-fed inputs_embeds must stay
+# FLOAT_32, because qualla's only implemented float path is fp32 lut -> fp32
+# input (dialog.cpp:678 copies raw bytes; basic.cpp:161's fp32->fp16 case is an
+# empty `// TODO`). Must be set HERE too -- this script converts the past-KV
+# prefill separately, and a flag applied only in full_build.sh would ship a
+# correct decode graph beside a prefill still declaring FLOAT_16.
+PRES=()
+if [ "$EMBEDS" = "1" ] && [ -z "${EMBEDS_FP16_IN:-}" ]; then
+    PRES=(--preserve_io_datatype inputs_embeds)
+fi
 # NO_VERIFY=1 builds prefill+decode only. verify32 exists for LADE, which is
 # parked as a 30% regression and unused in basic mode, so the probe omits it
 # rather than paying for an export that changes nothing it measures.
@@ -128,7 +138,7 @@ for i in $(seq 0 27); do
 done
 $PY_QAIRT "$CONVERTER" --input_network "$QKV/model_renamed.onnx" \
     --output_path "$DLCKV/prefill.dlc" --quantization_overrides "$ENC" \
-    --float_bitwidth 16 --target_backend HTP "${DIMS[@]}"
+    --float_bitwidth 16 --target_backend HTP "${PRES[@]}" "${DIMS[@]}"
 
 INFO=$DLCKV/prefill_info.txt
 "$QAIRT_SDK/bin/x86_64-linux-clang/qairt-dlc-info" -i "$DLCKV/prefill.dlc" > "$INFO" 2>/dev/null

@@ -111,12 +111,27 @@ convert() {
                    -d "past_value_${i}_in" "1,$NKV,$past,$HEAD_DIM")
         done
     fi
+    # Shard 0 owns inputs_embeds, which Genie fills from the float32 LUT. Under a
+    # bare --float_bitwidth 16 that input lands FLOAT_16, and NOTHING converts the
+    # fp32 LUT bytes down to it: qualla's only implemented float path is
+    # FLOAT_32 lut -> FLOAT_32 input. dialog.cpp:678 moves the raw fp32 bytes
+    # straight in ("decoderInput = std::move(encoderOutput)"), and basic.cpp:161
+    # -- the fp32->fp16 case -- is an empty `// TODO` whose body is commented out,
+    # so it silently writes nothing at all. Neither errors. That is the 2026-08-15
+    # text-garbage defect. --preserve_io_datatype keeps the network input FLOAT_32
+    # and lets the converter insert its own Convert op to the fp16 interior, which
+    # is what the runtime already assumes. Applied ONLY to inputs_embeds:
+    # deepstack_* are written by the image path, which has real FLOAT_16 handling
+    # (nsp-image-model.cpp:547/899/982), and that path is device-proven in v4.
+    local pres=()
+    [ "$first" = "1" ] && pres=(--preserve_io_datatype inputs_embeds)
+    [ -n "${EMBEDS_FP16_IN:-}" ] && pres=()   # escape hatch: rebuild the BROKEN control
     disk_guard 20
-    echo "== convert $graph (S=$seq, past=$past, layers $start-$((end - 1))) =="
+    echo "== convert $graph (S=$seq, past=$past, layers $start-$((end - 1)))${pres:+ [inputs_embeds fp32]} =="
     $PY_QAIRT "$CONVERTER" --input_network "$ONNX/$graph/$graph.onnx" \
         --output_path "$DLC/$graph.dlc" \
         --quantization_overrides "$ENCDIR/chunk$chunk.encodings" \
-        --float_bitwidth 16 --target_backend HTP "${args[@]}"
+        --float_bitwidth 16 --target_backend HTP "${pres[@]}" "${args[@]}"
 }
 
 echo "== prefill flavour: past=$PREFILL_PAST, mask total=$P_TOTAL, deepstack suffix='${DSP_SUFFIX:-<none>}' =="
