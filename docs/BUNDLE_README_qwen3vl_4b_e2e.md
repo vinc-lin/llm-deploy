@@ -1,4 +1,4 @@
-# Qwen3-VL-4B on SA8797P — bundle v4
+# Qwen3-VL-4B on SA8797P — bundle v5
 
 Image + text in, description out, as one flat `genie-app` bundle for the
 Qualcomm **SA8797P** (Hexagon v81 HTP, Android GVM), built against **QAIRT
@@ -14,15 +14,20 @@ see the document map below.
 
 | Read | For |
 |---|---|
-| **`V4_CHANGES.md`** | what changed since v3 and why — **read first** |
-| **`SESSION_RUNBOOK.md`** | the ordered test procedure (V1…V5), outcomes, what to collect |
+| **`V5_CHANGES.md`** | what this bundle is for — **read first** |
+| **`SESSION_RUNBOOK.md`** | the ordered procedure for this session (probes A and C) |
 | **`OPERATOR_GUIDE.md`** | full reference: install, metric definitions, pass/fail, triage, limitations |
+| `V4_CHANGES.md` | the image fix (float32 blobs), still current — ctx-bin md5s live here |
 | `TEST_IMAGES.md` | per-image expected captions for the weather kit |
 
+> **v5 is a DIAGNOSTIC bundle.** The ctx-bins are unchanged from v3/v4 and no
+> caption is expected from it. Its deliverable is a verdict on which stage
+> breaks the text tower — see `V5_CHANGES.md`.
+
 ```bash
-adb push qwen3vl_4b_e2e_pipeline_v4 /data/local/tmp/qwen3vl_v4
+adb push qwen3vl_4b_e2e_pipeline_v5 /data/local/tmp/qwen3vl_v5
 adb shell
-cd /data/local/tmp/qwen3vl_v4 && chmod +x genie-app genie-t2t-run qnn-net-run
+cd /data/local/tmp/qwen3vl_v5 && chmod +x genie-app genie-t2t-run qnn-net-run
 export LD_LIBRARY_PATH=.
 
 ls -l sample_image_fp32.raw               # MUST read 6295552
@@ -121,9 +126,9 @@ driver, used by test V1. Documentation per the map at the top.
 ## 3. Deploying
 
 ```bash
-adb push qwen3vl_4b_e2e_pipeline_v4 /data/local/tmp/qwen3vl_v4
+adb push qwen3vl_4b_e2e_pipeline_v5 /data/local/tmp/qwen3vl_v5
 adb shell
-cd /data/local/tmp/qwen3vl_v4
+cd /data/local/tmp/qwen3vl_v5
 chmod +x genie-app genie-t2t-run qnn-net-run
 ls libGenie.so libQnnHtp.so libQnnHtpV81Skel.so    # loader sanity
 ```

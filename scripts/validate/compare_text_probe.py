@@ -140,8 +140,8 @@ def main():
             print(f"  {c}: ctx-bin computes CORRECTLY.")
             print("      => the converter and ctx-bin are exonerated for this "
                   "case. The garbage on device comes from how GENIE FEEDS the "
-                  "tower, not from the graph. Next: probe B (Genie's own debug "
-                  "dump) is the one that matters.")
+                  "tower, not from the graph. Next: work probe B's ranked list "
+                  "(feed_variants.json); emb_fp32_as_fp16 leads it.")
         elif bad(s["shard0"]):
             print(f"  {c}: SHARD 0 is wrong at the very first graph.")
             print("      => the fault is in the ctx-bin/converter for shard 0. "

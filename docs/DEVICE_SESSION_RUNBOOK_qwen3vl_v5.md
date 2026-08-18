@@ -109,6 +109,39 @@ separately; never average.
 Also report the generated text from each run, garbage included — it is data,
 and a *change* in the garbage pattern between runs would itself be a finding.
 
+## 3b. Already done on the host: which feed mistakes could even cause this
+
+`probe_feed_variants.py` has already been run (results in
+`feed_variants.json`). It corrupts the feed one hypothesis at a time on the
+real tower and measures how far the logits move, so the session is not spent
+guessing. Ranked, worst first:
+
+| Hypothesis | worst cos | argmax | Could it cause garbage? |
+|---|---:|---|---|
+| `emb_fp32_as_fp16` | **−0.87** | 0/4 | **Yes — and it degenerates into repetition** |
+| `mask_multiplicative` | −0.71 | 0/4 | yes |
+| `mask_all_visible` | −0.10 | 1/4 | yes |
+| `mask_row0_only` | +0.78 | 1/4 | yes |
+| `rope_not_applied` | +0.997 | 3/4 | marginal |
+| `rope_no_offset` | +0.997 | 3/4 | marginal |
+| `rope_wrong_theta` | +1.000 | 4/4 | **no — eliminated** |
+| `emb_halved` | +0.9996 | 4/4 | **no — eliminated** |
+
+**The leading candidate is `emb_fp32_as_fp16`**, and not only because it scores
+worst. Its output *degenerates into repetition* — `[188, 26610, 26610, 26610]`
+— which is the shape of what you actually observed on device
+("…abilityability…", "…uringuring…", running until the context was exceeded).
+It is also the same class of defect as the v3 image crash: a dtype
+misinterpretation in Genie's input staging, one layer over. `inputs_embeds` is
+declared `FLOAT_16` while the accumulator carries float32, and the conversion
+between them is exactly the step that would produce this.
+
+Two hypotheses are **eliminated** and should not be re-tested: rope theta and
+embedding scale barely move the logits at all.
+
+This does not prove anything about the device yet — that is what probe A is
+for. It tells us where to look the moment probe A exonerates the ctx-bin.
+
 ## 4. What is NOT in this session, and why
 
 **There is no Genie debug-tensor dump.** It was planned and then dropped on
