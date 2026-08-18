@@ -226,12 +226,19 @@ def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int):
     np.save(cdir / "ref" / "logits.npy", lg_r)
 
     # ---- a spec the POSIX-sh runner can `.` source -------------------------
+    # PAST_BYTES is per-case, not a constant: the past-KV prefill carries
+    # past=2048 while decode carries past=2175 (both plus AR make 2176). One
+    # shared zero file across both would feed the wrong number of bytes.
     graph_idx = 0 if kind == "prefill" else 1      # bins hold [prefill_N, decode_N]
+    past_bytes = m0["n_kv"] * m0["head_dim"] * m0["past"] * 2
+    assert past_bytes == m1["n_kv"] * m1["head_dim"] * m1["past"] * 2, \
+        "shards disagree on past-KV size"
     env = [f"KIND={kind}", f"G0={g0}", f"G1={g1}", f"GRAPH_IDX={graph_idx}",
            f"AR={m0['ar']}", f"N_REAL={n_real}",
            f"LAYER_BASE_0={m0['layer_idx'][0]}", f"LAYER_N_0={len(m0['layer_idx'])}",
            f"LAYER_BASE_1={m1['layer_idx'][0]}", f"LAYER_N_1={len(m1['layer_idx'])}",
            f"DEEP='{' '.join(m0['deep'])}'",
+           f"PAST_BYTES={past_bytes}",
            f"HIDDEN_BYTES={m0['ar'] * H * 2}"]
     (cdir / "case.env").write_text("\n".join(env) + "\n")
 
