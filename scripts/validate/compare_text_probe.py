@@ -50,29 +50,51 @@ def find_out(d: Path, stem: str):
     return hits[0] if hits else None
 
 
-def load_f16(p: Path, n: int, label: str):
+def load_rows(p: Path, n_real: int, width: int, label: str):
+    """Device tensor -> the first n_real rows, as fp32.
+
+    The device writes ALL rows (AR=128 for prefill), while the reference keeps
+    only the real ones -- padding rows are meaningless and would be 78 MB of
+    noise. So slice by width rather than assuming the totals match.
+    """
     raw = p.read_bytes()
-    if len(raw) != n * 2:
-        print(f"    !! {label}: {len(raw)} bytes, expected {n*2} "
-              f"({n} fp16). Wrong dtype or a truncated pull.")
-        if len(raw) == n * 4:
-            print("       (that is exactly 4 bytes/element -- the run wrote "
-                  "float32, so --use_native_output_files was not in effect)")
-            return np.frombuffer(raw, dtype="<f4").astype(np.float32)
-        return None
-    return np.frombuffer(raw, dtype="<f2").astype(np.float32)
+    for dtype, esz in (("<f2", 2), ("<f4", 4)):
+        if len(raw) % (width * esz) == 0:
+            rows = len(raw) // (width * esz)
+            if rows < n_real:
+                continue
+            a = np.frombuffer(raw, dtype=dtype).astype(np.float32)
+            if esz == 4:
+                print(f"    note {label}: file is float32, so "
+                      "--use_native_output_files did not take effect. "
+                      "Comparing anyway.")
+            return a.reshape(rows, width)[:n_real]
+    print(f"    !! {label}: {len(raw)} bytes is not a whole number of "
+          f"{width}-wide rows in fp16 or fp32 -- truncated pull or wrong tensor")
+    return None
 
 
 def verdict(tag, ref, got, extra=""):
+    """Per-row cosine + argmax agreement. Reported per row because a fault that
+    only appears at row>0 -- the cross-token/rope failure mode the prefill case
+    exists to catch -- averages away into a healthy-looking single number."""
     if got is None:
         print(f"  {tag:22s} MISSING")
         return None
-    c = cos(ref, got)
-    ra, ga = int(np.argmax(ref.reshape(-1))), int(np.argmax(got.reshape(-1)))
-    mark = "OK  " if c >= COS_PASS else ("WEAK" if c >= COS_SUSPECT else "BAD ")
-    agree = "argmax==" if ra == ga else f"argmax {ga} != ref {ra}"
-    print(f"  {tag:22s} {mark} cos={c:+.6f}  {agree}  {extra}")
-    return c
+    cs, agree = [], 0
+    for r in range(ref.shape[0]):
+        c = cos(ref[r], got[r])
+        cs.append(c)
+        if int(np.argmax(ref[r])) == int(np.argmax(got[r])):
+            agree += 1
+    worst = min(cs)
+    mark = "OK  " if worst >= COS_PASS else ("WEAK" if worst >= COS_SUSPECT else "BAD ")
+    per_row = " ".join(f"{c:+.4f}" for c in cs)
+    print(f"  {tag:22s} {mark} worst_cos={worst:+.6f}  argmax {agree}/{ref.shape[0]}"
+          f"  {extra}")
+    if len(cs) > 1:
+        print(f"  {'':22s}      per-row cos: {per_row}")
+    return worst
 
 
 def main():
@@ -84,26 +106,26 @@ def main():
     cases = json.loads((args.kit / "cases.json").read_text())
     summary = []
     for meta in cases:
-        name = meta["case"]
-        print(f"\n=== case {name}  (token {meta['token']}, position "
-              f"{meta['position']}) — {meta['why']}")
+        name, n_real = meta["case"], meta["n_real"]
+        print(f"\n=== case {name}  ({meta['kind']}, AR={meta['ar']}, "
+              f"{n_real} real row(s)) — {meta['why']}")
         ref_h = np.load(args.kit / name / "ref" / "last_hidden_states.npy")
         ref_l = np.load(args.kit / name / "ref" / "logits.npy")
 
-        p = find_out(args.results / f"{name}_d0", "last_hidden_states")
-        got_h = load_f16(p, ref_h.size, "shard0") if p else None
+        p = find_out(args.results / f"{name}_s0", "last_hidden_states")
+        got_h = load_rows(p, n_real, ref_h.shape[1], "shard0") if p else None
         c_h = verdict("shard0", ref_h, got_h)
 
-        p = find_out(args.results / f"{name}_d1chain", "logits")
-        got_c = load_f16(p, ref_l.size, "shard1-chained") if p else None
+        p = find_out(args.results / f"{name}_s1chain", "logits")
+        got_c = load_rows(p, n_real, ref_l.shape[1], "shard1-chained") if p else None
         c_c = verdict("shard1-chained", ref_l, got_c,
-                      f"ref top5={meta['top10_ids'][:5]}")
+                      f"ref last-row top5={meta['last_row_top10_ids'][:5]}")
 
-        p = find_out(args.results / f"{name}_d1iso", "logits")
-        got_i = load_f16(p, ref_l.size, "shard1-isolated") if p else None
+        p = find_out(args.results / f"{name}_s1iso", "logits")
+        got_i = load_rows(p, n_real, ref_l.shape[1], "shard1-isolated") if p else None
         c_i = verdict("shard1-isolated", ref_l, got_i)
 
-        summary.append({"case": name, "shard0": c_h,
+        summary.append({"case": name, "kind": meta["kind"], "shard0": c_h,
                         "chained": c_c, "isolated": c_i})
 
     print("\n" + "=" * 72)
@@ -141,14 +163,26 @@ def main():
             print("      => report the raw numbers; a WEAK band is not a "
                   "verdict and a second opinion is cheaper than a wrong rebuild.")
 
-    if len(summary) == 2:
-        a, b = summary
-        if ok(a["chained"]) and bad(b["chained"]):
-            print("\n  CROSS-CASE: pos0 (rope=identity) is fine but pos7 "
-                  "(rope active) is not.")
-            print("      => the graph mishandles the rope tables. That is an "
-                  "in-graph/conversion fault, NOT Genie's table generation, "
-                  "because these tables came from us.")
+    dec = next((s for s in summary if s["kind"] == "decode"), None)
+    pre = next((s for s in summary if s["kind"] == "prefill"), None)
+    if dec and pre:
+        if ok(dec["chained"]) and bad(pre["chained"]):
+            print("\n  CROSS-CASE: decode is clean but prefill is not.")
+            print("      => the fault needs cross-token attention or rope to "
+                  "show up -- single-token numerics are fine. Suspect the "
+                  "prefill graphs or the rope/mask handling INSIDE them. Note "
+                  "the real prompt is three AR=128 prefill calls, so this "
+                  "alone would explain the device garbage.")
+        elif bad(dec["chained"]) and bad(pre["chained"]):
+            print("\n  CROSS-CASE: both decode and prefill are wrong.")
+            print("      => the fault is not rope- or attention-specific; it "
+                  "is in the shared weight/quantization path. A rebuild is "
+                  "justified.")
+        elif ok(dec["chained"]) and ok(pre["chained"]):
+            print("\n  CROSS-CASE: every graph computes correctly on device.")
+            print("      => the ctx-bins are GOOD. Stop looking at the "
+                  "converter. Run probe_feed_variants.py and work its ranked "
+                  "list of Genie feed mistakes.")
 
 
 if __name__ == "__main__":
