@@ -37,6 +37,19 @@ VAR=${VERIFY_AR:-32}  # existing verify graph AR
 FUSE=()
 [[ -n "${FUSE_FLAGS:-}" ]] && read -r -a FUSE <<< "$FUSE_FLAGS"
 
+# --input-embeds inside FUSE_FLAGS turns this into the LUT probe's past-KV
+# prefill: the tower is fed hidden states from an external LUT. Detected here
+# because, as in full_build.sh, it has to change the I/O rename and the
+# converter dims too -- a flag that only reached the quantizer would build a
+# graph still called input_ids, which qualla drives as token ids
+# (nsp-model.cpp:668 matches the name literally).
+EMBEDS=0
+for f in "${FUSE[@]:-}"; do [ "$f" = "--input-embeds" ] && EMBEDS=1; done
+# NO_VERIFY=1 builds prefill+decode only. verify32 exists for LADE, which is
+# parked as a 30% regression and unused in basic mode, so the probe omits it
+# rather than paying for an export that changes nothing it measures.
+NO_VERIFY=${NO_VERIFY:-0}
+
 MODEL=${MODEL:-$LLMDEPLOY_DATA/models/Qwen3-0.6B}
 QP=$LLMDEPLOY_DATA/work/quant/$NAME-prefill
 QKV=$LLMDEPLOY_DATA/work/quant/$NAME-prefillkv$AR
@@ -48,9 +61,10 @@ CONVERTER="$QAIRT_SDK/bin/x86_64-linux-clang/qairt-converter"
 PAST=$((CTX + CL - AR))   # 1024 for AR=128
 TOTAL=$((CTX + CL))       # 1152
 
-for f in "$QP/model_torch.encodings" "$QP/model_filtered.encodings" \
-         "$DLC/decode.dlc" "$DLC/verify$VAR.dlc"; do
-  [[ -f $f ]] || { echo "MISSING prerequisite: $f (run full_build.sh + lade_build.sh $NAME first)"; exit 1; }
+REQ=("$QP/model_torch.encodings" "$QP/model_filtered.encodings" "$DLC/decode.dlc")
+[ "$NO_VERIFY" = "1" ] || REQ+=("$DLC/verify$VAR.dlc")
+for f in "${REQ[@]}"; do
+  [[ -f $f ]] || { echo "MISSING prerequisite: $f (run full_build.sh${NO_VERIFY:+ }$([ "$NO_VERIFY" = 1 ] || echo "+ lade_build.sh") $NAME first)"; exit 1; }
 done
 
 if [[ -n "${ENC_SRC:-}" ]]; then
@@ -75,21 +89,40 @@ else
 
   disk_guard
   echo "== [2/5] canonical I/O rename =="
+  RENAME_FLAGS=()
+  [ "$EMBEDS" = "1" ] && RENAME_FLAGS=(--vl-text --n-deepstack 0)
   $PY "$LLMDEPLOY_ROOT/scripts/quant/rename_aimet_io.py" \
       --model "$QKV/model.onnx" --encodings "$ENC_IN" \
-      --layers 28 --with-past
+      --layers 28 --with-past "${RENAME_FLAGS[@]}"
 fi
 
-echo "== [3/5] FP parity: qualla feed pattern incl. chunking (AR=$AR) =="
-$PY "$LLMDEPLOY_ROOT/scripts/validate/parity_ladekv_read.py" \
-    --model "$MODEL" --onnx "$QKV/model_renamed.onnx" \
-    --ar "$AR" --ctx "$CTX"
+if [ "$EMBEDS" = "1" ]; then
+    echo "== [3/5] FP parity: LUT-fed (parity_ladekv_read.py feeds TOKEN IDS and"
+    echo "         cannot drive an embeddings-in graph; parity_lutprobe.py is"
+    echo "         the equivalent gate and reads the LUT at the runtime's own"
+    echo "         byte offsets) =="
+    $PY "$LLMDEPLOY_ROOT/scripts/validate/parity_lutprobe.py" \
+        --onnx "$QKV/model_renamed.onnx" \
+        --lut "${LUT_DIR:-$LLMDEPLOY_DATA/work/lut/qwen3-0.6b}" \
+        --model "$MODEL"
+else
+    echo "== [3/5] FP parity: qualla feed pattern incl. chunking (AR=$AR) =="
+    $PY "$LLMDEPLOY_ROOT/scripts/validate/parity_ladekv_read.py" \
+        --model "$MODEL" --onnx "$QKV/model_renamed.onnx" \
+        --ar "$AR" --ctx "$CTX"
+fi
 
 disk_guard
 echo "== [4/5] convert past-KV prefill -> DLC =="
 mkdir -p "$DLCKV"
-DIMS=(-d input_ids "1,$AR" -d attention_mask "1,$AR,$TOTAL"
+HID=$($PY -c "import json; print(json.load(open('$MODEL/config.json'))['hidden_size'])")
+if [ "$EMBEDS" = "1" ]; then
+  DIMS=(-d inputs_embeds "1,1,$AR,$HID" -d attention_mask "1,$AR,$TOTAL"
+        -d position_ids_cos "1,$AR,64" -d position_ids_sin "1,$AR,64")
+else
+  DIMS=(-d input_ids "1,$AR" -d attention_mask "1,$AR,$TOTAL"
       -d position_ids_cos "1,$AR,64" -d position_ids_sin "1,$AR,64")
+fi
 for i in $(seq 0 27); do
   DIMS+=(-d "past_key_${i}_in" "1,8,128,$PAST" -d "past_value_${i}_in" "1,8,$PAST,128")
 done
@@ -110,16 +143,22 @@ disk_guard
 # so the config is not an argument and cannot be hashed from one. Fold its
 # content hash into the recipe instead -- otherwise editing configs/ would leave
 # the key unchanged and the registry would claim a stale bin is current.
+if [ "$NO_VERIFY" = "1" ]; then
+  DLC_LIST="$DLCKV/prefill.dlc,$DLC/decode.dlc"; GRAPH_LIST="prefill,decode"
+else
+  DLC_LIST="$DLCKV/prefill.dlc,$DLC/decode.dlc,$DLC/verify$VAR.dlc"
+  GRAPH_LIST="prefill,decode,verify$VAR"
+fi
 coord_guard "ladekv $NAME" \
-    "$DLCKV/prefill.dlc,$DLC/decode.dlc,$DLC/verify$VAR.dlc" \
-    "prefill,decode,verify$VAR" \
+    "$DLC_LIST" \
+    "$GRAPH_LIST" \
     "{\"config_md5\": \"$(md5sum "$LLMDEPLOY_ROOT/configs/htp_backend_config.json" | cut -d' ' -f1)\"}" \
     20
-echo "== [5/5] three-graph ctx-bin (prefill-kv + decode + verify$VAR) =="
+echo "== [5/5] ctx-bin ($GRAPH_LIST) =="
 cd "$LLMDEPLOY_ROOT/configs"
 qnn-context-binary-generator \
     --model "$QAIRT_SDK/lib/x86_64-linux-clang/libQnnModelDlc.so" \
-    --dlc_path "$DLCKV/prefill.dlc,$DLC/decode.dlc,$DLC/verify$VAR.dlc" \
+    --dlc_path "$DLC_LIST" \
     --backend "$QAIRT_SDK/lib/x86_64-linux-clang/libQnnHtp.so" \
     --output_dir "$CTXBIN" --binary_file "${NAME}-ladekv_ctx" \
     --config_file htp_config.json

@@ -72,7 +72,13 @@ def main():
     AR = shapes["attention_mask"][-2]
     TOTAL = shapes["attention_mask"][-1]
     H = shapes["inputs_embeds"][-1]
-    print(f"graph  : inputs_embeds {shapes['inputs_embeds']} AR={AR} TOTAL={TOTAL}")
+    PAST = TOTAL - AR                 # 0 for a bertcache prefill
+    past_names = sorted(n for n in shapes
+                        if n.startswith("past_") and n.endswith("_in"))
+    kind = "past-KV" if PAST else "bertcache"
+    print(f"graph  : inputs_embeds {shapes['inputs_embeds']} AR={AR} "
+          f"TOTAL={TOTAL} PAST={PAST} ({kind} prefill, "
+          f"{len(past_names)} past inputs)")
 
     tok = AutoTokenizer.from_pretrained(str(args.model))
     hf = AutoModelForCausalLM.from_pretrained(str(args.model),
@@ -87,19 +93,41 @@ def main():
         rows, n_embd = lut_rows(args.lut, ids)
         assert n_embd == H, f"LUT width {n_embd} != graph hidden {H}"
 
-        # Right-aligned window, exactly as text_batches builds calibration:
-        # pad columns masked out, positions restarted at the first real token.
         emb = np.zeros((1, 1, AR, H), dtype=np.float32)
-        emb[0, 0, -n:] = rows
         mask = np.full((1, AR, TOTAL), MASK_VALUE, dtype=np.float32)
-        for r in range(AR - n, AR):
-            mask[0, r, AR - n:r + 1] = 0.0
-        pos = np.concatenate([np.zeros(AR - n, dtype=np.int64), np.arange(n)])
+        if PAST:
+            # Past-KV prefill with an EMPTY cache, per parity_e2e_vl.PrefillKV:
+            # content LEFT-aligned, row i sees the valid past span (nothing here)
+            # plus the causal new span [PAST, PAST+i]. Rows past n stay masked.
+            emb[0, 0, :n] = rows
+            for r in range(n):
+                mask[0, r, PAST:PAST + r + 1] = 0.0
+            pos = np.arange(n)
+            row_out = n - 1
+        else:
+            # Bertcache prefill: right-aligned window, pad columns masked out,
+            # positions restarted at the first real token -- exactly how
+            # text_batches builds calibration windows.
+            emb[0, 0, -n:] = rows
+            for r in range(AR - n, AR):
+                mask[0, r, AR - n:r + 1] = 0.0
+            pos = np.concatenate([np.zeros(AR - n, dtype=np.int64), np.arange(n)])
+            row_out = AR - 1
         c, s = rope_tables(torch.tensor(pos), cfg.head_dim, theta)
+        cos = np.zeros((1, AR, cfg.head_dim // 2), dtype=np.float32)
+        sin = np.zeros((1, AR, cfg.head_dim // 2), dtype=np.float32)
+        if PAST:
+            cos[0, :n] = c.numpy()[0]
+            sin[0, :n] = s.numpy()[0]
+        else:
+            cos[:] = c.numpy()
+            sin[:] = s.numpy()
         feeds = {"inputs_embeds": emb, "attention_mask": mask,
-                 "position_ids_cos": c.numpy().astype(np.float32),
-                 "position_ids_sin": s.numpy().astype(np.float32)}
-        got = sess.run(["logits"], feeds)[0][0, -1]
+                 "position_ids_cos": cos, "position_ids_sin": sin}
+        for nm in past_names:
+            feeds[nm] = np.zeros([d if isinstance(d, int) else 1
+                                  for d in shapes[nm]], dtype=np.float32)
+        got = sess.run(["logits"], feeds)[0][0, row_out]
 
         with torch.no_grad():
             ref = hf(torch.tensor([ids])).logits[0, -1].numpy()

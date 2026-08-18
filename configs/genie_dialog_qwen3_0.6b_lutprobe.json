@@ -1,9 +1,13 @@
 {
   "_comment": [
-    "0.6B LUT PROBE -- a diagnostic, not a product. Byte-for-byte the working",
-    "genie_dialog_qwen3_0.6b.json except for the `embedding` block and the",
-    "ctx-bin name, so any behaviour difference on device is attributable to the",
-    "external-LUT feed path and nothing else.",
+    "0.6B LUT PROBE -- a diagnostic, not a product. The ctx-bin is built on the",
+    "SHIPPING model's ladekv recipe, so its graphs are shape-identical to the",
+    "device-proven 44.707 tok/s build: prefill mask [1,128,640] past [1,8,128,512],",
+    "decode mask [1,1,640] past [1,8,128,639]. The ONLY difference is that the",
+    "first input is inputs_embeds instead of input_ids -- i.e. the external-LUT",
+    "feed. verify32 is omitted: it exists for LADE, which is parked as a 30%",
+    "regression and unused in basic mode, so it would cost an export while",
+    "changing nothing this probe measures.",
     "",
     "embedding.size is the HIDDEN dim (Dialog.cpp:190 maps it to context.n-embd,",
     "and LUT.cpp strides by n_embd) -- 1024 for Qwen3-0.6B. context.size is the",
@@ -67,7 +71,7 @@
         "binary": {
           "version": 1,
           "ctx-bins": [
-            "qwen3-0.6b-w8a16-lutprobe_ctx.bin"
+            "qwen3-0.6b-w8a16-lutprobe-ladekv_ctx.bin"
           ]
         },
         "positional-encoding": {
