@@ -62,9 +62,25 @@ REQUANT_TABLE = {
     "QNN_DATATYPE_SFIXED_POINT_16": {"QNN_DATATYPE_SFIXED_POINT_8",
                                      "QNN_DATATYPE_SFIXED_POINT_16"},
 }
-# quantizeInput's switch (nsp-model.cpp:3120-3155), i.e. the float32 fast path
+# quantizeInput's switch (nsp-model.cpp:3120-3155), i.e. the float32 fast path.
+# FLOAT_16 is deliberately NOT here -- see FLOAT32_BROKEN_DESTINATIONS.
 FLOAT32_DESTINATIONS = {"QNN_DATATYPE_UFIXED_POINT_8", "QNN_DATATYPE_UFIXED_POINT_16",
-                        "QNN_DATATYPE_FLOAT_16", "QNN_DATATYPE_FLOAT_32"}
+                        "QNN_DATATYPE_FLOAT_32"}
+# quantizeInput HAS a FLOAT_16 case, so this pair looks supported and this lint
+# used to pass it. It is not: the case advances its destination pointer by
+# tensorOffset BYTES --
+#     case QNN_DATATYPE_FLOAT_16:
+#       float32ToFloat16(reinterpret_cast<uint8_t*>(getBuffer(t)) + tensorOffset, in, len);
+# -- while the other three advance by ELEMENTS (uint8_t*/uint16_t*/float* + off),
+# and setupInputEmbeddings (nsp-model.cpp:1807-1814) passes an ELEMENT count
+# (i * m_embd_size) when padding a partially-filled chunk with the pad/EOS
+# embedding. The pad write therefore starts at byte n_process*n_embd instead of
+# n_process*n_embd*2 -- halfway into the real prompt -- and overwrites its back
+# half. Fires only when variant > n_process, i.e. the LAST, partial prefill
+# chunk: exactly the tokens the next prediction leans on hardest. Decode
+# (variant == n_process == 1) is untouched, which is why a model can look fine
+# on short single-token probes and still produce garbage from a real prompt.
+FLOAT32_BROKEN_DESTINATIONS = {"QNN_DATATYPE_FLOAT_16"}
 # ufixed4 is the one case that raises instead of falling through
 THROWS_INSTEAD_OF_SILENCE = {"QNN_DATATYPE_UFIXED_POINT_4"}
 
@@ -72,9 +88,20 @@ THROWS_INSTEAD_OF_SILENCE = {"QNN_DATATYPE_UFIXED_POINT_4"}
 def check_pair(lut_dtype, input_dtype):
     """(ok, detail). lut_dtype/input_dtype are QNN_DATATYPE_* strings."""
     if lut_dtype == "QNN_DATATYPE_FLOAT_32":
+        if input_dtype in FLOAT32_BROKEN_DESTINATIONS:
+            return False, (
+                "float32 LUT -> FLOAT_16 input: quantizeInput's FLOAT_16 case advances "
+                "its destination by tensorOffset BYTES while setupInputEmbeddings "
+                "passes ELEMENTS, so padding a partially-filled prefill chunk "
+                "overwrites the back half of the real prompt (nsp-model.cpp:3144 vs "
+                ":1813). Graft a 16-bit INT activation encoding onto the tensor so the "
+                "converter types it uFxp_16 -- scripts/quant/graft_input_encoding.py. "
+                "Do NOT use --preserve_io_datatype: it pins the input to float32 and "
+                "the converter emits a QNN_Convert that graph-prepare cannot create.")
         if input_dtype in FLOAT32_DESTINATIONS:
             return True, ("float32 LUT bypasses requantEmbedding; "
-                          "quantizeInput (nsp-model.cpp:3120) handles this input dtype")
+                          "quantizeInput (nsp-model.cpp:3120) handles this input dtype "
+                          "with element-offset arithmetic")
         return False, (f"float32 LUT but quantizeInput has no case for {input_dtype} "
                        "(nsp-model.cpp:3120-3155)")
     supported = REQUANT_TABLE.get(lut_dtype)

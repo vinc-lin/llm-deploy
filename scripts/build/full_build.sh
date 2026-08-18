@@ -26,17 +26,17 @@ MODEL=${MODEL:-$LLMDEPLOY_DATA/models/Qwen3-0.6B}   # override: MODEL=.../Qwen3-
 # drive as token ids (nsp-model.cpp:668 matches the name literally).
 EMBEDS=0
 for f in "$@"; do [ "$f" = "--input-embeds" ] && EMBEDS=1; done
-# An embeddings-fed graph MUST keep inputs_embeds at FLOAT_32. Genie fills it
-# from the float32 LUT, and its only implemented float path is fp32 lut -> fp32
-# input: dialog.cpp:678 moves the raw fp32 bytes in unconverted, and basic.cpp:161
-# (the fp32->fp16 case) is an empty `// TODO` that writes nothing. Under a bare
-# --float_bitwidth 16 the input lands FLOAT_16 and the tower is fed reinterpreted
-# bytes -- the 2026-08-15 text-garbage defect. On by default so the bug cannot be
-# rebuilt by accident; EMBEDS_FP16_IN=1 reproduces the broken control on purpose.
-PRES=()
-if [ "$EMBEDS" = "1" ] && [ -z "${EMBEDS_FP16_IN:-}" ]; then
-    PRES=(--preserve_io_datatype inputs_embeds)
-fi
+# An embeddings-fed inputs_embeds must NOT land FLOAT_16. Genie fills it from the
+# float32 LUT and then calls quantizeInput, whose tensorOffset is an ELEMENT
+# offset for UFIXED_8/16 and FLOAT_32 but a BYTE offset for FLOAT_16 -- so the
+# pad fill of a partially-filled prefill chunk writes halfway into the real
+# prompt and overwrites its back half (the 2026-08-15 text-garbage defect).
+# Giving the tensor a 16-bit INT activation encoding makes the converter type it
+# uFxp_16, the correct branch. See scripts/quant/graft_input_encoding.py.
+# On by default so the defect cannot be rebuilt by accident; EMBEDS_FP16_IN=1
+# reproduces the broken control on purpose.
+GRAFT_EMBEDS=0
+if [ "$EMBEDS" = "1" ] && [ -z "${EMBEDS_FP16_IN:-}" ]; then GRAFT_EMBEDS=1; fi
 QP=$LLMDEPLOY_DATA/work/quant/$NAME-prefill
 QD=$LLMDEPLOY_DATA/work/quant/$NAME-decode
 DLC=$LLMDEPLOY_DATA/work/dlc/$NAME
@@ -50,7 +50,7 @@ TOTAL=$((PAST + 1))
 # when its outputs are already on disk -- same idiom (and same FORCE_EXPORT
 # escape) as ladekv_build.sh, and the same reason: re-deriving a byte-identical
 # artifact costs ~20 min and buys nothing. This is what makes a converter-flag
-# change (e.g. --preserve_io_datatype) a cheap re-convert instead of a rebuild.
+# change (e.g. grafting an I/O encoding) a cheap re-convert instead of a rebuild.
 if [[ -f "$QP/model_renamed.onnx" && -f "$QD/model_renamed.onnx" && -z "${FORCE_EXPORT:-}" ]]; then
   echo "== [1-4/7] SKIP quantize+rename ($QD/model_renamed.onnx exists; FORCE_EXPORT=1 to redo) =="
   ENC=$QP/model_filtered_renamed.encodings
@@ -90,6 +90,13 @@ $PY "$LLMDEPLOY_ROOT/scripts/quant/rename_aimet_io.py" \
 ENC=$QP/model_filtered_renamed.encodings
 fi
 
+if [ "$GRAFT_EMBEDS" = "1" ]; then
+    echo "== [4b/7] graft the inputs_embeds activation encoding (uFxp_16 I/O) =="
+    $PY "$LLMDEPLOY_ROOT/scripts/quant/graft_input_encoding.py" \
+        --encodings "$ENC" --tensor inputs_embeds \
+        --lut "${LUT_DIR:-$LLMDEPLOY_DATA/work/lut/qwen3-0.6b}"
+fi
+
 # Hidden size read from the checkpoint rather than hardcoded: the same probe
 # should work for 1.7B without editing this script.
 HID=$($PY -c "import json,sys; print(json.load(open('$MODEL/config.json'))['hidden_size'])")
@@ -106,7 +113,7 @@ echo "== [5/7] convert prefill -> DLC =="
 mkdir -p "$DLC"
 $PY_QAIRT "$CONVERTER" --input_network "$QP/model_renamed.onnx" \
     --output_path "$DLC/prefill.dlc" --quantization_overrides "$ENC" \
-    --float_bitwidth 16 --target_backend HTP "${PRES[@]}" \
+    --float_bitwidth 16 --target_backend HTP \
     "${IN0_P[@]}" -d attention_mask "1,$CL,$CL" \
     -d position_ids_cos "1,$CL,64" -d position_ids_sin "1,$CL,64"
 
@@ -119,7 +126,7 @@ for i in $(seq 0 27); do
 done
 $PY_QAIRT "$CONVERTER" --input_network "$QD/model_renamed.onnx" \
     --output_path "$DLC/decode.dlc" --quantization_overrides "$ENC" \
-    --float_bitwidth 16 --target_backend HTP "${PRES[@]}" "${DIMS[@]}"
+    --float_bitwidth 16 --target_backend HTP "${DIMS[@]}"
 
 disk_guard
 echo "== [7/7] two-graph ctx-bin (vtcm 16, unsigned PD, v81) =="

@@ -111,28 +111,41 @@ convert() {
                    -d "past_value_${i}_in" "1,$NKV,$past,$HEAD_DIM")
         done
     fi
-    # Shard 0 owns inputs_embeds, which Genie fills from the float32 LUT. Under a
-    # bare --float_bitwidth 16 that input lands FLOAT_16, and NOTHING converts the
-    # fp32 LUT bytes down to it: qualla's only implemented float path is
-    # FLOAT_32 lut -> FLOAT_32 input. dialog.cpp:678 moves the raw fp32 bytes
-    # straight in ("decoderInput = std::move(encoderOutput)"), and basic.cpp:161
-    # -- the fp32->fp16 case -- is an empty `// TODO` whose body is commented out,
-    # so it silently writes nothing at all. Neither errors. That is the 2026-08-15
-    # text-garbage defect. --preserve_io_datatype keeps the network input FLOAT_32
-    # and lets the converter insert its own Convert op to the fp16 interior, which
-    # is what the runtime already assumes. Applied ONLY to inputs_embeds:
-    # deepstack_* are written by the image path, which has real FLOAT_16 handling
-    # (nsp-image-model.cpp:547/899/982), and that path is device-proven in v4.
-    local pres=()
-    [ "$first" = "1" ] && pres=(--preserve_io_datatype inputs_embeds)
-    [ -n "${EMBEDS_FP16_IN:-}" ] && pres=()   # escape hatch: rebuild the BROKEN control
     disk_guard 20
-    echo "== convert $graph (S=$seq, past=$past, layers $start-$((end - 1)))${pres:+ [inputs_embeds fp32]} =="
+    echo "== convert $graph (S=$seq, past=$past, layers $start-$((end - 1))) =="
     $PY_QAIRT "$CONVERTER" --input_network "$ONNX/$graph/$graph.onnx" \
         --output_path "$DLC/$graph.dlc" \
         --quantization_overrides "$ENCDIR/chunk$chunk.encodings" \
-        --float_bitwidth 16 --target_backend HTP "${pres[@]}" "${args[@]}"
+        --float_bitwidth 16 --target_backend HTP "${args[@]}"
 }
+
+# Shard 0 owns inputs_embeds, which Genie fills from the float32 LUT (and, for a
+# VL tower, from spliced image features). With no encoding on that tensor the
+# converter types it FLOAT_16, and quantizeInput's FLOAT_16 case advances its
+# destination by tensorOffset BYTES while setupInputEmbeddings passes ELEMENTS --
+# so padding a partially-filled prefill chunk overwrites the back half of the real
+# prompt. Grafting a 16-bit INT activation encoding types it uFxp_16 instead,
+# which is the correct element-offset branch and is HTP-native. This is the same
+# mechanism that gives the ViT its UFIXED_16 I/O; see vit_build_quant.sh's header,
+# which also explains why --preserve_io_datatype is NOT the way (it pins I/O to
+# float32 and the converter then emits a QNN_Convert the backend cannot create).
+#
+# RANGE: inputs_embeds carries BOTH text-LUT rows and image embeddings, so the
+# encoding must cover both. Point EMBED_COVER_JSON/EMBED_COVER_NAME at the vision
+# tower's output encoding, or set EMBED_MIN/EMBED_MAX outright. Covering only the
+# LUT would clip every image feature that falls outside the text range.
+if [ -z "${EMBEDS_FP16_IN:-}" ]; then
+    echo "== graft the inputs_embeds activation encoding into chunk0 (uFxp_16 I/O) =="
+    GRAFT=("$LLMDEPLOY_ROOT/scripts/quant/graft_input_encoding.py"
+           --encodings "$ENCDIR/chunk0.encodings" --tensor inputs_embeds)
+    [ -n "${EMBED_LUT_DIR:-$LLMDEPLOY_DATA/work/lut/qwen3vl-4b}" ] &&
+        GRAFT+=(--lut "${EMBED_LUT_DIR:-$LLMDEPLOY_DATA/work/lut/qwen3vl-4b}")
+    [ -n "${EMBED_COVER_JSON:-}" ] && GRAFT+=(--cover-json "$EMBED_COVER_JSON"
+                                              --cover-name "${EMBED_COVER_NAME:?}")
+    [ -n "${EMBED_MIN:-}" ] && GRAFT+=(--min "$EMBED_MIN")
+    [ -n "${EMBED_MAX:-}" ] && GRAFT+=(--max "$EMBED_MAX")
+    "$PY_DEPLOY" "${GRAFT[@]}"
+fi
 
 echo "== prefill flavour: past=$PREFILL_PAST, mask total=$P_TOTAL, deepstack suffix='${DSP_SUFFIX:-<none>}' =="
 convert prefill_0 "$CL" "$PREFILL_PAST" 1 0       "$SPLIT" 0 "$P_TOTAL"
