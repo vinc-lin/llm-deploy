@@ -151,14 +151,20 @@ for f in "${CONFIGS[@]}"; do cp "$LLMDEPLOY_ROOT/configs/$f" "$OUT/"; done
 # note itself can become visible. Licence/base-model tags belong in the root
 # README (docs/HF_HUB_README_qwen3vl.md), which is where they are.
 cp "$LLMDEPLOY_ROOT/docs/BUNDLE_README_qwen3vl_4b_e2e.md" "$OUT/README.md"
-# v4 entry point: the resolved image-crash mechanism, the fp32 blob contract,
-# and the current test matrix. Supersedes the blob instructions elsewhere.
+# The v4 doc set, three files with non-overlapping roles. Overlap is not a
+# style question here: v3 shipped five documents that each restated the image
+# blob contract, and the device team followed a stale copy. Entry point ->
+# procedure -> reference, each stating a fact exactly once.
+#   V4_CHANGES     why v4 differs from v3 (the fp32 mechanism), what to read next
+#   SESSION_RUNBOOK the ordered procedure V1..V5, outcomes, what to collect
+#   OPERATOR_GUIDE  reference: manifest, install, metrics, pass/fail, triage
+# DEVICE_TEST.md and IMAGE_PROBE.md are deliberately NOT shipped in v4 -- the
+# first is superseded by the runbook, the second probes a theory correction #35
+# disproves, and shipping it invites running dead experiments. Both remain in
+# the repo as the diagnostic record; V4_CHANGES §5 tells the operator that.
 cp "$LLMDEPLOY_ROOT/docs/BUNDLE_V4_CHANGES_qwen3vl.md" "$OUT/V4_CHANGES.md"
-cp "$LLMDEPLOY_ROOT/docs/DEVICE_TEST_qwen3vl_e2e.md" "$OUT/DEVICE_TEST.md"
-# Single entry point for the device operator: usage, ordered test procedure,
-# the metric definitions to use verbatim, and a fill-in results table. The
-# other two docs go deeper; this one is runnable on its own.
-cp "$LLMDEPLOY_ROOT/docs/BUNDLE_OPERATOR_GUIDE_qwen3vl_4b_v3.md" "$OUT/OPERATOR_GUIDE.md"
+cp "$LLMDEPLOY_ROOT/docs/DEVICE_SESSION_RUNBOOK_qwen3vl_v4.md" "$OUT/SESSION_RUNBOOK.md"
+cp "$LLMDEPLOY_ROOT/docs/BUNDLE_OPERATOR_GUIDE_qwen3vl_4b_v4.md" "$OUT/OPERATOR_GUIDE.md"
 if [ -d "$KIT" ] && compgen -G "$KIT/wx_*.raw" >/dev/null; then
     cp "$KIT"/wx_*.{raw,json,jpg,script} "$KIT/TEST_IMAGES.md" "$OUT/"
     echo "   test kit: $(ls "$KIT"/wx_*.raw | wc -l) image(s) from $KIT"

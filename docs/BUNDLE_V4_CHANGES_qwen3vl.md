@@ -1,10 +1,8 @@
-# v4 — what changed and what to run
+# v4 — what changed and why
 
-**Read this first. It supersedes the image-blob instructions in every other
-document in this bundle.** v3's OPERATOR_GUIDE / SESSION_RUNBOOK / IMAGE_PROBE
-remain included as the historical record of how the crash was diagnosed, but
-where they tell you to feed `sample_image.raw` (a UFixed16 blob), that
-instruction is exactly the bug v4 fixes — do not follow it.
+**Start here, then run `SESSION_RUNBOOK.md`.** This document explains what is
+different in v4 and why; the runbook is the ordered procedure, and
+`OPERATOR_GUIDE.md` is the full reference (metrics, triage, limitations).
 
 v4 ships **the same three ctx-bins and the same LUT as v3** — no tower was
 rebuilt. Both v3 failures traced to the *interface* files around them:
@@ -45,7 +43,7 @@ buffer. That mechanism reproduces every observation you reported:
 (`[1024,1536]` fp32 = 6,291,456 B payload + 4,096 B inert pad = **6,295,552 B**).
 Genie now reads exactly the payload and performs on device the same
 quantization the host used to do — against the ctx-bin's own encoding, which
-the bundle lint verifies.
+the bundle lint verifies (host and device blobs agree to 0 LSB).
 
 **The `*_u16.raw` files are NOT pipeline inputs.** They are exact tensor bytes
 (3,145,728 B, unpadded) for `qnn-net-run` triage only — the T5 flow. Feeding
@@ -54,28 +52,16 @@ one to `node set image` reproduces the v3 SIGSEGV byte for byte. The rename to
 directory can never be fed by accident: **delete old `sample_image.raw` and
 `wx_*.raw` files from the device before running v4.**
 
-## 2. What to run — image (V-tests, in order)
+## 2. What to run
 
-Same environment as v3 (`LD_LIBRARY_PATH=.`, all files flat in one directory).
+Full procedure in `SESSION_RUNBOOK.md`. In short: **V1 text-only first**, then
+V2 image, then V3 kit.
 
-* **V1 — the headline test.** `./genie-app -s genie_pipeline_qwen3vl.script`
-  This is the exact sequence that crashed in v3, with only the blob format
-  changed. Expected: no SIGSEGV; a caption is emitted.
-  * If it emits a *coherent* caption: end-to-end image+text is working; go
-    straight to V3.
-  * If it emits a *garbage* caption but does not crash: the image blocker is
-    fixed and the remaining fault is the same open text issue as §3 — report
-    both, that is still major progress.
-  * If it still SIGSEGVs: capture the tombstone; confirm the fed file is
-    `sample_image_fp32.raw` at 6,295,552 bytes (`ls -l`), and that no stale
-    blob shadowed it.
-* **V2 — text retest** (§3): `./genie-t2t-run -c genie_dialog_qwen3vl_4b.json`
-  with the same prompt as v3's T1. The configs changed; compare output
-  against T1's garbage.
-* **V3 — the weather kit.** `./genie-app -s wx_<scene>.script` per image;
-  compare captions against TEST_IMAGES.md (semantic agreement, not wording).
-* **Fallback** unchanged: if the primary script fails at *load*,
-  `genie_pipeline_qwen3vl_decodeonly.script` (slow prefill, same output).
+V1 runs first for a reason that changes how the session is read: if the text
+tower still emits garbage, **V2 and V3 will produce garbage captions even with
+a perfectly working image path**, and V2's pass criterion becomes
+*no SIGSEGV* alone. Judging a caption without knowing V1's result will produce
+a wrong conclusion about the image path.
 
 ## 3. The text issue: status honest and current
 
@@ -85,15 +71,15 @@ value prepended a spurious `<|endoftext|>` before the chat template on every
 has no BOS). Also added: explicit `n-embd: 2560` and `pad-token: 151643`,
 matching the SDK's own working Qwen3 LUT config.
 
-What v4 does **not** claim: that this explains T1's garbage. A bad BOS
-degrades; it rarely garbles. The embedding chain (LUT stride → fp32 feed →
-fp32→fp16 staging) was audited end-to-end against the SDK source and is
-coherent, so the remaining suspects are the ctx-bin conversion numerics (the
-one hop no host gate covers) or a shipped-libGenie divergence from the
-example source. V2's result decides the next step; if still garbage, the next
-kit will carry a `qnn-net-run` harness for the *text* decode graph — same
-method that vindicated the ViT in T5 — to split converter numerics from Genie
-runtime behavior.
+What v4 does **not** claim: that this explains the garbage. A bad BOS degrades;
+it rarely garbles. The embedding chain (LUT stride → fp32 feed → fp32→fp16
+staging) was audited end-to-end against the SDK source and is coherent, so the
+remaining suspects are the ctx-bin conversion numerics (the one hop no host
+gate covers) or a shipped-libGenie divergence from the example source. V1's
+result decides the next step; if still garbage, the next kit will carry a
+`qnn-net-run` harness for the *text* decode graph — the same method that
+vindicated the ViT in T5 — to split converter numerics from Genie runtime
+behaviour.
 
 ## 4. Files: changed vs identical
 
@@ -115,18 +101,35 @@ sidecars, `sample_image.png`, `wx_*.jpg`.
 `genie_text_generator_qwen3vl_4b.json`,
 `genie_text_generator_qwen3vl_4b_decodeonly.json` (context blocks),
 both `genie_pipeline_qwen3vl*.script` (blob name + comments),
-`wx_*.script`, `TEST_IMAGES.md`, this file, doc updates.
+`wx_*.script`, `TEST_IMAGES.md`, `README.md`.
 
 **New:** `sample_image_fp32.raw` + `sample_image_fp32.json` +
 `sample_image_u16.raw`, and per kit image `wx_*_fp32.raw` + `wx_*_fp32.json` +
-`wx_*_u16.raw`.
+`wx_*_u16.raw`. Plus this file and a rewritten `OPERATOR_GUIDE.md` /
+`SESSION_RUNBOOK.md`.
 
 **Gone (delete on device):** `sample_image.raw`, `sample_image.json`,
 `wx_*.raw`, `wx_*.json` from v3.
 
-## 5. What to report back
+## 5. Documents in this bundle
 
-Per test: the command, full stdout/stderr, and for V1/V3 the caption text
-verbatim. On any crash: the tombstone (signal line, fault address, `ls -l` of
-every `.raw` in the directory). For V2: the generated text plus the four
-profile JSONs, same as T1.
+| File | Role |
+|---|---|
+| `V4_CHANGES.md` | this file — what changed since v3 and why |
+| `SESSION_RUNBOOK.md` | **the ordered procedure** — V1…V5, outcomes, what to collect |
+| `OPERATOR_GUIDE.md` | full reference — manifest, install, metric definitions, pass/fail, triage, limitations |
+| `TEST_IMAGES.md` | per-image expected captions for the weather kit |
+| `README.md` | bundle landing page and file manifest |
+
+**Two v3 documents were removed rather than updated:** `DEVICE_TEST.md`
+(superseded by the runbook + operator guide) and `IMAGE_PROBE.md` (a probe
+protocol for the padding theory that §1 disproves — keeping it would invite
+running dead experiments). Their diagnostic content is preserved in the
+project's repository history.
+
+## 6. What to report back
+
+Per test: the command, full stdout/stderr, and the generated text verbatim —
+**including garbage output**, which is data. On any crash: the tombstone
+(signal line, fault address) and `ls -l *.raw`. Full list in
+`SESSION_RUNBOOK.md`.
