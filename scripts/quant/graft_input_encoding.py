@@ -41,9 +41,12 @@ RANGE
 -----
 The encoding has to cover every value that will ever arrive in the tensor. For a
 text-only tower that is exactly the LUT (--lut). For a VL tower the same tensor
-also carries spliced image embeddings, so union in the vision tower's output
-encoding as well (--cover-json/--cover-name), or state the range outright
-(--min/--max).
+also carries spliced image embeddings, so union in the vision tower's own output
+encoding as well: --cover-ctxbin-info <vit>/info.json reads it straight out of the
+built ViT bin. That is not merely safe, it is the target -- when the two
+encodings match exactly, Genie's image splice hits the requantScale==1 &&
+requantOffset==0 fast path and copies instead of rescaling. Or state the range
+outright with --min/--max.
 
 Idempotent: re-running leaves an existing entry for the tensor alone unless
 --force is given.
@@ -69,6 +72,41 @@ def lut_range(lut_dir: Path):
     return float(a.min()), float(a.max())
 
 
+def ctxbin_range(info_path: Path, name: str):
+    """Range of a tensor in a built ctx-bin, from its own scale/offset.
+
+    For a VL tower this is how you cover the image features: point it at the
+    vision ctx-bin's `image_features` output. Matching that encoding exactly is
+    not just safe, it is desirable -- Genie's splice then hits the
+    requantScale==1 && requantOffset==0 fast path and copies instead of
+    rescaling.
+
+    The key is `quantizeParams.scaleOffset`, NOT `scaleOffsetEncoding`; these
+    names are not guessable and the wrong one silently reads None.
+    """
+    doc = json.loads(info_path.read_text())
+    found = {}
+
+    def walk(o):
+        if isinstance(o, dict):
+            i = o.get("info", o)
+            if i.get("name") == name:
+                so = (i.get("quantizeParams") or {}).get("scaleOffset") or {}
+                if so.get("scale") is not None:
+                    found["s"], found["o"] = so["scale"], so["offset"]
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(doc)
+    if "s" not in found:
+        raise SystemExit(f"no quantized tensor named {name!r} in {info_path}")
+    s, o = float(found["s"]), int(found["o"])
+    return o * s, (QMAX + o) * s
+
+
 def encoding_range(enc_path: Path, name: str):
     """Reconstruct [min,max] from an existing asymmetric entry in an encodings file."""
     entries = json.loads(enc_path.read_text())
@@ -88,6 +126,10 @@ def main():
     ap.add_argument("--lut", type=Path, help="LUT dir to take the range from")
     ap.add_argument("--cover-json", type=Path, help="also cover this encodings file's...")
     ap.add_argument("--cover-name", help="...entry for this tensor (e.g. the ViT output)")
+    ap.add_argument("--cover-ctxbin-info", type=Path,
+                    help="also cover a tensor in a built ctx-bin's info.json")
+    ap.add_argument("--cover-ctxbin-tensor", default="image_features",
+                    help="which tensor in --cover-ctxbin-info (default: image_features)")
     ap.add_argument("--min", type=float, dest="vmin")
     ap.add_argument("--max", type=float, dest="vmax")
     ap.add_argument("--out", type=Path, help="default: in place")
@@ -127,6 +169,11 @@ def main():
         print(f"covering {args.cover_name}: [{clo:.6f}, {chi:.6f}]")
         lo = clo if lo is None else min(lo, clo)
         hi = chi if hi is None else max(hi, chi)
+    if args.cover_ctxbin_info:
+        blo, bhi = ctxbin_range(args.cover_ctxbin_info, args.cover_ctxbin_tensor)
+        print(f"covering {args.cover_ctxbin_tensor}: [{blo:.6f}, {bhi:.6f}]")
+        lo = blo if lo is None else min(lo, blo)
+        hi = bhi if hi is None else max(hi, bhi)
     if args.vmin is not None:
         lo = args.vmin if lo is None else min(lo, args.vmin)
     if args.vmax is not None:

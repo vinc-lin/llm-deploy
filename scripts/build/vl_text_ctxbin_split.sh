@@ -130,18 +130,22 @@ convert() {
 # which also explains why --preserve_io_datatype is NOT the way (it pins I/O to
 # float32 and the converter then emits a QNN_Convert the backend cannot create).
 #
-# RANGE: inputs_embeds carries BOTH text-LUT rows and image embeddings, so the
-# encoding must cover both. Point EMBED_COVER_JSON/EMBED_COVER_NAME at the vision
-# tower's output encoding, or set EMBED_MIN/EMBED_MAX outright. Covering only the
-# LUT would clip every image feature that falls outside the text range.
+# RANGE: inputs_embeds carries BOTH text-LUT rows and spliced image features, so
+# the encoding must cover both. VIT_INFO defaults to the built vision bin's
+# info.json, whose image_features encoding is unioned in -- covering only the LUT
+# would clip every image feature outside the text range (the 4B text LUT spans
+# +-0.24 while image features span +-11.6, a 48x difference). Matching the ViT
+# encoding exactly is the goal, not a compromise: the splice then copies rather
+# than rescales. Override with EMBED_MIN/EMBED_MAX if a future ViT changes.
 if [ -z "${EMBEDS_FP16_IN:-}" ]; then
     echo "== graft the inputs_embeds activation encoding into chunk0 (uFxp_16 I/O) =="
     GRAFT=("$LLMDEPLOY_ROOT/scripts/quant/graft_input_encoding.py"
            --encodings "$ENCDIR/chunk0.encodings" --tensor inputs_embeds)
     [ -n "${EMBED_LUT_DIR:-$LLMDEPLOY_DATA/work/lut/qwen3vl-4b}" ] &&
         GRAFT+=(--lut "${EMBED_LUT_DIR:-$LLMDEPLOY_DATA/work/lut/qwen3vl-4b}")
-    [ -n "${EMBED_COVER_JSON:-}" ] && GRAFT+=(--cover-json "$EMBED_COVER_JSON"
-                                              --cover-name "${EMBED_COVER_NAME:?}")
+    VIT_INFO=${VIT_INFO:-$LLMDEPLOY_DATA/work/ctxbin/qwen3vl-4b-vit-w8a16/info.json}
+    [ -f "$VIT_INFO" ] && GRAFT+=(--cover-ctxbin-info "$VIT_INFO"
+                                  --cover-ctxbin-tensor "${VIT_OUT:-image_features}")
     [ -n "${EMBED_MIN:-}" ] && GRAFT+=(--min "$EMBED_MIN")
     [ -n "${EMBED_MAX:-}" ] && GRAFT+=(--max "$EMBED_MAX")
     "$PY_DEPLOY" "${GRAFT[@]}"
