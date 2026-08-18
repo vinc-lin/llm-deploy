@@ -221,6 +221,17 @@ v2 shipped exactly that: 36 replication ops per shard at a 4:1 head ratio.
   call it before any multi-GB step, sized to that step: 6 GB is the converter
   floor, a 4B export writes 8.6 GB and asks 20. A flat 6 GB check passes and then
   still runs C: dry mid-step.
+- **Waiting on a build: `build_wait` (in `scripts/env.sh`), never a bare `pgrep`
+  loop.** `until ! pgrep -f "full_build.sh foo"; do sleep 20; done` **never
+  exits** — `pgrep -f` matches whole command lines and the pattern sits in the
+  waiter's own, so it matches itself, and it never notices the *other* waiter on
+  the same build. Three such shells were still spinning 2h26m after their builds
+  finished (2026-08-19). Bracketing (`[f]ull_build`) does **not** fix it once the
+  pattern is an argument. `build_wait <pid>` (exact, preferred) or `build_wait
+  <pattern> [poll_s] [max_min]`; it excludes self/ancestors/other waiters, caps
+  the wait at 4 h, and returns **2** — not 0 — when nothing matched at the start,
+  so a typo'd pattern cannot read as "the build finished". Same trap in cleanup:
+  `pkill -f <pattern>` will kill your own shell.
 - The vhdx is sparse and `/` is mounted `discard`, so deleting in-guest reclaims C:
   with no compaction step (asynchronously — free space does not jump immediately).
   `ls` reports the ~448 GB virtual size and always will; `du -h <vhdx>` (no
