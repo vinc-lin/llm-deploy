@@ -15,6 +15,17 @@ shift; shift || true; shift || true
 EXTRA_FLAGS=("$@")
 
 MODEL=${MODEL:-$LLMDEPLOY_DATA/models/Qwen3-0.6B}   # override: MODEL=.../Qwen3-1.7B full_build.sh ...
+
+# --input-embeds (passed through to quantize_aimet) turns this into the LUT
+# probe build: the tower is fed pre-computed hidden states from an external LUT
+# instead of token ids, which is the Qwen3-VL feed shape on a model that is
+# known-good on device. Detected here the same way --quant-head is, because it
+# has to change TWO later stages as well -- the I/O rename and the converter's
+# input dims -- and a flag that only reached the quantizer would silently build
+# a graph whose first input is still called input_ids, which qualla would then
+# drive as token ids (nsp-model.cpp:668 matches the name literally).
+EMBEDS=0
+for f in "$@"; do [ "$f" = "--input-embeds" ] && EMBEDS=1; done
 QP=$LLMDEPLOY_DATA/work/quant/$NAME-prefill
 QD=$LLMDEPLOY_DATA/work/quant/$NAME-decode
 DLC=$LLMDEPLOY_DATA/work/dlc/$NAME
@@ -45,11 +56,28 @@ done
 $PY "$LLMDEPLOY_ROOT/scripts/quant/filter_aimet_w8a16.py" "$QP/model.encodings" "${HEAD_FLAG[@]}"
 
 echo "== [4/7] canonical I/O rename =="
+# --vl-text is the "first input is inputs_embeds" switch; n-deepstack 0 because
+# a plain Qwen3 tower has no deepstack inputs. The name is the contract.
+RENAME_FLAGS=()
+[ "$EMBEDS" = "1" ] && RENAME_FLAGS=(--vl-text --n-deepstack 0)
 $PY "$LLMDEPLOY_ROOT/scripts/quant/rename_aimet_io.py" \
-    --model "$QP/model.onnx" --encodings "$QP/model_filtered.encodings" --layers 28
+    --model "$QP/model.onnx" --encodings "$QP/model_filtered.encodings" --layers 28 \
+    "${RENAME_FLAGS[@]}"
 $PY "$LLMDEPLOY_ROOT/scripts/quant/rename_aimet_io.py" \
-    --model "$QD/model.onnx" --encodings "$QP/model_filtered.encodings" --layers 28 --with-past
+    --model "$QD/model.onnx" --encodings "$QP/model_filtered.encodings" --layers 28 --with-past \
+    "${RENAME_FLAGS[@]}"
 ENC=$QP/model_filtered_renamed.encodings
+
+# Hidden size read from the checkpoint rather than hardcoded: the same probe
+# should work for 1.7B without editing this script.
+HID=$($PY -c "import json,sys; print(json.load(open('$MODEL/config.json'))['hidden_size'])")
+if [ "$EMBEDS" = "1" ]; then
+    IN0_P=(-d inputs_embeds "1,1,$CL,$HID")
+    IN0_D=(-d inputs_embeds "1,1,1,$HID")
+else
+    IN0_P=(-d input_ids "1,$CL")
+    IN0_D=(-d input_ids "1,1")
+fi
 
 disk_guard
 echo "== [5/7] convert prefill -> DLC =="
@@ -57,12 +85,12 @@ mkdir -p "$DLC"
 $PY_QAIRT "$CONVERTER" --input_network "$QP/model_renamed.onnx" \
     --output_path "$DLC/prefill.dlc" --quantization_overrides "$ENC" \
     --float_bitwidth 16 --target_backend HTP \
-    -d input_ids "1,$CL" -d attention_mask "1,$CL,$CL" \
+    "${IN0_P[@]}" -d attention_mask "1,$CL,$CL" \
     -d position_ids_cos "1,$CL,64" -d position_ids_sin "1,$CL,64"
 
 disk_guard
 echo "== [6/7] convert decode -> DLC (single source of truth: prefill encodings) =="
-DIMS=(-d input_ids "1,1" -d attention_mask "1,1,$TOTAL"
+DIMS=("${IN0_D[@]}" -d attention_mask "1,1,$TOTAL"
       -d position_ids_cos "1,1,64" -d position_ids_sin "1,1,64")
 for i in $(seq 0 27); do
   DIMS+=(-d "past_key_${i}_in" "1,8,128,$PAST" -d "past_value_${i}_in" "1,8,$PAST,128")

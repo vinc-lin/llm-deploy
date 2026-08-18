@@ -1,0 +1,81 @@
+{
+  "_comment": [
+    "0.6B LUT PROBE -- a diagnostic, not a product. Byte-for-byte the working",
+    "genie_dialog_qwen3_0.6b.json except for the `embedding` block and the",
+    "ctx-bin name, so any behaviour difference on device is attributable to the",
+    "external-LUT feed path and nothing else.",
+    "",
+    "embedding.size is the HIDDEN dim (Dialog.cpp:190 maps it to context.n-embd,",
+    "and LUT.cpp strides by n_embd) -- 1024 for Qwen3-0.6B. context.size is the",
+    "CONTEXT LENGTH, 512 here. For this model both numbers are small and easily",
+    "confused; for Qwen3-VL-4B they are 2560 and 2048, plainly different. Do not",
+    "'fix' one to match the other."
+  ],
+  "dialog": {
+    "version": 1,
+    "type": "basic",
+    "context": {
+      "version": 1,
+      "size": 512,
+      "n-vocab": 151936,
+      "bos-token": -1,
+      "eos-token": [
+        151645,
+        151643
+      ]
+    },
+    "sampler": {
+      "version": 1,
+      "seed": 42,
+      "temp": 0.0,
+      "top-k": 1,
+      "top-p": 1.0
+    },
+    "tokenizer": {
+      "version": 1,
+      "path": "tokenizer.json"
+    },
+    "embedding": {
+      "version": 1,
+      "type": "lut",
+      "lut-path": "embedding_float32_lut.bin",
+      "size": 1024,
+      "datatype": "float32"
+    },
+    "engine": {
+      "version": 1,
+      "n-threads": 3,
+      "backend": {
+        "version": 1,
+        "type": "QnnHtp",
+        "QnnHtp": {
+          "version": 1,
+          "use-mmap": true,
+          "spill-fill-bufsize": 0,
+          "mmap-budget": 25,
+          "poll": true,
+          "cpu-mask": "0xe0",
+          "kv-dim": 128,
+          "allow-async-init": true,
+          "enable-graph-switching": true
+        },
+        "extensions": "htp_backend_ext_config.json"
+      },
+      "model": {
+        "version": 1,
+        "type": "binary",
+        "binary": {
+          "version": 1,
+          "ctx-bins": [
+            "qwen3-0.6b-w8a16-lutprobe_ctx.bin"
+          ]
+        },
+        "positional-encoding": {
+          "type": "rope",
+          "rope-dim": 64,
+          "rope-theta": 1000000
+        }
+      }
+    }
+  }
+}

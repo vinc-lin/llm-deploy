@@ -59,8 +59,14 @@ EVAL_PROMPTS = ["The capital of France is", "def fibonacci(n):",
                 "解释一下什么是注意力机制。", "1+2+3+...+100 ="]
 
 
-def text_batches(tok, cfg, prompts, S, device):
+def text_batches(tok, cfg, prompts, S, device, embed=None):
     """(input_ids, attention_mask, cos, sin) windows for the plain text tower.
+
+    `embed` (an nn.Embedding) switches the first element to `inputs_embeds`
+    [1, 1, S, H]. Calibration MUST see the hidden states the runtime will
+    actually feed: with embeddings-in the graph has no embedding table, so
+    calibrating on token ids would leave the input quantizer with ranges for a
+    tensor that never arrives.
 
     The prompt is RIGHT-aligned in the S-slot window and the pad columns are
     masked out -- unchanged from the original inline construction, which lived
@@ -79,7 +85,16 @@ def text_batches(tok, cfg, prompts, S, device):
         cmask[:, :, : S - n] = -100.0
         pos = torch.cat([torch.zeros(S - n, dtype=torch.long), torch.arange(n)])
         c, s_ = rope_tables(pos, cfg.head_dim, rope_theta_of(cfg))
-        batches.append(((padded, cmask, c.to(device), s_.to(device)), S, p))
+        first = padded
+        if embed is not None:
+            # Look up on the TABLE's device, not the calibration device: the
+            # checkpoint stays on CPU while the sim may be on CUDA, and moving a
+            # 622 MB fp32 table onto an 8 GB card to index it would be pure
+            # waste even where it fits.
+            with torch.no_grad():
+                ids = padded.detach().to(embed.weight.device, torch.long)
+                first = embed(ids).unsqueeze(1).to(device)          # [1,1,S,H]
+        batches.append(((first, cmask, c.to(device), s_.to(device)), S, p))
     return batches
 
 
@@ -286,6 +301,15 @@ def main():
                          "(saves ~155MB/token of decode DDR stream)")
     ap.add_argument("--fuse-gate-up", action="store_true")
     ap.add_argument("--fuse-qkv", action="store_true")
+    ap.add_argument("--input-embeds", action="store_true",
+                    help="plain-Qwen3 tower fed pre-computed hidden states from an "
+                         "external LUT instead of token ids -- the Qwen3-VL feed "
+                         "shape on a model that is known-good on device. Diagnostic "
+                         "only: it exists so the LUT/accumulator path can be tested "
+                         "against a working control. Pair with rename_aimet_io.py "
+                         "--vl-text --n-deepstack 0, because qualla selects "
+                         "InputType::EMBEDDINGS by matching the literal input name "
+                         "`inputs_embeds` (nsp-model.cpp:668).")
     ap.add_argument("--grouped-gqa", action="store_true",
                     help="batch the attention MatMuls over the 8 KV heads instead of "
                          "materialising 16 replicated ones. Removes the 56 Expand+Reshape "
@@ -390,6 +414,12 @@ def main():
         hf = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32)
         cfg = hf.config
     S = args.cl_prefill
+    # Embeddings-in calibration needs the table the graph no longer carries, so
+    # keep a handle on the checkpoint's own embedding layer. None otherwise, and
+    # text_batches then behaves exactly as before.
+    calib_embed = None
+    if args.input_embeds and not args.vl_text:
+        calib_embed = hf.get_input_embeddings()
 
     def build_wrapper(use_past):
         # logits_last_only MUST be False: Genie's basic dialog left-aligns input
@@ -402,7 +432,8 @@ def main():
                 grouped_gqa=args.grouped_gqa)
         return ExportQwen3.from_hf(hf, args.fuse_gate_up, args.fuse_qkv,
                                    use_past=use_past, logits_last_only=False,
-                                   grouped_gqa=args.grouped_gqa)
+                                   grouped_gqa=args.grouped_gqa,
+                                   input_embeds=args.input_embeds)
 
     def head_dummies(ar):
         """The graph inputs that bracket mask/cos/sin: the token-or-embedding
@@ -412,6 +443,8 @@ def main():
             return (torch.zeros(1, 1, ar, cfg.hidden_size, device=args.device),
                     [torch.zeros(1, 1, ar, cfg.hidden_size, device=args.device)
                      for _ in range(args.n_deepstack)])
+        if args.input_embeds:
+            return (torch.zeros(1, 1, ar, cfg.hidden_size, device=args.device), [])
         return torch.zeros(1, ar, dtype=torch.int32, device=args.device), []
 
     if args.export_decode:
@@ -492,7 +525,8 @@ def main():
                                                    args.n_deepstack, args.device, "calib")]
             print(f"calibration: {len(batches)} multimodal windows from {args.vl_calib}")
         else:
-            batches = [b for b, _, _ in text_batches(tok, cfg, CALIB_PROMPTS, S, args.device)]
+            batches = [b for b, _, _ in text_batches(
+                tok, cfg, CALIB_PROMPTS, S, args.device, embed=calib_embed)]
         if args.seq_mse:
             # Sequential MSE picks per-layer optimal weight-encoding candidates
             # by minimizing activation MSE — Qualcomm's documented make-or-break
@@ -516,7 +550,8 @@ def main():
             samples = vl_batches(args.vl_calib, cfg, S, args.n_deepstack,
                                  args.device, "eval")
         else:
-            samples = text_batches(tok, cfg, EVAL_PROMPTS, S, args.device)
+            samples = text_batches(tok, cfg, EVAL_PROMPTS, S, args.device,
+                                   embed=calib_embed)
         agree = 0
         for b, n_valid, label in samples:
             with torch.no_grad():

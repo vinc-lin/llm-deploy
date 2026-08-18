@@ -113,7 +113,10 @@ from pathlib import Path
 import numpy as np
 from safetensors import safe_open
 
-EMBED_KEY = "model.language_model.embed_tokens.weight"
+# Qwen3-VL first, then plain Qwen3 (0.6B/1.7B). Order matters only in the
+# impossible case of a checkpoint carrying both.
+EMBED_KEYS = ("model.language_model.embed_tokens.weight",
+              "model.embed_tokens.weight")
 ROW_CHUNK = 4096
 ABS_HIST_BINS = 1 << 20
 
@@ -128,16 +131,36 @@ DTYPES = {
 
 
 def resolve_key(model_dir):
-    """Find the embedding tensor's shard, refusing to guess if the name moved."""
+    """Find the embedding tensor's shard, refusing to guess if the name moved.
+
+    Two spellings are accepted, in order: the Qwen3-VL key and the plain-Qwen3
+    one. Both are named explicitly rather than pattern-matched -- a checkpoint
+    can carry several 'embed'-ish tensors and silently picking the wrong one
+    yields a LUT that is the right size and wrong content, which is
+    indistinguishable from a correct one until the model talks nonsense on
+    device (the whole failure mode this file's parity gate exists to catch).
+    """
     index_path = model_dir / "model.safetensors.index.json"
-    assert index_path.is_file(), f"no safetensors index at {index_path}"
-    weight_map = json.loads(index_path.read_text())["weight_map"]
-    if EMBED_KEY not in weight_map:
+    if index_path.is_file():
+        weight_map = json.loads(index_path.read_text())["weight_map"]
+        for key in EMBED_KEYS:
+            if key in weight_map:
+                return key, model_dir / weight_map[key]
         cand = [k for k in weight_map if "embed" in k.lower()]
         raise AssertionError(
-            f"{EMBED_KEY!r} not in {index_path}; embedding-like keys present: {cand}"
-        )
-    return EMBED_KEY, model_dir / weight_map[EMBED_KEY]
+            f"none of {EMBED_KEYS} in {index_path}; embedding-like keys: {cand}")
+    # Small checkpoints (0.6B) ship a single unsharded model.safetensors with no
+    # index file at all -- fall back to the one shard and look inside it.
+    single = model_dir / "model.safetensors"
+    assert single.is_file(), f"neither {index_path} nor {single}"
+    with safe_open(single, framework="np") as f:
+        present = set(f.keys())
+    for key in EMBED_KEYS:
+        if key in present:
+            return key, single
+    cand = [k for k in present if "embed" in k.lower()]
+    raise AssertionError(
+        f"none of {EMBED_KEYS} in {single}; embedding-like keys: {cand}")
 
 
 def chunks(n_rows):

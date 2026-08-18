@@ -319,13 +319,26 @@ class ExportQwen3(nn.Module):
 
     @staticmethod
     def from_hf(hf_model, fuse_gate_up=False, fuse_qkv=False, use_past=True, logits_last_only=False,
-                grouped_gqa=False):
+                grouped_gqa=False, input_embeds=False):
+        """Plain Qwen3 (0.6B/1.7B).
+
+        `input_embeds=True` builds the same tower fed pre-computed hidden states
+        from an external LUT instead of token ids -- the Qwen3-VL feed shape, on
+        a model that is known-good on device. That combination has no product
+        use; it exists so the LUT/accumulator path can be tested against a
+        working control instead of only inside the 4B, which is the one place it
+        has ever run and the one place it fails. See
+        docs/DEVICE_TEST_qwen3_06b_lut.md.
+        """
         cfg = hf_model.config
         m = ExportQwen3(cfg, fuse_gate_up, fuse_qkv, use_past, logits_last_only,
-                        grouped_gqa=grouped_gqa)
+                        grouped_gqa=grouped_gqa, input_embeds=input_embeds)
         src = hf_model.state_dict()
         dst = {}
-        dst["embed_tokens.weight"] = src["model.embed_tokens.weight"]
+        # embed_tokens is None under input_embeds (the runtime owns the lookup),
+        # so loading it would fail strict load_state_dict.
+        if not input_embeds:
+            dst["embed_tokens.weight"] = src["model.embed_tokens.weight"]
         dst["norm.weight"] = src["model.norm.weight"]
         # 0.6B ties lm_head to embeddings; state dict may or may not carry lm_head
         dst["lm_head.weight"] = src.get("lm_head.weight", src["model.embed_tokens.weight"])
