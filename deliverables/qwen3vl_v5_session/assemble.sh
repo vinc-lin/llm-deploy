@@ -41,8 +41,13 @@ cp -r "$HERE/prompts" "$OUT/"
 # ---------------------------------------------------------------- 01 control
 echo "== 01_probe_06b_fp16in (broken control) =="
 if [ -d "$STAGE_CTRL" ]; then
-    mkdir -p "$OUT/01_probe_06b_fp16in"
-    cp -r "$STAGE_CTRL"/. "$OUT/01_probe_06b_fp16in/"
+    D=$OUT/01_probe_06b_fp16in
+    mkdir -p "$D"
+    # Hard-link rather than copy: these are the same bytes as the staging dir,
+    # and the LUT alone is 622 MB. Falls back to cp across filesystems.
+    for f in "$STAGE_CTRL"/*; do
+        ln -f "$f" "$D/$(basename "$f")" 2>/dev/null || cp "$f" "$D/"
+    done
 else
     MISSING+=("01: $STAGE_CTRL")
 fi
@@ -102,7 +107,10 @@ echo "== MANIFEST.md =="
         echo "## $b"
         echo
         # The dtype gate. 01 is the control and is SUPPOSED to fail it.
-        info=$(ls "$OUT/$b"/*info.json 2>/dev/null | head -1)
+        # A VL bundle also ships the ViT bin's info.json, which has no
+        # inputs_embeds at all -- picking it just makes the gate assert. Choose
+        # by CONTENT: the shard that actually declares the tensor.
+        info=$(grep -l '"inputs_embeds"' "$OUT/$b"/*info.json 2>/dev/null | head -1)
         if [ -n "$info" ]; then
             echo '```'
             "$PY_DEPLOY" "$LLMDEPLOY_ROOT/scripts/validate/lint_embedding_dtype.py" \
