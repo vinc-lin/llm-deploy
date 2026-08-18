@@ -36,6 +36,13 @@ pipeline create GeniePipeline pipelineConfig
 # without it setVisionParam is never called and MRoPE silently degrades to
 # plain rope for the image rows (ImageEncoder.cpp:46-47,136-138).
 # See docs/NOTES-genie-pipeline.md sections B and D.
+#
+# The IMAGE FILE, however, is FLOAT32, not UFixed16. setupInput branches on
+# the context's embedding-datatype, which defaults to FLOAT_32 and has no
+# config route for an image-encoder node -- so Genie reinterprets the file as
+# float32 and quantizes on device (nsp-image-model.cpp:501-524, 633-657).
+# Feeding the tensor-native UFixed16 blob makes that branch read 4 bytes per
+# element: a 2x over-read past the buffer = the 2026-08-15 SIGSEGV.
 node config create imageEncoderConfig genie_image_encoder_qwen3vl.json
 node create imageEncoder imageEncoderConfig
 
@@ -73,12 +80,13 @@ pipeline connect GeniePipeline lutEncoder GENIE_NODE_TEXT_ENCODER_EMBEDDING_OUTP
 # the file with rdbuf() (main.cpp:1151-1157), so real newlines survive.
 # The segment files must have NO trailing newline -- rdbuf() would include it.
 #
-# sample_image.raw is UFixed16, quantized host-side with the ViT graph's own
-# input encoding: Genie does no preprocessing, it feeds the file as an opaque
-# blob (GenieNode_setData), so the bytes must already be exactly what the
-# graph's pixel_values tensor expects.
+# sample_image_fp32.raw is the normalized FLOAT32 pixel_values ([1024,1536],
+# 6,291,456 bytes + 4 KB inert pad). Genie quantizes it on device with the
+# ViT graph's own encoding. NEVER feed a *_u16.raw here -- those are exact
+# tensor bytes for qnn-net-run triage, and at this input they reproduce the
+# setData SIGSEGV (2x over-read, see the vision-tower comment above).
 node set textFile lutEncoder GENIE_NODE_TEXT_ENCODER_TEXT_INPUT prompt_seg1.txt
-node set image imageEncoder GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT sample_image.raw
+node set image imageEncoder GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT sample_image_fp32.raw
 node set textFile lutEncoder GENIE_NODE_TEXT_ENCODER_TEXT_INPUT prompt_seg2.txt
 
 pipeline execute GeniePipeline

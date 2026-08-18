@@ -4,12 +4,17 @@
 Per selected image this writes, all FLAT (the bundle is flat by design --
 Genie resolves config-referenced paths from the bundle root):
 
-  wx_<scene>.jpg     the exact 512x512 RGB the device sees, for human eyes
-  wx_<scene>.raw     UFixed16 pixel_values quantized against the SHIPPED ViT
-                     ctx-bin's own encoding -- Genie does no preprocessing,
-                     it feeds this file as an opaque blob
-  wx_<scene>.json    sidecar: grid, encoding, clip statistics
-  wx_<scene>.script  the pipeline script with only the image path changed
+  wx_<scene>.jpg          the exact 512x512 RGB the device sees, for human eyes
+  wx_<scene>_fp32.raw     FLOAT32 pixel_values + 4 KB pad. THE BLOB THE SCRIPT
+                          FEEDS: Genie's image input staging interprets the
+                          file as float32 and quantizes on device with the
+                          graph's own encoding (nsp-image-model.cpp:501-524;
+                          a UFixed16 blob there is a 2x over-read = the
+                          2026-08-15 SIGSEGV). See preprocess_image.py.
+  wx_<scene>_u16.raw      the same image quantized host-side (exact tensor
+                          bytes, no pad) -- for qnn-net-run graph triage only
+  wx_<scene>_fp32.json    sidecar: grid, encoding, clip statistics
+  wx_<scene>.script       the pipeline script with only the image path changed
 
 and TEST_IMAGES.md, the table the device team reads.
 
@@ -36,10 +41,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from preprocess_image import (  # noqa: E402
-    EDGE, RAW_BYTES, PAD_BYTES, load_encoding, preprocess, quantize,
-    CLIP_EXCESS_LSB_MAX)
+    EDGE, RAW_BYTES, PAD_BYTES, U16_BYTES, load_encoding, preprocess, quantize,
+    write_blobs, CLIP_EXCESS_LSB_MAX)
 
-SAMPLE_LINE = "sample_image.raw"
+SAMPLE_LINE = "sample_image_fp32.raw"
 
 
 def main():
@@ -81,12 +86,12 @@ def main():
             status = f"OUT OF CALIBRATION RANGE ({excess:.1f} LSB)"
             problems.append(f"{stem}: pixels fall up to {excess:.1f} LSB outside "
                             "the ViT's calibrated range")
-        raw = out / f"{stem}.raw"
-        raw.write_bytes(q.tobytes() + b"\x00" * PAD_BYTES)
-        assert raw.stat().st_size == RAW_BYTES + PAD_BYTES, raw.stat().st_size
-        (out / f"{stem}.json").write_text(json.dumps(
-            {"shape": list(pv.shape), "dtype": "uint16", "bytes": RAW_BYTES,
+        raw = out / f"{stem}_fp32.raw"
+        _, u16_name = write_blobs(raw, pv, q)
+        (out / f"{stem}_fp32.json").write_text(json.dumps(
+            {"shape": list(pv.shape), "dtype": "float32", "bytes": RAW_BYTES,
              "pad_bytes": PAD_BYTES,
+             "u16_file": u16_name, "u16_bytes": U16_BYTES,
              "grid_thw": grid.tolist(), "edge": EDGE,
              "encoding": {"scale": scale, "offset": offset, "bitwidth": bw},
              "clipped": clipped, "clip_excess_lsb": excess,
@@ -94,7 +99,8 @@ def main():
              "source": {k: e.get(k) for k in
                         ("title", "url", "licence", "author", "descurl",
                          "source", "scene")}}, indent=1) + "\n")
-        (out / f"{stem}.script").write_text(base.replace(SAMPLE_LINE, f"{stem}.raw"))
+        (out / f"{stem}.script").write_text(
+            base.replace(SAMPLE_LINE, f"{stem}_fp32.raw"))
 
         print(f"  {stem:22s} clip {excess:5.2f} LSB ({clipped}/{q.size})  {status}")
         rows.append({
@@ -109,8 +115,9 @@ def main():
           "",
           "Real outdoor photographs covering the deployment's scenes: the view",
           "outside a vehicle -- road, surroundings, weather. Each ships the exact",
-          "512x512 JPEG the device sees, the preprocessed `UFixed16` blob, a",
-          "sidecar, and its own pipeline script.",
+          "512x512 JPEG the device sees, the `float32` blob the script feeds",
+          "(`*_fp32.raw`), a host-quantized `UFixed16` blob for qnn-net-run",
+          "triage (`*_u16.raw`), a sidecar, and its own pipeline script.",
           "",
           "```",
           "LD_LIBRARY_PATH=. ./genie-app -s wx_<scene>.script",
@@ -140,11 +147,13 @@ def main():
     md += ["",
            "## Preprocessing",
            "",
-           "Every `.raw` is quantized against the **shipped ViT ctx-bin's own**",
-           f"`pixel_values` encoding (bw={bw}, scale={scale:.9e}, offset={offset}),",
-           "not against `model.encodings`. Genie does no preprocessing -- it feeds",
-           "the file straight to the graph -- so these bytes must already be what",
-           "the tensor expects.",
+           "The shipped `*_fp32.raw` blobs hold the normalized float32 pixel",
+           "values; **the device quantizes them itself** against the ViT ctx-bin's",
+           f"own `pixel_values` encoding (bw={bw}, scale={scale:.9e},",
+           f"offset={offset}). Feed ONLY `*_fp32.raw` files to `node set image`:",
+           "Genie's input staging interprets the file as float32, so a `*_u16.raw`",
+           "blob there over-reads 2x and reproduces the 2026-08-15 SIGSEGV. The",
+           "`*_u16.raw` files are exact tensor bytes for `qnn-net-run` triage only.",
            "",
            "`clip_excess_lsb` in each sidecar says how far outside the graph's",
            "calibrated input range that image's pixels fell. The ViT was calibrated",

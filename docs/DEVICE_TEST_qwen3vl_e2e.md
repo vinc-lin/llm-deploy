@@ -113,7 +113,7 @@ console output.
 LD_LIBRARY_PATH=. ./genie-app -s genie_pipeline_qwen3vl.script
 ```
 
-`sample_image.raw` is a red circle and a blue square on a white background, the
+`sample_image_fp32.raw` is a red circle and a blue square on a white background, the
 same scene the parity gate used, so the output is directly comparable.
 Prompt: *"Describe this image in one sentence."*
 
@@ -129,24 +129,24 @@ a *different* image is a failure — see triage.
 
 ## 3. If it still crashes on `node set image`
 
-v3 ships every `.raw` already padded (payload + 4096 zero bytes), which is the
-fix for v2's `SIGSEGV (SEGV_ACCERR)` at `GenieNode_setData+572`. If step 2
-crashed at the same call anyway, the discriminator no longer needs extra files
-pushed from the host — recreate the unpadded probe from the blob already on
-device:
+The v2/v3 crash mechanism is resolved: Genie interprets the image file as
+float32 and reads 4 bytes per element, so the old UFixed16 blobs were a 2×
+over-read — see `V4_CHANGES.md` §1. v4's `*_fp32.raw` blobs are the fix; the
+padding theory (and its probes in `DEVICE_TEST_qwen3vl_imgenc_sigsegv.md`) is
+superseded history.
 
-```bash
-head -c 3145728 sample_image.raw > nopad.raw
-```
+If v4 crashes at `node set image` anyway, in order:
 
-Then follow `docs/DEVICE_TEST_qwen3vl_imgenc_sigsegv.md` §3–§4 for the two-run
-procedure (that padded `sample_image.raw` you just ran stands in for its Run 2;
-`nopad.raw` gives you its Run 1) and its §6 decision tree. Branch C — the
-padded blob fixes it — is what v3 already ships, so reaching this section means
-you are past that. **If both the padded and unpadded blobs crash, that is
-branch D:** the overrun is past the destination, not host-fixable. Capture the
-tombstone (§5 of that doc) and stop rather than continue swapping things — this
-becomes a Qualcomm escalation, not another on-device experiment.
+1. `ls -l *.raw` — the fed file must be `sample_image_fp32.raw` at exactly
+   **6,295,552** bytes. A 3,145,728/3,149,824-byte file is a stale v3 blob
+   shadowing the new one; delete every v3-era `sample_image.raw` / `wx_*.raw`
+   and rerun.
+2. Confirm the script line reads
+   `node set image imageEncoder GENIE_NODE_IMAGE_ENCODER_IMAGE_INPUT sample_image_fp32.raw`.
+3. If both check out and it still crashes, capture the tombstone (signal line,
+   fault address, the `ls -l` output) and stop — that is a new mechanism, not
+   a re-run candidate, and it goes back to the bundle developer with the
+   tombstone rather than into more on-device experiments.
 
 ## 4. Weather / road kit
 

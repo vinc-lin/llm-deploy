@@ -33,11 +33,13 @@
 #     the character after an escape verbatim (main.cpp:655-658) and nothing
 #     unescapes later (main.cpp:1140-1142), so "\n" becomes the two characters
 #     '\' and 'n'.
-#   * sample_image.{png,raw,json}. The scene is the red circle + blue square
-#     the E2E parity gate used (parity_e2e_vl.py:make_image), so the device's
-#     caption is directly comparable to that gate's recorded Tier-A text. The
-#     raw blob is quantized against the SHIPPED ctx-bin's own info.json, not
-#     against model.encodings: Genie does no preprocessing, it feeds the file
+#   * sample_image.png + sample_image_fp32.{raw,json} + sample_image_u16.raw.
+#     The scene is the red circle + blue square the E2E parity gate used
+#     (parity_e2e_vl.py:make_image), so the device's caption is directly
+#     comparable to that gate's recorded Tier-A text. The SHIPPED blob is
+#     FLOAT32 -- Genie's image staging interprets the file as float32 and
+#     quantizes on device against the ctx-bin's own encoding
+#     (nsp-image-model.cpp:501-524); the u16 blob is for qnn-net-run triage
 #     as an opaque blob, so those bytes must already be exactly what this
 #     graph's pixel_values tensor expects.
 #
@@ -149,6 +151,9 @@ for f in "${CONFIGS[@]}"; do cp "$LLMDEPLOY_ROOT/configs/$f" "$OUT/"; done
 # note itself can become visible. Licence/base-model tags belong in the root
 # README (docs/HF_HUB_README_qwen3vl.md), which is where they are.
 cp "$LLMDEPLOY_ROOT/docs/BUNDLE_README_qwen3vl_4b_e2e.md" "$OUT/README.md"
+# v4 entry point: the resolved image-crash mechanism, the fp32 blob contract,
+# and the current test matrix. Supersedes the blob instructions elsewhere.
+cp "$LLMDEPLOY_ROOT/docs/BUNDLE_V4_CHANGES_qwen3vl.md" "$OUT/V4_CHANGES.md"
 cp "$LLMDEPLOY_ROOT/docs/DEVICE_TEST_qwen3vl_e2e.md" "$OUT/DEVICE_TEST.md"
 # Single entry point for the device operator: usage, ordered test procedure,
 # the metric definitions to use verbatim, and a fill-in results table. The
@@ -215,7 +220,7 @@ img.save(os.path.join(os.environ["OUT"], "sample_image.png"))
 PYEOF
 $PY_DEPLOY "$LLMDEPLOY_ROOT/scripts/pipeline/preprocess_image.py" \
     --model "$MODEL" --image "$OUT/sample_image.png" \
-    --out "$OUT/sample_image.raw" \
+    --out "$OUT/sample_image_fp32.raw" \
     --encodings "$OUT/${VIT_BIN%.bin}.info.json"
 
 echo "== [5/5] Gate 2: static contract lint =="

@@ -153,14 +153,17 @@ v2 shipped exactly that: 36 replication ops per shard at a 4:1 head ratio.
   the 0.6B pattern does not transfer. See `docs/REFERENCE.md` §3.6.
 - Image-encoder configs need `vision-param: {height, width}` in **patch units**
   (pre-merge), or MRoPE never engages and image rows fall back to plain rope.
-- **Every shipped image blob needs 4096 bytes of zero padding past the
-  payload** (1024×1536×2 = 3,145,728 → 3,149,824 total). `GenieNode_setData`
-  allocates exactly `fileSize`; a consumer over-reads one byte past the end
-  into a Scudo guard page — `SIGSEGV (SEGV_ACCERR)` at `base+0x300000`, what
-  blocked the device on 2026-08-15. `preprocess_image.py` /
-  `build_test_kit.py` pad automatically; `lint_pipeline_bundle.py` enforces
-  the size. The runtime reads only the payload, so the pad is inert.
-  `docs/DEVICE_TEST_qwen3vl_imgenc_sigsegv.md` §1.2b/§4.
+- **The shipped image blob is FLOAT32 (`*_fp32.raw`), never tensor-native
+  UFixed16.** Genie's image staging reinterprets the file as float32 and
+  quantizes on device (`nsp-image-model.cpp:501-524`; `embedding-datatype`
+  defaults to FLOAT_32 and no image-encoder config key routes to it), so a
+  UFixed16 blob is read at 2× its size — a ~3 MB over-read, the `SIGSEGV
+  (SEGV_ACCERR)` that blocked the device 2026-08-15..17. Padding cannot fix it
+  (correction #35 — the earlier 1-byte/guard-page theory here was wrong).
+  fp32 payload 1024×1536×4 = 6,291,456 B + 4096 B inert pad = 6,295,552 B;
+  `preprocess_image.py` / `build_test_kit.py` emit it plus a `*_u16.raw`
+  (exact tensor bytes, **qnn-net-run triage only**); `lint_pipeline_bundle.py`
+  enforces sizes and fp32↔u16 agreement. `docs/NOTES-genie-pipeline.md` D1b.
 
 ## Validation gates (run before shipping any bundle)
 

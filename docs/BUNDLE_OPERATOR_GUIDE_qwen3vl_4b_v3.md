@@ -1,5 +1,8 @@
 # Qwen3-VL-4B on SA8797P — operator guide (bundle v3)
 
+> **v4:** read `V4_CHANGES.md` first. Feed only `*_fp32.raw` image blobs;
+> `*_u16.raw` files are qnn-net-run triage inputs and crash genie-app.
+
 **Read this file first.** It is the single entry point: what this bundle is,
 how to run it, what to measure, and exactly what to send back. The other two
 documents go deeper — `DEVICE_TEST.md` is the step-by-step runbook with
@@ -132,7 +135,7 @@ text tower has ever had its tok/s measured** — the number stands alone.
 LD_LIBRARY_PATH=. ./genie-app -s genie_pipeline_qwen3vl.script
 ```
 
-Expected caption for `sample_image.raw` (a red circle and a blue square on
+Expected caption for `sample_image_fp32.raw` (a red circle and a blue square on
 white):
 
 > A red circle and a blue square are positioned side by side on a white background.
@@ -205,9 +208,8 @@ v3 already ships the padded blobs that should fix this. If it still crashes at
 `GenieNode_setData`, recreate the unpadded probe **from the blob already on
 device** — nothing extra to push:
 
-```bash
-head -c 3145728 sample_image.raw > nopad.raw
-```
+*(v3's padding probe is retired — the crash mechanism is resolved in
+`V4_CHANGES.md` §1; the blob is float32 now and there is nothing to probe.)*
 
 Then follow `DEVICE_TEST.md` §3 and the decision tree in the imaging runbook.
 If **both** the padded and unpadded blobs crash, stop: the overrun is past the

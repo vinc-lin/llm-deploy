@@ -1,5 +1,13 @@
 # ImageEncoder `setData` crash — probe results and corrected analysis
 
+> **SUPERSEDED IN PART (v4).** The crash this document investigates is
+> resolved: Genie's image staging interprets the input file as float32
+> (nsp-image-model.cpp:501-524, `embedding-datatype` default), so the
+> UFixed16 blobs v2/v3 shipped were read at 2x their size — a ~3 MB
+> over-read, which is why padding and page-alignment probes could not
+> help. v4 ships float32 blobs. Kept as the diagnostic record; do not
+> run its probes. Current instructions: `V4_CHANGES.md`.
+
 **Bundle:** `qwen3vl_4b_e2e_pipeline_v3`
 **Last updated:** 2026-08-17, after the +1-byte page-alignment probe
 **Status:** blocker unresolved; **padding is now ruled out structurally**, one

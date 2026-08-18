@@ -1,5 +1,8 @@
 # Qwen3-VL-4B on SA8797P — deployment and test guide
 
+> **v4:** read `V4_CHANGES.md` first — the image blob format changed
+> (float32, `*_fp32.raw`), and it is the fix for the v3 ImageEncoder SIGSEGV.
+
 Image + text in, description out, as one flat `genie-app` bundle for the
 Qualcomm **SA8797P** (Hexagon v81 HTP, Android GVM), built against **QAIRT
 2.48.40.260702 / libGenie 1.19**.
@@ -88,7 +91,8 @@ subdirectory. Do not reorganise into subfolders.
 | `htp_backend_ext_config_vltext.json` | <1 KB | HTP tuning for the four text graphs |
 | `embedding_lut_params.json` | <1 KB | LUT dtype/size declaration |
 | `prompt_seg1.txt` / `prompt_seg2.txt` | <1 KB | The chat-template halves around the image. **Byte-exact, no trailing newline** |
-| `sample_image.raw` | 3.0 MB | Smoke-test image, pre-quantized to the ViT's own input encoding |
+| `sample_image_fp32.raw` | 6.0 MB | Smoke-test image, normalized **float32** — Genie quantizes it on device against the ViT's own encoding (see `V4_CHANGES.md` §1) |
+| `sample_image_u16.raw` | 3.0 MB | Same image pre-quantized UFixed16 — **qnn-net-run triage only, never feed to genie-app** |
 
 Total required: **~6.2 GB** on device, before KV cache.
 
@@ -157,7 +161,7 @@ Requirements and cautions:
 LD_LIBRARY_PATH=. ./genie-app -s genie_pipeline_qwen3vl.script
 ```
 
-The prompt is *"Describe this image in one sentence."* over `sample_image.raw`
+The prompt is *"Describe this image in one sentence."* over `sample_image_fp32.raw`
 (a red circle and a blue square on a white background).
 
 **Expected output** — recorded from the parity gate's `tierB` chain, which is
@@ -187,7 +191,7 @@ work around it silently.
 
 ### T1 — Smoke (required)
 
-One run of the primary script on `sample_image.raw`. Judged by §5.
+One run of the primary script on `sample_image_fp32.raw`. Judged by §5.
 Capture full stdout/stderr, including everything before the first output token.
 
 ### T2 — Weather / road kit (required)

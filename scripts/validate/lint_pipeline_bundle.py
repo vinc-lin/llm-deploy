@@ -91,9 +91,15 @@ from pathlib import Path
 LUT_ROWS, LUT_DIM = 151936, 2560
 LUT_BYTES = LUT_ROWS * LUT_DIM * 4
 N_PATCH, N_FEAT = 1024, 1536
-RAW_BYTES = N_PATCH * N_FEAT * 2
-# guard-page padding every shipped blob carries -- see preprocess_image.py's
-# PAD_BYTES (imgenc runbook §1.2b/§4).
+# The SHIPPED image blob is FLOAT32: Genie's image input staging interprets
+# the file as float32 and quantizes on device (nsp-image-model.cpp:501-524,
+# embedding-datatype defaults to FLOAT_32 with no config route for an
+# image-encoder node). A tensor-native UFixed16 blob there is read at 4 bytes
+# per element -- a 2x over-read, the 2026-08-15 SIGSEGV. u16 blobs remain in
+# the kit strictly for qnn-net-run triage.
+RAW_BYTES = N_PATCH * N_FEAT * 4
+U16_BYTES = N_PATCH * N_FEAT * 2
+# inert padding kept on shipped blobs -- see preprocess_image.py's PAD_BYTES.
 PAD_BYTES = 4096
 IMG_ROWS = 256                      # merged ViT output rows == <|image_pad|> count
 EDGE = 512
@@ -466,21 +472,50 @@ def check_lut(bundle, nodes, rep):
             rep.ok(f"{path}: {got} bytes == {LUT_ROWS}*{LUT_DIM}*4")
 
 
+def check_blob_pair(bundle, fp32_path, u16_path, meta, rep):
+    """The u16 debug blob must be the quantization of the fp32 shipped blob
+    under the sidecar's encoding -- a mismatched pair means qnn-net-run triage
+    would test a different image than genie-app runs."""
+    import numpy as np
+    enc = meta.get("encoding") or {}
+    if "scale" not in enc or "offset" not in enc:
+        return                       # encoding failures are reported elsewhere
+    pv = np.frombuffer(fp32_path.read_bytes()[:RAW_BYTES], dtype="<f4")
+    q = np.frombuffer(u16_path.read_bytes(), dtype="<u2")
+    raw = np.rint(pv.astype(np.float64) / float(enc["scale"])) - int(enc["offset"])
+    expect = np.clip(raw, 0, 65535).astype(np.int64)
+    diff = np.abs(expect - q.astype(np.int64))
+    if diff.max() > 1:
+        rep.fail(f"{u16_path.name}: differs from quantize({fp32_path.name}) by "
+                 f"up to {int(diff.max())} LSB at {int((diff > 1).sum())} "
+                 "elements -- the debug blob is NOT this image")
+    else:
+        rep.ok(f"{u16_path.name} == quantize({fp32_path.name}) (max "
+               f"{int(diff.max())} LSB)")
+
+
 def check_sample_image(bundle, raw_name, pixel_enc, rep):
     rep.head(7, "sample image (bytes, grid, dtype, host<->device encoding)")
     if raw_name is None:
         rep.fail("the pipeline script sets no image input")
         return None
+    if not raw_name.endswith("_fp32.raw"):
+        rep.fail(f"script feeds {raw_name!r}: the shipped image blob must be a "
+                 "*_fp32.raw file. Genie interprets the image file as float32 "
+                 "(nsp-image-model.cpp:501-524); a UFixed16 blob is a 2x "
+                 "over-read = the 2026-08-15 SIGSEGV, and the suffix is what "
+                 "keeps a stale v2/v3 blob from being fed by accident")
     raw = bundle / raw_name
     if not raw.is_file():
         return None                                     # check 1 reports the miss
     got = raw.stat().st_size
     if got != RAW_BYTES + PAD_BYTES:
         rep.fail(f"{raw_name}: {got} bytes != {RAW_BYTES}+{PAD_BYTES} "
-                 "(payload + the 4 KB guard-page padding; an unpadded blob "
-                 "re-ships the GenieNode_setData SIGSEGV -- imgenc runbook §4)")
+                 f"(float32 payload + {PAD_BYTES} pad; a {U16_BYTES}-byte-ish "
+                 "size means a UFixed16 blob is being shipped as the image "
+                 "input, which re-ships the setData SIGSEGV)")
     else:
-        rep.ok(f"{raw_name}: {got} bytes == payload+{PAD_BYTES} pad")
+        rep.ok(f"{raw_name}: {got} bytes == fp32 payload+{PAD_BYTES} pad")
     meta_path = raw.with_suffix(".json")
     if not meta_path.is_file():
         rep.fail(f"{meta_path.name}: missing sidecar for {raw_name}")
@@ -490,10 +525,18 @@ def check_sample_image(bundle, raw_name, pixel_enc, rep):
         rep.fail(f"{meta_path.name}: grid_thw {meta.get('grid_thw')} != [[1,32,32]]")
     else:
         rep.ok(f"{meta_path.name}: grid_thw [[1,32,32]]")
-    if meta.get("dtype") != "uint16":
-        rep.fail(f"{meta_path.name}: dtype {meta.get('dtype')!r} != 'uint16'")
+    if meta.get("dtype") != "float32":
+        rep.fail(f"{meta_path.name}: dtype {meta.get('dtype')!r} != 'float32'")
     else:
-        rep.ok(f"{meta_path.name}: dtype uint16")
+        rep.ok(f"{meta_path.name}: dtype float32")
+    u16_name = meta.get("u16_file")
+    if u16_name and (bundle / u16_name).is_file():
+        u16_got = (bundle / u16_name).stat().st_size
+        if u16_got != U16_BYTES:
+            rep.fail(f"{u16_name}: {u16_got} bytes != {U16_BYTES} (qnn-net-run "
+                     "debug blob must be exact tensor bytes, unpadded)")
+        else:
+            check_blob_pair(bundle, raw, bundle / u16_name, meta, rep)
     enc = meta.get("encoding") or {}
     if pixel_enc is None:
         rep.fail("ViT pixel_values encoding unavailable; host<->device agreement "
@@ -1177,37 +1220,47 @@ def check_kit(bundle, raw_name, pixel_enc, rep):
         if missing:
             rep.fail(f"{s.name}: references missing file(s) {missing}")
         own = [r for r in refs if r.endswith(".raw")]
-        if own != [f"{stem}.raw"]:
-            rep.fail(f"{s.name}: feeds {own}, expected ['{stem}.raw'] -- a kit "
-                     "script that points at another image tests the wrong scene")
+        if own != [f"{stem}_fp32.raw"]:
+            rep.fail(f"{s.name}: feeds {own}, expected ['{stem}_fp32.raw'] -- "
+                     "a kit script must feed its own image, and only the fp32 "
+                     "blob (a u16 blob at the image input re-ships the setData "
+                     "SIGSEGV)")
             continue
-        seen_raw.add(f"{stem}.raw")
-        blob = bundle / f"{stem}.raw"
+        seen_raw.add(f"{stem}_fp32.raw")
+        seen_raw.add(f"{stem}_u16.raw")
+        blob = bundle / f"{stem}_fp32.raw"
         if blob.is_file() and blob.stat().st_size != RAW_BYTES + PAD_BYTES:
             rep.fail(f"{blob.name}: {blob.stat().st_size} bytes != "
-                     f"{RAW_BYTES}+{PAD_BYTES} (unpadded blob re-ships the "
-                     "setData SIGSEGV)")
-        side = bundle / f"{stem}.json"
+                     f"{RAW_BYTES}+{PAD_BYTES} (fp32 payload + pad; a smaller "
+                     "blob is a stale UFixed16 image)")
+        side = bundle / f"{stem}_fp32.json"
         if not side.is_file():
-            rep.fail(f"{stem}.json: sidecar missing")
+            rep.fail(f"{stem}_fp32.json: sidecar missing")
             continue
         try:
             meta = json.loads(side.read_text())
         except Exception as exc:                              # noqa: BLE001
-            rep.fail(f"{stem}.json: unparseable ({exc})")
+            rep.fail(f"{stem}_fp32.json: unparseable ({exc})")
             continue
         enc = meta.get("encoding") or {}
         got = (float(enc.get("scale", 0)), int(enc.get("offset", 0)))
         if pixel_enc and got != pixel_enc:
-            rep.fail(f"{stem}.json: encoding {got} != the shipped ViT's "
-                     f"pixel_values {pixel_enc} -- these bytes are not what the "
-                     "graph expects")
+            rep.fail(f"{stem}_fp32.json: encoding {got} != the shipped ViT's "
+                     f"pixel_values {pixel_enc} -- the device would quantize "
+                     "this image against a different range than it was gated on")
         if meta.get("grid_thw") != [[1, 32, 32]]:
-            rep.fail(f"{stem}.json: grid {meta.get('grid_thw')} != [[1,32,32]]")
+            rep.fail(f"{stem}_fp32.json: grid {meta.get('grid_thw')} != [[1,32,32]]")
+        u16 = bundle / f"{stem}_u16.raw"
+        if u16.is_file():
+            if u16.stat().st_size != U16_BYTES:
+                rep.fail(f"{u16.name}: {u16.stat().st_size} bytes != {U16_BYTES}")
+            elif blob.is_file() and blob.stat().st_size == RAW_BYTES + PAD_BYTES:
+                check_blob_pair(bundle, blob, u16, meta, rep)
     stray = sorted(p.name for p in bundle.glob("wx_*.raw")
                    if p.name not in seen_raw)
     if stray:
-        rep.fail(f"kit blob(s) no script feeds: {stray}")
+        rep.fail(f"kit blob(s) no script feeds: {stray} -- stale-format blobs "
+                 "must not ship where they can be fed by accident")
     if not (bundle / "TEST_IMAGES.md").is_file():
         rep.fail("TEST_IMAGES.md missing -- the kit has no expected outputs")
     if len(rep.problems) == before:

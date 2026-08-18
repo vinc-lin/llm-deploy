@@ -1,5 +1,13 @@
 # Device test — ImageEncoder SIGSEGV bisect (Qwen3-VL-4B v2, SA8797P)
 
+> **SUPERSEDED IN PART (v4).** The crash this document investigates is
+> resolved: Genie's image staging interprets the input file as float32
+> (nsp-image-model.cpp:501-524, `embedding-datatype` default), so the
+> UFixed16 blobs v2/v3 shipped were read at 2x their size — a ~3 MB
+> over-read, which is why padding and page-alignment probes could not
+> help. v4 ships float32 blobs. Kept as the diagnostic record; do not
+> run its probes. Current instructions: `V4_CHANGES.md`.
+
 **Goal: two short runs that decide, between three possible causes, why
 `node set image` dies — and capture the one tombstone line that lets us
 disassemble the exact faulting instruction off-device.**
