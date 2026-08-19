@@ -40,10 +40,17 @@ TOL = 0.05              # +-5% on the ratio; W8A16 vs fp32 sits far inside this
 DEVICE_BAND = (1.25, 3.0)   # the band that reproduces argmax 105196 on the host
 
 
-def load(p: Path, label: str):
+def load(p: Path, label: str, expect_bytes: int = None):
     raw = p.read_bytes()
-    if len(raw) != BYTES:
-        print(f"  !! {label}: {len(raw)} bytes, expected {BYTES} "
+    if expect_bytes is None:
+        expect_bytes = BYTES
+    if len(raw) % (ELEMS * 2) == 0 and len(raw) != expect_bytes:
+        # A whole number of 2560-wide fp16 rows: a different case (e.g.
+        # prefill4tok is 128 rows). Accept it and say so.
+        print(f"  note {label}: {len(raw)//(ELEMS*2)} rows of {ELEMS} fp16 "
+              "(not the 1-row decode1tok case) -- comparing row-wise.")
+    elif len(raw) != expect_bytes:
+        print(f"  !! {label}: {len(raw)} bytes, expected {expect_bytes} "
               f"({ELEMS} x fp16). Wrong tensor, wrong case, or truncated pull.")
         if len(raw) % 2:
             sys.exit(2)
@@ -72,13 +79,14 @@ def main():
         ap.error("give --device <file> or --device-rms <number>")
 
     ref = load(args.ref, "reference") if args.ref else None
+    exp = ref.size * 2 if ref is not None else None
     ref_rms = rms(ref) if ref is not None else REF_RMS
     if ref is not None and abs(ref_rms - REF_RMS) / REF_RMS > 0.01:
         print(f"  note: supplied reference RMS {ref_rms:.4f} differs from the "
               f"recorded {REF_RMS:.4f} -- is this the decode1tok boundary?")
 
     if args.device is not None:
-        dev = load(args.device, "device")
+        dev = load(args.device, "device", exp)
         dev_rms = rms(dev)
         if ref is not None and dev.size == ref.size:
             m = np.isfinite(dev) & np.isfinite(ref)
@@ -98,14 +106,45 @@ def main():
     if c is not None:
         print(f"  cosine        : {c:.6f}   (scale-invariant -- cannot see the ratio)")
     if dev is not None and ref is not None and dev.size == ref.size:
-        m = np.isfinite(dev) & np.isfinite(ref) & (np.abs(ref) > 1e-6)
-        if m.any():
-            per = dev[m] / ref[m]
-            print(f"  per-element ratio: median {np.median(per):.4f}  "
+        # Uniformity by LEAST SQUARES, not by per-element ratio percentiles.
+        # These hidden states are extremely heavy-tailed -- median |x| ~ 1,
+        # max ~ 5000 -- so ~78% of elements are near zero and their ratios are
+        # pure noise. Percentiles over those said "NON-uniform" for a boundary
+        # that is in fact a clean uniform gain (2026-08-15 Test E), sending the
+        # hunt toward per-channel dequantization for nothing.
+        m = np.isfinite(dev) & np.isfinite(ref)
+        g = float(dev[m] @ ref[m] / (ref[m] @ ref[m]))
+        resid = dev[m] - g * ref[m]
+        rel = float(np.linalg.norm(resid) / np.linalg.norm(dev[m]))
+        print(f"  best-fit gain : {g:.5f}x  (least squares)")
+        print(f"  residual after removing it: {rel:.4%} of the norm")
+        uniform = rel < 0.02
+        print(f"  -> {'UNIFORM gain' if uniform else 'NOT a single gain'}"
+              f" ({'within' if uniform else 'exceeds'} 2% residual)")
+        # Ratios only where the reference is big enough for a ratio to mean
+        # anything; state the cut so the number is never read as global.
+        floor = max(1e-3, 0.02 * ref_rms)
+        big = m & (np.abs(ref) > floor)
+        if big.sum() >= 20:
+            per = dev[big] / ref[big]
+            print(f"  per-element ratio over |ref| > {floor:.3g} "
+                  f"({big.sum()}/{ref.size} elems): median {np.median(per):.4f}  "
                   f"p05 {np.percentile(per, 5):.4f}  p95 {np.percentile(per, 95):.4f}")
-            spread = np.percentile(per, 95) - np.percentile(per, 5)
-            print(f"  -> {'UNIFORM' if spread < 0.1 * abs(np.median(per)) else 'NON-uniform'}"
-                  " across elements")
+        # Per-row, when there is more than one row: a gain that differs by row
+        # is structural, one that does not is a single scalar fault.
+        if ref.size % ELEMS == 0 and ref.size // ELEMS > 1:
+            rows = ref.size // ELEMS
+            gs = []
+            for r in range(rows):
+                rr, dd = ref[r * ELEMS:(r + 1) * ELEMS], dev[r * ELEMS:(r + 1) * ELEMS]
+                k = np.isfinite(rr) & np.isfinite(dd)
+                if (rr[k] @ rr[k]) > 0:
+                    gs.append(float(dd[k] @ rr[k] / (rr[k] @ rr[k])))
+            if gs:
+                gs = np.array(gs)
+                print(f"  per-row gain  : min {gs.min():.5f}  max {gs.max():.5f}  "
+                      f"spread {gs.max()-gs.min():.5f} over {len(gs)} rows")
+                print(f"  -> {'SAME on every row' if gs.max()-gs.min() < 0.02 else 'VARIES by row'}")
 
     print("\n=== verdict ===")
     # Saturation first: with inf/nan present the RMS ratio is computed over the

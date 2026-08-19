@@ -315,6 +315,30 @@ entry, so it converts as plain fp16). The host ONNX pair is self-consistent —
 `parity_e2e_vl.py` chains them token-for-token — so the asymmetry appears
 somewhere in ONNX → DLC → ctx-bin, and cannot be reproduced without HTP.
 
+### RESULT (2026-08-15, Path A) — measured, and it is a uniform gain
+
+| | |
+|---|---:|
+| reference RMS | 107.2226 |
+| device RMS | 149.0009 |
+| cosine | 0.999990 |
+| **best-fit uniform gain** | **1.38959×** |
+| residual after removing that gain | **0.447%** |
+
+The boundary is a **uniform 1.3896× scaling** of the reference, correct to 0.45%
+— i.e. ordinary W8A16-vs-fp32 error once the gain is removed. 1.3896 sits inside
+the [1.25, 3.0] band that reproduces argmax 105196 on the host, so this is the
+defect.
+
+⚠ The first report of this measurement called the error "non-uniform", from
+per-element ratio percentiles of 0.39 / 1.35 / 2.36. That was an artefact of the
+checker: these hidden states are heavy-tailed (median |x| ≈ 1.06, max ≈ 5244), so
+~78% of elements are near zero and their ratios are noise. A *uniform* gain plus
+noise sized to cos = 0.999990 produces an even wider percentile spread
+(−1.35 / 4.32). `check_boundary_scale.py` now decides uniformity by least-squares
+residual instead, and restricts the percentile readout to elements above 2% of
+RMS. **Do not chase per-channel dequantization; look for a scalar gain.**
+
 ### The next datum, and it is tiny
 
 From `testb_probe_out.tar.gz`, send **shard 0's `decode1tok` output**
