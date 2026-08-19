@@ -11,11 +11,17 @@ The v5 session **confirmed** the Genie `FLOAT_16` embedding-padding bug and
 **confirmed** that re-typing `inputs_embeds` to `UFIXED_POINT_16` fixes it — both
 decisively, at 0.6B scale. It also reported that the Qwen3-VL-4B text ctx-bins are
 "numerically incorrect independently of Genie", based on a `qnn-net-run` probe
-whose outputs barely correlated with host references. **That last conclusion is
-not safe**: the probe kit was built for the *previous* ctx-bins and fed the new
-ones the wrong byte encoding. This document explains which findings stand, why the
-fourth is in doubt, and gives the exact procedure to settle it — the first step of
-which needs **no device time at all**.
+whose outputs barely correlated with host references. **That conclusion was an
+artefact**: the probe kit was built for the *previous* ctx-bins and fed the new
+ones the wrong byte encoding (§3). A corrected kit reversed it — Test B then
+declared the ctx-bins correct.
+
+**§8b withdraws that too.** Test C showed Genie's n=1 output is the exact token
+Test B's *chained* run produced and dismissed as noise, and the host has now
+reproduced the whole device pattern with a single parameter: a **uniform scale
+error on the shard-0 → shard-1 boundary**. Cosine is scale-invariant, which is
+why the probe scored that boundary a perfect 1.0000. Read §8b first; §§3–7 are
+the history that led there.
 
 ---
 
@@ -254,15 +260,77 @@ Cheapest and most likely first. Do **not** start here before Test A.
 
 ---
 
+## 8b. 2026-08-19 update — Test B and Test C reconciled
+
+Test B concluded "the ctx-bins are numerically correct; the fault is in Genie".
+**That conclusion is withdrawn.** Test C showed Genie's n=1 output is token
+**105196 `是中国`** — the exact token Test B's *chained* run produced and
+dismissed as "a single-token ranking swap consistent with INT8 quantization
+noise". The chained anomaly is the defect, and `qnn-net-run` reproduces it with
+no Genie involved.
+
+### The apparent paradox, and its resolution
+
+Test B reported shard 0's boundary output at cosine **1.0000** against the host
+reference, yet feeding that same file to shard 1 gave 105196 while feeding the
+host file gave 374. Two inputs agreeing to 1.0000 cannot diverge by 2.8 logits.
+
+They can if the difference is **scale**, because **cosine is scale-invariant**.
+Measured on the host against `prefill_1.onnx` / `decode_1.onnx`:
+
+| boundary scale | decode1tok argmax | prefill4tok rows 0..3 |
+|---|---|---|
+| 0.50 – 1.10 | 374 (correct) | 374, 279, 330, 315 — all correct |
+| **1.25 – 3.00** | **105196** | **105196**, 279, 330, 315 |
+| 4.00 | 103451 | — |
+
+A *global* boundary scale anywhere in ~[1.25, 3] reproduces the device's chained
+result **exactly**, including the row pattern: row 0 wrong, rows 1-3 right. Row 0
+is not specially corrupted — it is simply the least-contextualised row, so its
+logits are flattest and it flips first. Random noise does **not** do this: at
+comparable cosine the argmax scatters across many tokens and only reaches 105196
+for occasional seeds, whereas *every* scale factor in that band lands on 105196.
+
+### What this means
+
+* There is no "row-0 corruption" and no chunk/KV/LUT hypothesis needed. The
+  device's shard-0 output points the right direction with the wrong magnitude.
+* **The probe's shard-0 check was insufficient.** It scored cosine only, so any
+  scale error passed as 1.0000. `compare_text_probe.py` now also checks an
+  RMS ratio (±5%) and marks a scale-only deviation BAD.
+* Test C's whole shape follows: n=1 uses only the flat row → wrong; n≥4's first
+  generated token comes from the last prompt row → correct; every decode step
+  thereafter runs on shard-1 state built from a mis-scaled boundary → garbage;
+  n=129's last real token lands on its chunk's first row → wrong.
+* Three of the device report's four candidates are dead on their own data: the
+  probe fed a **zero KV cache** (not KV), **bypassed the LUT** (not requant), and
+  ran **without Genie** (not orchestration).
+
+### What is still unknown
+
+The *cause* of the magnitude error. Ruled out so far: the boundary dtype
+(FLOAT_16 on both sides, shapes match) and an encodings mismatch (neither
+`chunk0.encodings` nor `chunk1.encodings` carries any `last_hidden_states`
+entry, so it converts as plain fp16). The host ONNX pair is self-consistent —
+`parity_e2e_vl.py` chains them token-for-token — so the asymmetry appears
+somewhere in ONNX → DLC → ctx-bin, and cannot be reproduced without HTP.
+
+### The next datum, and it is tiny
+
+From `testb_probe_out.tar.gz`, send **shard 0's `decode1tok` output**
+`last_hidden_states.raw` — 1x2560 fp16 = **5,120 bytes** — or simply its RMS.
+The host reference RMS is **107.2226**. The ratio pins the factor immediately and
+costs no device time. Also useful, and already in `testb_probe.log`: the
+`shard0 out: ... (N bytes, expect M)` lines.
+
 ## 9. Bottom line
 
 Two defects were in play and they are not the same thing:
 
 1. **Genie's `FLOAT_16` embedding padding** — confirmed, understood, fixed by
    `UFIXED_POINT_16`, verified on device at 0.6B.
-2. **Whatever still breaks the 4B text tower** — real, but *not yet localised*.
-   The evidence that pointed at the ctx-bins came from a probe that was fed the
-   wrong bytes, and must be re-established before anyone spends days in the
-   export/quantization pipeline.
-
-**Test A costs nothing and decides which.**
+2. **Whatever still breaks the 4B text tower** — now localised to the
+   **magnitude of the shard-0 -> shard-1 boundary**, reproducible under
+   `qnn-net-run` with no Genie, and quantitatively matched on the host by a
+   uniform scale in ~[1.25, 3]. The cause within ONNX -> DLC -> ctx-bin is still
+   open; the 5,120-byte artefact in section 8b pins it.

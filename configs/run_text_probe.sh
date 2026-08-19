@@ -86,13 +86,36 @@ for CASE in $(cat probe_cases.txt); do
          > "$OUT/${CASE}_s0.txt"
     run_one "shard 0 ($G0)" "$BIN0" "$OUT/${CASE}_s0.txt" "$OUT/${CASE}_s0"
 
-    S0=$(find "$OUT/${CASE}_s0" -name "last_hidden_states*" | head -1)
-    if [ -z "$S0" ]; then
+    # Pick shard 0's output DETERMINISTICALLY and prove it is the right file.
+    # `find ... | head -1` returns directory order, while compare_text_probe.py
+    # scores sorted()[0]. If the directory ever holds more than one match, the
+    # file FED to shard 1 need not be the file SCORED as shard 0's output -- and
+    # the symptom of that is precisely "shard 0 matches the host at cosine 1.0000
+    # yet chaining it gives a different argmax". Sort, require exactly one, and
+    # make the size a hard failure rather than a printed remark.
+    _hits=$(find "$OUT/${CASE}_s0" -type f -name 'last_hidden_states*' | sort)
+    _n=$(printf '%s\n' "$_hits" | grep -c . || true)
+    if [ -z "$_hits" ]; then
         echo "FATAL: shard 0 produced no last_hidden_states -- stop and report"
         ls -R "$OUT/${CASE}_s0" || true
         exit 1
     fi
-    echo "   shard0 out: $S0 ($(wc -c < "$S0") bytes, expect $HIDDEN_BYTES)"
+    if [ "$_n" -ne 1 ]; then
+        echo "FATAL: $_n files match last_hidden_states* in $OUT/${CASE}_s0 --"
+        echo "       ambiguous, and the comparator may score a different one."
+        printf '%s\n' "$_hits" | sed 's/^/         /'
+        exit 1
+    fi
+    S0=$_hits
+    _sz=$(wc -c < "$S0")
+    if [ "$_sz" -ne "$HIDDEN_BYTES" ]; then
+        echo "FATAL: shard0 out $S0 is $_sz bytes, expected $HIDDEN_BYTES."
+        echo "       Wrong tensor, wrong dtype, or a truncated write. Stop."
+        exit 1
+    fi
+    echo "   shard0 out: $S0 ($_sz bytes == HIDDEN_BYTES, OK)"
+    # Record what was actually fed, so the host can prove it scored the same file.
+    printf '%s\n' "$S0" > "$OUT/${CASE}_s0_fed.txt"
 
     # ---- shard 1 CHAINED: fed the device's own shard-0 output -------------
     emit "$CASE" "$G1" "$LAYER_BASE_1" "$LAYER_N_1" \

@@ -75,6 +75,9 @@ def load_rows(p: Path, n_real: int, width: int, label: str):
     return None
 
 
+MAG_TOL = 0.05           # +-5% on RMS ratio; W8A16 vs fp32 sits well inside this
+
+
 def verdict(tag, ref, got, extra=""):
     """Per-row cosine + argmax agreement. Reported per row because a fault that
     only appears at row>0 -- the cross-token/rope failure mode the prefill case
@@ -82,17 +85,32 @@ def verdict(tag, ref, got, extra=""):
     if got is None:
         print(f"  {tag:22s} MISSING")
         return None
-    cs, agree = [], 0
+    cs, mags, agree = [], [], 0
     for r in range(ref.shape[0]):
         c = cos(ref[r], got[r])
         cs.append(c)
+        # COSINE IS SCALE-INVARIANT and on its own is not sufficient here.
+        # Measured 2026-08-19: a boundary tensor scaled by anything in ~[1.25,3]
+        # reproduces the device's wrong argmax (105196) while scoring cosine
+        # exactly 1.000000. Test B read that 1.0000 as "shard 0 is perfect" and
+        # concluded the ctx-bins were fine. Magnitude has to be checked too.
+        rr = float(np.sqrt((ref[r].astype(np.float64) ** 2).mean()))
+        gr = float(np.sqrt((got[r].astype(np.float64) ** 2).mean()))
+        mags.append(gr / rr if rr else float("nan"))
         if int(np.argmax(ref[r])) == int(np.argmax(got[r])):
             agree += 1
     worst = min(cs)
+    worst_mag = max(mags, key=lambda m: abs(np.log(m)) if m and m == m and m > 0 else 0)
     mark = "OK  " if worst >= COS_PASS else ("WEAK" if worst >= COS_SUSPECT else "BAD ")
     per_row = " ".join(f"{c:+.4f}" for c in cs)
-    print(f"  {tag:22s} {mark} worst_cos={worst:+.6f}  argmax {agree}/{ref.shape[0]}"
-          f"  {extra}")
+    if not (1 - MAG_TOL <= worst_mag <= 1 + MAG_TOL):
+        mark = "BAD "
+    print(f"  {tag:22s} {mark} worst_cos={worst:+.6f}  mag_ratio={worst_mag:.4f}"
+          f"  argmax {agree}/{ref.shape[0]}  {extra}")
+    if not (1 - MAG_TOL <= worst_mag <= 1 + MAG_TOL):
+        print(f"  {'':22s}      !! MAGNITUDE off by {worst_mag:.3f}x while cosine "
+              f"is {worst:.6f} -- direction right, scale wrong. Cosine alone "
+              "would have called this perfect.")
     if len(cs) > 1:
         print(f"  {'':22s}      per-row cos: {per_row}")
     return worst
@@ -181,7 +199,20 @@ def main():
         ref_h = np.load(args.kit / name / "ref" / "last_hidden_states.npy")
         ref_l = np.load(args.kit / name / "ref" / "logits.npy")
 
+        # Cross-check that we are scoring the SAME shard-0 file the runner fed
+        # to shard 1. If those diverge, "shard 0 is perfect but chaining it
+        # fails" is an artefact of file selection, not a property of the model.
+        fed = args.results / f"{name}_s0_fed.txt"
         p = find_out(args.results / f"{name}_s0", "last_hidden_states")
+        if fed.is_file() and p is not None:
+            want = Path(fed.read_text().strip()).name
+            if want != p.name:
+                print(f"  !! {name}: runner fed {want!r} to shard 1 but this "
+                      f"scores {p.name!r} -- the chained result is NOT comparable "
+                      "to the shard-0 number below. Fix the probe, not the model.")
+        elif not fed.is_file():
+            print(f"  note {name}: no _s0_fed.txt (pre-2026-08-19 runner); cannot "
+                  "confirm the scored file is the one that was chained.")
         got_h = load_rows(p, n_real, ref_h.shape[1], "shard0") if p else None
         c_h = verdict("shard0", ref_h, got_h)
 
