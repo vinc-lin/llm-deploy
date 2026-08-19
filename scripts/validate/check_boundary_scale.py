@@ -81,7 +81,8 @@ def main():
     ref = load(args.ref, "reference") if args.ref else None
     exp = ref.size * 2 if ref is not None else None
     ref_rms = rms(ref) if ref is not None else REF_RMS
-    if ref is not None and abs(ref_rms - REF_RMS) / REF_RMS > 0.01:
+    if (ref is not None and ref.size == ELEMS
+            and abs(ref_rms - REF_RMS) / REF_RMS > 0.01):
         print(f"  note: supplied reference RMS {ref_rms:.4f} differs from the "
               f"recorded {REF_RMS:.4f} -- is this the decode1tok boundary?")
 
@@ -99,7 +100,9 @@ def main():
 
     ratio = dev_rms / ref_rms
 
-    print("\n=== shard-0 boundary, decode1tok ===")
+    rows_n = (ref.size // ELEMS) if ref is not None else 1
+    case = "decode1tok" if rows_n == 1 else f"{rows_n}-row prefill"
+    print(f"\n=== shard-0 boundary, {case} ===")
     print(f"  reference RMS : {ref_rms:.4f}")
     print(f"  device    RMS : {dev_rms:.4f}")
     print(f"  ratio         : {ratio:.4f}x")
@@ -119,8 +122,6 @@ def main():
         print(f"  best-fit gain : {g:.5f}x  (least squares)")
         print(f"  residual after removing it: {rel:.4%} of the norm")
         uniform = rel < 0.02
-        print(f"  -> {'UNIFORM gain' if uniform else 'NOT a single gain'}"
-              f" ({'within' if uniform else 'exceeds'} 2% residual)")
         # Ratios only where the reference is big enough for a ratio to mean
         # anything; state the cut so the number is never read as global.
         floor = max(1e-3, 0.02 * ref_rms)
@@ -134,17 +135,48 @@ def main():
         # is structural, one that does not is a single scalar fault.
         if ref.size % ELEMS == 0 and ref.size // ELEMS > 1:
             rows = ref.size // ELEMS
-            gs = []
+            # Only rows carrying real content. A prefill case zero-pads most of
+            # its rows (prefill4tok: 4 real of 128), and a gain fitted to a
+            # near-zero row is meaningless -- including them would manufacture a
+            # huge spread and read as "structural", which is the same mistake
+            # the percentile heuristic made.
+            row_rms = np.array([np.sqrt((ref[r * ELEMS:(r + 1) * ELEMS] ** 2).mean())
+                                for r in range(rows)])
+            # 1% of the max cleanly separates real tokens from padding here:
+            # measured on prefill4tok the four real rows are 107.2 / 2.26 / 1.26
+            # / 1.20 while all 124 padded rows sit at exactly 0.6185. Row 0
+            # carries this model's massive-activation channels, which is why it
+            # dwarfs the others and why a 5% cut kept only itself.
+            live = row_rms > 0.01 * row_rms.max()
+            gs, idx = [], []
             for r in range(rows):
+                if not live[r]:
+                    continue
                 rr, dd = ref[r * ELEMS:(r + 1) * ELEMS], dev[r * ELEMS:(r + 1) * ELEMS]
                 k = np.isfinite(rr) & np.isfinite(dd)
                 if (rr[k] @ rr[k]) > 0:
-                    gs.append(float(dd[k] @ rr[k] / (rr[k] @ rr[k])))
+                    gs.append(float(dd[k] @ rr[k] / (rr[k] @ rr[k]))); idx.append(r)
             if gs:
                 gs = np.array(gs)
-                print(f"  per-row gain  : min {gs.min():.5f}  max {gs.max():.5f}  "
-                      f"spread {gs.max()-gs.min():.5f} over {len(gs)} rows")
-                print(f"  -> {'SAME on every row' if gs.max()-gs.min() < 0.02 else 'VARIES by row'}")
+                shown = "  ".join(f"r{r}={g:.4f}" for r, g in
+                                  list(zip(idx, gs))[:8])
+                print(f"  per-row gain  : {shown}{'  ...' if len(gs) > 8 else ''}")
+                print(f"                  over {len(gs)} content row(s) of {rows}; "
+                      f"spread {gs.max()-gs.min():.5f}")
+                # A global least-squares fit is dominated by whichever row
+                # carries the massive activations (row 0 here, RMS 107 vs ~1),
+                # so a row-0-only fault can still show a small global residual.
+                # The per-row spread has to be able to overrule it.
+                if gs.max() - gs.min() >= 0.02:
+                    uniform = False
+                    print("  -> VARIES by row -- NOT a single gain, whatever the "
+                          "global residual says (that fit is dominated by the "
+                          "largest row)")
+                else:
+                    print("  -> SAME on every row")
+
+    if dev is not None and ref is not None and dev.size == ref.size:
+        print(f"  UNIFORMITY: {'a single uniform gain' if uniform else 'NOT a single gain'}")
 
     print("\n=== verdict ===")
     # Saturation first: with inf/nan present the RMS ratio is computed over the
