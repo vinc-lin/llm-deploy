@@ -151,9 +151,12 @@ def layer_scan(kit: Path, results: Path, meta):
     if not scan:
         return None
     sdir = kit / meta["case"] / "ref" / "layerscan"
-    past, n_kv, hd = meta["past"], meta["n_kv"], meta["head_dim"]
-    total = past + meta["ar"]
+    n_kv, hd, ar = meta["n_kv"], meta["head_dim"], meta["ar"]
     rows = meta["real_rows"]
+    # The taps hold only the NEW AR-wide slice, so the row index is the AR row
+    # itself. key is [1,n_kv,hd,AR], value [1,n_kv,AR,hd] -- on prefill both are
+    # [1,8,128,128], so the axes are taken by NAME and never inferred.
+    nelem = n_kv * hd * ar
     found, res = 0, {}
     for name in sorted(scan, key=lambda n: (int(n.split("_")[2]),
                                             n.split("_")[1])):
@@ -163,18 +166,18 @@ def layer_scan(kit: Path, results: Path, meta):
             continue
         ref = np.load(ref_p)                       # [n, n_kv, hd]
         raw = dev_p.read_bytes()
-        esz = 2 if len(raw) == n_kv * total * hd * 2 else 4
-        if len(raw) != n_kv * total * hd * esz:
+        esz = len(raw) // nelem if nelem and len(raw) % nelem == 0 else 0
+        if esz not in (2, 4):
             print(f"    !! {name}: {len(raw)} bytes, expected "
-                  f"{n_kv * total * hd * 2} (fp16) -- skipped")
+                  f"{nelem * 2} (fp16) -- skipped")
             continue
         a = np.frombuffer(raw, dtype="<f2" if esz == 2 else "<f4")
         if name.startswith("past_key_"):
-            a = a.reshape(n_kv, hd, total)
-            dev = np.stack([a[:, :, past + r] for r in rows])       # [n,nkv,hd]
+            a = a.reshape(n_kv, hd, ar)
+            dev = np.stack([a[:, :, r] for r in rows])              # [n,nkv,hd]
         else:
-            a = a.reshape(n_kv, total, hd)
-            dev = np.stack([a[:, past + r, :] for r in rows])       # [n,nkv,hd]
+            a = a.reshape(n_kv, ar, hd)
+            dev = np.stack([a[:, r, :] for r in rows])              # [n,nkv,hd]
         found += 1
         layer = int(name.split("_")[2])
         kind = "k" if name.startswith("past_key_") else "v"

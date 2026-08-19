@@ -71,6 +71,12 @@ run_one() {  # $1 label  $2 ctx-bin  $3 list file  $4 output dir
     echo "   exit=$?"
 }
 
+# Every run also writes the 36 per-layer KV tensors, and Test F reads shard 0's
+# as the layer scan. They are cheap to keep: these graphs emit only the NEW
+# AR-wide slice, not the concatenated cache, so a prefill tap is 8x128x128 fp16
+# = 256 KB and a decode tap 2 KB -- about 9 MB per prefill run rather than the
+# 160 MB the full-cache shape would have cost. Nothing needs pruning.
+
 for CASE in $(cat probe_cases.txt); do
     echo ""
     echo "===================== case $CASE ====================="

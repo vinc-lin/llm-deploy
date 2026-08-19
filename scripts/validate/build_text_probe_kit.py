@@ -437,27 +437,34 @@ def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int,
     np.save(cdir / "ref" / "last_hidden_states.npy", hid_r)
     np.save(cdir / "ref" / "logits.npy", lg_r)
 
-    # ---- layer-scan references: the real rows' slice of every per-layer KV
-    # tap. Slices only -- the full tensors would be ~320 MB per case, while the
-    # rows we care about are 300 KB. The position axis differs between key and
-    # value, which is exactly the kind of thing that is silently wrong if
-    # assumed: key is [1, n_kv, head_dim, TOTAL] and value [1, n_kv, TOTAL,
-    # head_dim], so the same token lives on different axes.
+    # ---- layer-scan references: the real rows' slice of every per-layer KV tap.
+    #
+    # These graphs emit only the NEW AR-wide slice, not the concatenated cache:
+    # key  is [1, n_kv, head_dim, AR] and value [1, n_kv, AR, head_dim]. So the
+    # row index is the AR row r, NOT past+r -- indexing at past+r raised
+    # IndexError on the decode graph, whose taps are [.., 1], and would have
+    # silently read the wrong token on prefill, where AR=128 happens to equal
+    # head_dim and every wrong index is still in bounds. The axis carrying AR
+    # also differs between key and value, so both are taken by NAME, never by
+    # shape -- on prefill the two tensors are both [1,8,128,128] and shape alone
+    # cannot tell them apart.
     scan_meta = {}
     if scan_names:
         sdir = cdir / "ref" / "layerscan"
         sdir.mkdir(parents=True, exist_ok=True)
-        past = m0["past"]
         for n, t in taps.items():
-            if n.startswith("past_key_"):
-                sl = t[0, :, :, [past + r for r in real_rows]]      # [nkv,hd,n]
-                sl = np.transpose(sl, (2, 0, 1))                    # [n,nkv,hd]
+            is_key = n.startswith("past_key_")
+            ar_axis = 3 if is_key else 2
+            if t.shape[ar_axis] != m0["ar"]:
+                raise SystemExit(
+                    f"{n}: axis {ar_axis} is {t.shape[ar_axis]}, expected "
+                    f"AR={m0['ar']} -- the tap layout is not what this assumes")
+            if is_key:
+                sl = np.transpose(t[0, :, :, real_rows], (2, 0, 1))  # [n,nkv,hd]
             else:
-                sl = t[0, :, [past + r for r in real_rows], :]      # [nkv,n,hd]
-                sl = np.transpose(sl, (1, 0, 2))                    # [n,nkv,hd]
+                sl = np.transpose(t[0, :, real_rows, :], (1, 0, 2))  # [n,nkv,hd]
             np.save(sdir / f"{n}.npy", np.ascontiguousarray(sl))
-            scan_meta[n] = {"shape": list(t.shape), "slice_index_axis":
-                            3 if n.startswith("past_key_") else 2}
+            scan_meta[n] = {"shape": list(t.shape), "ar_axis": ar_axis}
         del taps
         gc.collect()
 
