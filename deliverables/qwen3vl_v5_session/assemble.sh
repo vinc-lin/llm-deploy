@@ -29,6 +29,13 @@ STAGE_CTRL=$LLMDEPLOY_DATA/hf-staging-lutprobe/qwen3_06b_lutprobe
 STAGE_V5=$LLMDEPLOY_DATA/hf-staging-v5/qwen3vl_4b_e2e_pipeline_v5
 NEW_06B=$LLMDEPLOY_DATA/work/ctxbin/qwen3-0.6b-w8a16-lutprobe-ladekv
 VL_FIX=${VL_FIX:-$LLMDEPLOY_DATA/work/ctxbin/qwen3vl-4b-w8a16-gqa-splitkv-u16in}
+# The qnn-net-run probe kit MUST be built against the ctx-bins that will execute:
+# it writes each input in that tensor's declared native encoding. The v5 session
+# shipped a kit built for the previous FLOAT_16 bins, which silently fed fp16 bit
+# patterns into a UFIXED_POINT_16 input (same byte count, no error) and produced
+# near-zero cosines that read as "the ctx-bins are numerically wrong". Overlaid
+# here rather than inherited from STAGE_V5 so it cannot go stale again.
+PROBE_KIT=${PROBE_KIT:-$LLMDEPLOY_DATA/work/probe_kit_u16}
 
 disk_guard 10
 mkdir -p "$OUT"
@@ -36,6 +43,7 @@ MISSING=()
 
 echo "== docs, prompts, collector =="
 cp "$HERE/TESTING_GUIDE.md" "$HERE/RESULTS_TEMPLATE.md" "$HERE/collect.sh" "$OUT/"
+cp "$LLMDEPLOY_ROOT/docs/ISSUE_qwen3vl_4b_text_numerics.md" "$OUT/"
 cp -r "$HERE/prompts" "$OUT/"
 
 # ---------------------------------------------------------------- 01 control
@@ -48,6 +56,12 @@ if [ -d "$STAGE_CTRL" ]; then
     for f in "$STAGE_CTRL"/*; do
         ln -f "$f" "$D/$(basename "$f")" 2>/dev/null || cp "$f" "$D/"
     done
+    # The staging copy predates the _comment removal, and it is now HARD-LINKED
+    # into this bundle -- writing through the link would corrupt staging too.
+    # Unlink first, then install the current config from the repo.
+    rm -f "$D/genie_dialog_qwen3_0.6b_lutprobe.json"
+    cp "$LLMDEPLOY_ROOT/configs/genie_dialog_qwen3_0.6b_lutprobe.json" "$D/"
+    cp "$LLMDEPLOY_ROOT/configs/genie_dialog_qwen3_0.6b_lutprobe.notes.md" "$D/" 2>/dev/null || true
 else
     MISSING+=("01: $STAGE_CTRL")
 fi
@@ -69,6 +83,7 @@ if [ -f "$NEW_06B/qwen3-0.6b-w8a16-lutprobe-ladekv_ctx.bin" ]; then
     cp "$NEW_06B/qwen3-0.6b-w8a16-lutprobe-ladekv_ctx.bin" "$D/"
     cp "$NEW_06B/info.json" "$D/qwen3-0.6b-w8a16-lutprobe-ladekv_ctx.info.json"
     cp "$LLMDEPLOY_ROOT/configs/genie_dialog_qwen3_0.6b_lutprobe_u16in.json" "$D/"
+    cp "$LLMDEPLOY_ROOT/configs/genie_dialog_qwen3_0.6b_lutprobe_u16in.notes.md" "$D/" 2>/dev/null || true
 else
     MISSING+=("02: $NEW_06B/*_ctx.bin")
 fi
@@ -89,6 +104,13 @@ if [ -d "$STAGE_V5" ]; then
         done
     else
         MISSING+=("03: text ctx-bins not rebuilt yet ($VL_FIX)")
+    fi
+    if [ -d "$PROBE_KIT" ]; then
+        rm -rf "$D/decode1tok" "$D/prefill4tok"
+        cp -r "$PROBE_KIT"/decode1tok "$PROBE_KIT"/prefill4tok \
+              "$PROBE_KIT"/cases.json "$PROBE_KIT"/probe_cases.txt "$D/"
+    else
+        MISSING+=("03: probe kit not rebuilt for these bins ($PROBE_KIT)")
     fi
 else
     MISSING+=("03: $STAGE_V5")

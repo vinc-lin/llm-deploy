@@ -7,6 +7,10 @@ Total board time ≈ **35 minutes**. Nothing here needs a host toolchain.
 Everything you need is in this folder. Paths in the commands are relative to the
 folder you push to the device.
 
+**Also in this folder:** `ISSUE_qwen3vl_4b_text_numerics.md` — what the previous
+session settled, what it did not, and a free re-analysis of the data you already
+have. Read it if you ran the v5 session.
+
 ---
 
 ## 0. What changed since v4, in one paragraph
@@ -190,11 +194,19 @@ Run this **whatever** Test 3 produced — decode rate is the same compute whethe
 the tokens are right or wrong, and we still have no init/TTFT/decode numbers for
 a 4B two-shard W8A16 tower on this silicon.
 
+**Always pass `--max-num-tokens`.** `genie-t2t-run` only flushes its profile JSON
+when a query completes cleanly; if generation runs into
+`Context Size was exceeded / Failed to query`, the handle is freed and the file
+is never written. That cost 7 of ~8 profiles in the previous session, and it was
+our guide's fault for not saying so.
+
 ```sh
 cd /data/local/tmp/v5
-./genie-t2t-run -c genie_dialog_qwen3vl_4b.json -p "What is 2+2? Answer with one number." --profile v5_cold.json
-./genie-t2t-run -c genie_dialog_qwen3vl_4b.json -p "What is 2+2? Answer with one number." --profile v5_warm1.json
-./genie-t2t-run -c genie_dialog_qwen3vl_4b.json -p "What is 2+2? Answer with one number." --profile v5_warm2.json
+for tag in cold warm1 warm2; do
+  ./genie-t2t-run -c genie_dialog_qwen3vl_4b.json \
+      -p "What is 2+2? Answer with one number." \
+      --max-num-tokens 64 --profile v5_$tag.json
+done
 
 for i in 1 2 3; do echo "== pipeline run $i"; time ./genie-app -s genie_pipeline_qwen3vl.script; done 2>&1 | tee v5_timing.log
 ```
@@ -207,6 +219,14 @@ Report **cold and warm separately, never averaged.**
 
 ## Test 5 — `qnn-net-run` text probe (10 min) — *only if Test 3a was garbage*
 
+> **The probe kit in this bundle was rebuilt on 2026-08-19.** The previous one
+> was built for the older `FLOAT_16` ctx-bins and fed the current ones IEEE fp16
+> where they expect `UFIXED_POINT_16` — the same byte count, so nothing errored,
+> and every cosine collapsed toward zero. If you still have the previous
+> session's `v5_probe_out.tar.gz`, **re-analysing it is free and comes first**:
+> see `ISSUE_qwen3vl_4b_text_numerics.md` §4. The comparator now refuses to print
+> a verdict when the kit and the ctx-bin disagree.
+
 This runs the shipped text ctx-bins with **no Genie involved**, on inputs we
 control, against references computed on the host. It answers "is the ctx-bin
 itself right?" — which is the question left over if the Genie-side fix did not
@@ -218,7 +238,20 @@ sh run_text_probe.sh 2>&1 | tee text_probe.log
 ```
 
 Do **not** judge it on the device. Pull the whole `text_probe_out/` directory
-back (it is a few MB); the host compares it.
+back (it is a few MB); the host compares it:
+
+```bash
+$PY_DEPLOY scripts/validate/compare_text_probe.py \
+    --kit <bundle>/03_vl4b_v5 --results text_probe_out \
+    --ctxbin-info-0 <bundle>/03_vl4b_v5/qwen3vl-4b-w8a16_1_of_2.info.json \
+    --ctxbin-info-1 <bundle>/03_vl4b_v5/qwen3vl-4b-w8a16_2_of_2.info.json
+```
+
+It prints `kit/bin encoding cross-check: OK` before any numbers. If it does not,
+stop and report — the numbers below it would be meaningless.
+
+**Report `shard1-isolated` separately from `shard1-chained`.** They answer
+different questions and only the pair localises a fault.
 
 If `qnn-net-run` rejects a flag name, run `./qnn-net-run --help` and report what
 it calls its native input/output file options. **Do not** fall back to feeding

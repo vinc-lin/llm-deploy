@@ -139,6 +139,18 @@ def main():
     if args.ctxbin_info_0 or args.ctxbin_info_1:
         d0 = bin_dtypes(args.ctxbin_info_0) if args.ctxbin_info_0 else {}
         d1 = bin_dtypes(args.ctxbin_info_1) if args.ctxbin_info_1 else {}
+        # A kit built before this guard existed records nothing, and "nothing to
+        # compare" must not read as "verified". That is precisely the kit that
+        # produced the bogus 2026-08-15 numbers.
+        unrec = [c["case"] for c in cases if not c.get("input_dtypes")]
+        if unrec:
+            print("STOP: this probe kit predates the encoding cross-check and does")
+            print(f"      not record what it wrote ({', '.join(unrec)}).")
+            print("      It cannot be trusted against a rebuilt ctx-bin: writing IEEE")
+            print("      fp16 into a UFIXED_POINT_16 input is the same byte count, so")
+            print("      it fails silently and looks like a broken model.")
+            print("      Rebuild it:  build_text_probe_kit.py --ctxbin-info-0 ... --ctxbin-info-1 ...")
+            sys.exit(2)
         mism = []
         for c in cases:
             for key, wrote in (c.get("input_dtypes") or {}).items():
