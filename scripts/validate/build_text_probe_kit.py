@@ -459,10 +459,22 @@ def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int,
                 raise SystemExit(
                     f"{n}: axis {ar_axis} is {t.shape[ar_axis]}, expected "
                     f"AR={m0['ar']} -- the tap layout is not what this assumes")
-            if is_key:
-                sl = np.transpose(t[0, :, :, real_rows], (2, 0, 1))  # [n,nkv,hd]
-            else:
-                sl = np.transpose(t[0, :, real_rows, :], (1, 0, 2))  # [n,nkv,hd]
+            # Drop the batch axis FIRST. `t[0, :, :, real_rows]` looks like the
+            # obvious spelling and is a trap: numpy counts the leading integer 0
+            # as an advanced index too, so with the row list it forms TWO
+            # advanced indices separated by slices and the broadcast dimension
+            # is moved to the FRONT. The result is already [n, n_kv, head_dim]
+            # and the "corrective" transpose then scrambles it -- measured, the
+            # key refs came out [128, n, 8]. Indexing a plain 3-D view has one
+            # advanced index and no such rule.
+            tt = t[0]
+            if is_key:                                   # [n_kv, head_dim, AR]
+                sl = np.transpose(tt[:, :, real_rows], (2, 0, 1))
+            else:                                        # [n_kv, AR, head_dim]
+                sl = np.transpose(tt[:, real_rows, :], (1, 0, 2))
+            if sl.shape != (len(real_rows), m0["n_kv"], m0["head_dim"]):
+                raise SystemExit(f"{n}: sliced to {sl.shape}, expected "
+                                 f"{(len(real_rows), m0['n_kv'], m0['head_dim'])}")
             np.save(sdir / f"{n}.npy", np.ascontiguousarray(sl))
             scan_meta[n] = {"shape": list(t.shape), "ar_axis": ar_axis}
         del taps
