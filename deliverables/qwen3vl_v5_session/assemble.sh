@@ -45,6 +45,9 @@ echo "== docs, prompts, collector =="
 cp "$HERE/TESTING_GUIDE.md" "$HERE/RESULTS_TEMPLATE.md" "$HERE/collect.sh" "$OUT/"
 cp "$LLMDEPLOY_ROOT/docs/ISSUE_qwen3vl_4b_text_numerics.md" "$OUT/"
 cp "$LLMDEPLOY_ROOT/docs/TEST_C_genie_vs_graph_ladder.md" "$OUT/"
+cp "$LLMDEPLOY_ROOT/docs/TEST_E_boundary_scale.md" "$OUT/"
+# Test E is run from the bundle, so ship the checker beside its input.
+cp "$LLMDEPLOY_ROOT/scripts/validate/check_boundary_scale.py" "$OUT/"
 cp -r "$HERE/testc_prompts" "$OUT/"
 cp -r "$HERE/prompts" "$OUT/"
 
