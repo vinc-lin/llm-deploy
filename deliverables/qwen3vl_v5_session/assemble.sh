@@ -44,6 +44,8 @@ MISSING=()
 echo "== docs, prompts, collector =="
 cp "$HERE/TESTING_GUIDE.md" "$HERE/RESULTS_TEMPLATE.md" "$HERE/collect.sh" "$OUT/"
 cp "$LLMDEPLOY_ROOT/docs/ISSUE_qwen3vl_4b_text_numerics.md" "$OUT/"
+cp "$LLMDEPLOY_ROOT/docs/TEST_C_genie_vs_graph_ladder.md" "$OUT/"
+cp -r "$HERE/testc_prompts" "$OUT/"
 cp -r "$HERE/prompts" "$OUT/"
 
 # ---------------------------------------------------------------- 01 control
