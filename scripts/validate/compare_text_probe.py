@@ -25,6 +25,7 @@ are separating is "approximately right" from "unrelated", not grading precision.
 """
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -101,9 +102,65 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kit", required=True, type=Path, help="the built probe kit")
     ap.add_argument("--results", required=True, type=Path, help="pulled text_probe_out/")
+    ap.add_argument("--ctxbin-info-0", type=Path,
+                    help="shard-0 info.json of the bin that was RUN (dtype cross-check)")
+    ap.add_argument("--ctxbin-info-1", type=Path,
+                    help="shard-1 info.json of the bin that was RUN (dtype cross-check)")
     args = ap.parse_args()
 
     cases = json.loads((args.kit / "cases.json").read_text())
+
+    # --- kit/bin encoding cross-check -------------------------------------
+    # The kit writes each device input in the tensor's declared native encoding.
+    # If the bin that actually ran declares something else, every number below is
+    # meaningless -- and meaningless in a way that LOOKS like a broken model:
+    # feeding IEEE fp16 into a UFIXED_POINT_16 input is the same byte count, so
+    # nothing errors, and cosines collapse to ~0. That is exactly what happened in
+    # the 2026-08-15 v5 session and it was read as "the 4B ctx-bins are
+    # numerically incorrect". Refuse to render a verdict instead.
+    def bin_dtypes(info):
+        doc = json.loads(Path(info).read_text())
+        out = {}
+
+        def walk(o):
+            if isinstance(o, dict):
+                for t in o.get("graphInputs", []):
+                    ti = t.get("info", t)
+                    out[ti["name"]] = ti.get("dataType")
+                for v in o.values():
+                    walk(v)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v)
+
+        walk(doc)
+        return out
+
+    if args.ctxbin_info_0 or args.ctxbin_info_1:
+        d0 = bin_dtypes(args.ctxbin_info_0) if args.ctxbin_info_0 else {}
+        d1 = bin_dtypes(args.ctxbin_info_1) if args.ctxbin_info_1 else {}
+        mism = []
+        for c in cases:
+            for key, wrote in (c.get("input_dtypes") or {}).items():
+                shard1 = key.startswith("s1/")
+                nm = key[3:] if shard1 else key
+                have = (d1 if shard1 else d0).get(nm)
+                if have and wrote and have != wrote:
+                    mism.append((c["case"], key, wrote, have))
+        if mism:
+            print("STOP: the kit and the ctx-bin disagree on input encoding.\n")
+            for case, key, wrote, have in mism:
+                print(f"  {case}/{key}: kit wrote {wrote}, bin declares {have}")
+            print("\nEvery cosine/argmax below would be an artefact of that, not a")
+            print("property of the model. Rebuild the kit against THIS bin:")
+            print("  build_text_probe_kit.py --ctxbin-info-0 ... --ctxbin-info-1 ...")
+            sys.exit(2)
+        print(f"kit/bin encoding cross-check: OK "
+              f"({len(cases)} case(s), {len(d0)} shard-0 inputs)\n")
+    elif any(c.get("input_dtypes") for c in cases):
+        print("NOTE: no --ctxbin-info-* given, so the kit/bin encoding cross-check")
+        print("      was skipped. A stale kit produces near-zero cosines that look")
+        print("      exactly like a broken model. Pass them.\n")
     summary = []
     for meta in cases:
         name, n_real = meta["case"], meta["n_real"]

@@ -171,11 +171,74 @@ def run(onnx, feeds, out_name, threads):
     return out, m, f
 
 
-def w16(p: Path, a):
-    p.write_bytes(np.ascontiguousarray(a, dtype=np.float32).astype("<f2").tobytes())
+# --- device input encoding -------------------------------------------------
+# qnn-net-run is invoked with --use_native_input_files, so every .raw must hold
+# the tensor's NATIVE bytes. Writing IEEE fp16 unconditionally was correct only
+# while every input was FLOAT_16; once inputs_embeds became UFIXED_POINT_16 the
+# same 2 bytes/element meant NO size error and NO warning, while the graph
+# decoded fp16 bit patterns as quantized integers. Measured: cosine(intended,
+# received) = -0.72, and a true 0.0 arrives as -11.65. That silently produced
+# "the 4B ctx-bins are numerically wrong" in the 2026-08-15 v5 session.
+#
+# So the encoding is read from the ctx-bin that will actually execute, never
+# assumed, and an unhandled dtype is a hard error rather than a default.
+def tensor_specs(info_json: Path) -> dict:
+    """{tensor name: (dtype, scale, offset)} for every graph input in a bin."""
+    doc = json.loads(info_json.read_text())
+    specs = {}
+
+    def walk(o):
+        if isinstance(o, dict):
+            if "graphInputs" in o:
+                for t in o["graphInputs"]:
+                    ti = t.get("info", t)
+                    so = (ti.get("quantizeParams") or {}).get("scaleOffset") or {}
+                    specs[ti["name"]] = (ti.get("dataType"),
+                                         so.get("scale"), so.get("offset"))
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(doc)
+    if not specs:
+        raise SystemExit(f"no graphInputs found in {info_json}")
+    return specs
 
 
-def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int):
+def write_native(p: Path, a, name: str, specs: dict):
+    """Write `a` as the bytes the graph declares for input `name`."""
+    if name not in specs:
+        raise SystemExit(f"{name!r} is not an input of the ctx-bin "
+                         f"(have: {sorted(specs)[:8]}...) -- kit and bin disagree")
+    dtype, scale, offset = specs[name]
+    a = np.ascontiguousarray(a, dtype=np.float32)
+    if dtype == "QNN_DATATYPE_FLOAT_16":
+        raw = a.astype("<f2")
+    elif dtype == "QNN_DATATYPE_FLOAT_32":
+        raw = a.astype("<f4")
+    elif dtype in ("QNN_DATATYPE_UFIXED_POINT_16", "QNN_DATATYPE_UFIXED_POINT_8"):
+        if scale is None:
+            raise SystemExit(f"{name}: {dtype} with no scaleOffset in the bin")
+        qmax = 65535 if dtype.endswith("16") else 255
+        # value = (q + offset) * scale  ->  q = value/scale - offset
+        q = np.rint(a / scale) - offset
+        lo, hi = float(q.min()), float(q.max())
+        if lo < 0 or hi > qmax:
+            clipped = int((q < 0).sum() + (q > qmax).sum())
+            print(f"      WARN {name}: {clipped} value(s) outside the bin's "
+                  f"encoding range [q {lo:.0f}..{hi:.0f}] vs [0..{qmax}] -- clipped")
+        raw = np.clip(q, 0, qmax).astype("<u2" if qmax == 65535 else "<u1")
+    else:
+        raise SystemExit(f"{name}: unhandled input dtype {dtype!r}. Add a case "
+                         "here rather than letting it fall through to fp16.")
+    p.write_bytes(raw.tobytes())
+    return dtype
+
+
+def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int,
+               specs0: dict, specs1: dict):
     name, kind, n_real = case["name"], case["kind"], case["n_real"]
     g0, g1 = f"{kind}_0", f"{kind}_1"
     cdir = out / name
@@ -206,17 +269,22 @@ def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int):
 
     logits, m1, f1 = run(onnx_split / g1 / f"{g1}.onnx", feeds1, "logits", threads)
 
-    # ---- device inputs, native fp16 ---------------------------------------
+    # ---- device inputs, in each tensor's DECLARED native encoding ---------
+    written = {}
     for t in ("inputs_embeds", "attention_mask", "position_ids_cos",
               "position_ids_sin"):
-        w16(cdir / g0 / f"{t}.raw", f0[t])
+        written[t] = write_native(cdir / g0 / f"{t}.raw", f0[t], t, specs0)
     for dk in m0["deep"]:
-        w16(cdir / g0 / f"{dk}.raw", f0[dk])
+        written[dk] = write_native(cdir / g0 / f"{dk}.raw", f0[dk], dk, specs0)
     for t in ("attention_mask", "position_ids_cos", "position_ids_sin"):
-        w16(cdir / g1 / f"{t}.raw", f1[t])
+        written[f"s1/{t}"] = write_native(cdir / g1 / f"{t}.raw", f1[t], t, specs1)
     # shard 1 fed the HOST reference boundary: the isolation run, which answers
-    # "is shard 1 right given good input?" independently of shard 0.
-    w16(cdir / g1 / "last_hidden_states.raw", f1["last_hidden_states"])
+    # "is shard 1 right given good input?" independently of shard 0. Its inputs
+    # are unaffected by shard 0's encoding, which is what makes it the one run
+    # still valid if the kit and shard 0 ever fall out of sync again.
+    written["s1/last_hidden_states"] = write_native(
+        cdir / g1 / "last_hidden_states.raw", f1["last_hidden_states"],
+        "last_hidden_states", specs1)
 
     # ---- references. Only the real rows: padding rows are meaningless, and
     # full prefill logits would be 78 MB of mostly-padding per case. ---------
@@ -250,7 +318,11 @@ def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int):
             "last_row_top10_ids": [int(t) for t in top],
             "last_row_argmax": int(top[0]),
             "mask_value": MASK_VALUE, "rope_theta": ROPE_THETA,
-            "deep_names": m0["deep"]}
+            "deep_names": m0["deep"],
+            # What the kit encoded each input AS. compare_text_probe.py checks
+            # this against the bin it was actually run on and refuses to give a
+            # verdict if they differ -- a stale kit must never look like a defect.
+            "input_dtypes": written}
     (cdir / "ref" / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
     print(f"  {name:12s} AR={m0['ar']:<4} rows={n_real}  last-row argmax="
           f"{meta['last_row_argmax']}  top5={meta['last_row_top10_ids'][:5]}")
@@ -264,6 +336,10 @@ def main():
     ap.add_argument("--lut", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--ctxbin-info-0", required=True, type=Path,
+                    help="info.json of the shard-0 ctx-bin that will execute")
+    ap.add_argument("--ctxbin-info-1", required=True, type=Path,
+                    help="info.json of the shard-1 ctx-bin that will execute")
     args = ap.parse_args()
 
     for g in ("decode_0", "decode_1", "prefill_0", "prefill_1"):
@@ -271,9 +347,18 @@ def main():
         if not p.is_file():
             raise SystemExit(f"missing {p} -- must be the SAME ONNX the DLCs "
                              "were converted from, not a re-export")
+    specs0 = tensor_specs(args.ctxbin_info_0)
+    specs1 = tensor_specs(args.ctxbin_info_1)
+    print("encoding device inputs to match the ctx-bins:")
+    for n in ("inputs_embeds", "attention_mask"):
+        if n in specs0:
+            print(f"  shard0 {n}: {specs0[n][0]} scale={specs0[n][1]} offset={specs0[n][2]}")
+    if "last_hidden_states" in specs1:
+        print(f"  shard1 last_hidden_states: {specs1['last_hidden_states'][0]}")
     args.out.mkdir(parents=True, exist_ok=True)
     print(f"building text probe -> {args.out}")
-    metas = [build_case(c, args.onnx_split, args.lut, args.out, args.threads)
+    metas = [build_case(c, args.onnx_split, args.lut, args.out, args.threads,
+                        specs0, specs1)
              for c in CASES]
     (args.out / "cases.json").write_text(json.dumps(metas, indent=1) + "\n")
     (args.out / "probe_cases.txt").write_text(
