@@ -76,14 +76,64 @@ DEEPSTACK = 3
 # here needs a tokenizer to be present on tank.
 TOKENS = [3838, 374, 264, 1273]
 
-CASES = [
-    {"name": "decode1tok", "kind": "decode", "n_real": 1,
+CASES_V5 = [
+    {"name": "decode1tok", "kind": "decode", "n_real": 1, "mask": "causal",
      "why": "1 token, empty cache -- rope cancels in self-attention, so this "
             "is a clean read on pure numerics"},
-    {"name": "prefill4tok", "kind": "prefill", "n_real": 4,
+    {"name": "prefill4tok", "kind": "prefill", "n_real": 4, "mask": "causal",
      "why": "4 tokens, empty cache -- rope and cross-token attention are live, "
             "and these are the graphs the real prompt uses"},
 ]
+
+# --- Test F ---------------------------------------------------------------
+# Test E measured a UNIFORM 1.3896x gain on shard 0's boundary output, and the
+# per-row follow-up localised it to ROW 0 ALONE (rows 1-3 sit at 0.93/1.00/0.99).
+# The same 1.3896x appears in decode1tok, a different graph. What those two share
+# is not the graph and not the position value: it is that the row ATTENDS ONLY TO
+# ITSELF -- the attention-sink condition, under which this row carries massive
+# activations (RMS 107.2 vs ~1-2 elsewhere; c4=5244 alone is 93.4% of its norm).
+#
+# Two candidate causes remain and they need different fixes:
+#   (a) the CONDITION  -- self-attention / massive activations overflow or clamp
+#                         somewhere, so any such row is amplified wherever it sits;
+#   (b) the ROW INDEX  -- something specific to element 0 of the AR window
+#                         (a tile edge, an offset bug), and the sink is incidental.
+#
+# These four cases separate them by changing ONLY the mask and where the real
+# tokens sit in the AR window -- both already shipped graph inputs, so no rebuild,
+# no new bytes, and the host reference is computed from the identical feed.
+#
+#            sink at row 0     no sink at row 0
+#   row 0 :  fp_ctrl  (known 1.39x)   f1_row0ctx
+#   row 4 :  f2_shift4                 --
+#
+# f2_shift4 is the sharp one: its row 4 performs a computation numerically
+# IDENTICAL to fp_ctrl's row 0 (same token, same self-only mask, same rope
+# position 0), differing only in which row of the tensor it occupies. The builder
+# asserts that host-side equality, so any device difference between them is the
+# index effect and nothing else.
+CASES_F = [
+    {"name": "f0_ctrl_dec", "kind": "decode", "n_real": 1, "mask": "causal",
+     "why": "decode anchor -- must reproduce the measured 1.3896x, otherwise the "
+            "device is not in the state Test E measured and nothing below is "
+            "comparable",
+     "asks": "is the device still in the Test E state?"},
+    {"name": "fp_ctrl_pre", "kind": "prefill", "n_real": 4, "mask": "causal",
+     "why": "prefill anchor -- the known pattern: row 0 at ~1.39x, rows 1-3 clean",
+     "asks": "is the prefill row pattern still row-0-only?"},
+    {"name": "f1_row0ctx", "kind": "prefill", "n_real": 4, "mask": "row0_full",
+     "why": "row 0 is made NON-causal: it attends to all four tokens instead of "
+            "itself alone. Row index still 0, sink condition removed",
+     "asks": "does the gain survive when row 0 has real context?"},
+    {"name": "f2_shift4", "kind": "prefill", "n_real": 4, "mask": "causal",
+     "row_offset": 4,
+     "why": "the same four tokens moved to rows 4-7 with rope positions 0-3; rows "
+            "0-3 are masked padding. Row 4 now does exactly what fp_ctrl's row 0 "
+            "does. Sink condition kept, row index moved",
+     "asks": "does the gain follow the sink to row 4, or stay at row 0?"},
+]
+
+SUITES = {"v5": CASES_V5, "f": CASES_F}
 
 
 def lut_row(lut_dir: Path, token: int) -> np.ndarray:
@@ -129,7 +179,7 @@ def zeros_past(m):
     return f
 
 
-def build_mask_rope(m, n_real):
+def build_mask_rope(m, case):
     """Mask + rope tables for an EMPTY cache, per parity_e2e_vl.
 
     decode  (AR==1): additive MASK_VALUE, 0.0 only at index PAST -- the new
@@ -137,27 +187,66 @@ def build_mask_rope(m, n_real):
     prefill (AR>1) : row i sees the valid past span [0, nv) -- empty here, so
                      nothing -- plus the causal new span [PAST, PAST+i].
     Rows past n_real stay fully masked; their KV is never committed.
+
+    Test F varies two things and nothing else:
+
+      row_offset   where the real tokens sit in the AR window. The real rows
+                   become [off, off+n_real); rope position i is assigned to row
+                   off+i, so row off computes EXACTLY what row 0 computes in the
+                   unshifted case -- same token, same self-only attention, same
+                   rope angle -- at a different tensor row.
+      mask=row0_full
+                   the first real row additionally attends to every other real
+                   row (non-causal). Not a valid LM step, but a valid graph
+                   execution, and the host reference is computed from the same
+                   mask -- which is the only thing that has to be true.
+
+    Fully-masked rows are well defined here: MASK_VALUE is -100.0, not -inf, so
+    softmax over an all-masked row is uniform rather than NaN.
+
+    Returns (mask, cos, sin, real_rows) where real_rows are the AR indices that
+    carry a token, in token order.
     """
     import torch
     ar, total, past, half = m["ar"], m["total"], m["past"], m["head_dim"] // 2
+    n_real = case["n_real"]
     if ar == 1:
+        if case.get("row_offset") or case.get("mask", "causal") != "causal":
+            raise SystemExit(f"{case['name']}: a decode graph has one row; "
+                             "row_offset/mask variants need kind=prefill")
         mask = np.full((1, 1, total), MASK_VALUE, dtype=np.float32)
         mask[0, 0, past] = 0.0
         cos, sin = rope_tables(torch.arange(1), m["head_dim"], ROPE_THETA)
-        return mask, cos.numpy().astype(np.float32), sin.numpy().astype(np.float32)
+        return (mask, cos.numpy().astype(np.float32),
+                sin.numpy().astype(np.float32), [0])
+
+    off = case.get("row_offset", 0)
+    kind = case.get("mask", "causal")
+    if off + n_real > ar:
+        raise SystemExit(f"{case['name']}: rows {off}..{off + n_real - 1} "
+                         f"do not fit in AR={ar}")
+    real_rows = [off + i for i in range(n_real)]
 
     mask = np.full((1, ar, total), MASK_VALUE, dtype=np.float32)
     for i in range(n_real):
-        mask[0, i, past:past + i + 1] = 0.0     # causal new span; no valid past
+        # causal over the real span only; no valid past in an empty cache
+        mask[0, off + i, past + off:past + off + i + 1] = 0.0
+    if kind == "row0_full":
+        mask[0, off, past + off:past + off + n_real] = 0.0
+    elif kind != "causal":
+        raise SystemExit(f"{case['name']}: unknown mask {kind!r}")
+
     c, s = rope_tables(torch.arange(n_real), m["head_dim"], ROPE_THETA)
     cos = np.zeros((1, ar, half), dtype=np.float32)
     sin = np.zeros((1, ar, half), dtype=np.float32)
-    cos[0, :n_real] = c.numpy()[0]
-    sin[0, :n_real] = s.numpy()[0]
-    return mask, cos, sin
+    cos[0, off:off + n_real] = c.numpy()[0]
+    sin[0, off:off + n_real] = s.numpy()[0]
+    return mask, cos, sin, real_rows
 
 
-def run(onnx, feeds, out_name, threads):
+def run(onnx, feeds, out_name, threads, extra_outputs=()):
+    """Run one shard. `extra_outputs` additionally fetches named graph outputs
+    (the per-layer KV taps) and returns them in a dict."""
     import onnxruntime as ort
     so = ort.SessionOptions()
     if threads:
@@ -165,10 +254,18 @@ def run(onnx, feeds, out_name, threads):
     sess = ort.InferenceSession(str(onnx), so, providers=["CPUExecutionProvider"])
     m = meta_of(sess)
     f = feeds(m)
-    out = np.asarray(sess.run([out_name], f)[0], dtype=np.float32)
-    del sess
+    wanted = [out_name] + list(extra_outputs)
+    have = {o.name for o in sess.get_outputs()}
+    missing = [w for w in wanted if w not in have]
+    if missing:
+        raise SystemExit(f"{onnx}: no such graph output(s) {missing}")
+    res = sess.run(wanted, f)
+    out = np.asarray(res[0], dtype=np.float32)
+    extra = {n: np.asarray(v, dtype=np.float32)
+             for n, v in zip(wanted[1:], res[1:])}
+    del sess, res
     gc.collect()
-    return out, m, f
+    return out, m, f, extra
 
 
 # --- device input encoding -------------------------------------------------
@@ -238,36 +335,83 @@ def write_native(p: Path, a, name: str, specs: dict):
 
 
 def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int,
-               specs0: dict, specs1: dict):
+               specs0: dict, specs1: dict, layer_scan: bool = False):
     name, kind, n_real = case["name"], case["kind"], case["n_real"]
     g0, g1 = f"{kind}_0", f"{kind}_1"
     cdir = out / name
     for sub in (g0, g1, "ref"):
         (cdir / sub).mkdir(parents=True, exist_ok=True)
 
-    rows = np.stack([lut_row(lut, t) for t in TOKENS[:n_real]])   # [n, H]
+    toks = case.get("tokens", TOKENS[:n_real])
+    rows = np.stack([lut_row(lut, t) for t in toks])              # [n, H]
     H = rows.shape[1]
+    real_rows_box = {}
 
     def feeds0(m):
-        mask, cos, sin = build_mask_rope(m, n_real)
+        mask, cos, sin, real_rows = build_mask_rope(m, case)
+        real_rows_box["r"] = real_rows
         emb = np.zeros((1, 1, m["ar"], H), dtype=np.float32)
-        emb[0, 0, :n_real] = rows
+        emb[0, 0, real_rows] = rows
         f = {"inputs_embeds": emb, "attention_mask": mask,
              "position_ids_cos": cos, "position_ids_sin": sin, **zeros_past(m)}
         for dk in m["deep"]:
             f[dk] = np.zeros((1, 1, m["ar"], H), dtype=np.float32)
         return f
 
-    hidden, m0, f0 = run(onnx_split / g0 / f"{g0}.onnx", feeds0,
-                         "last_hidden_states", threads)
+    # The per-layer KV taps are the layer scan: shard 0 already writes all 36 of
+    # these tensors on every run and they have never once been compared, so this
+    # costs no extra device time at all.
+    #
+    # WHAT THEY CAN AND CANNOT SEE -- verified against the graph, not assumed.
+    # Tracing decode_0 back from `past_value_0_out` shows v_proj consuming
+    # `input_layernorm`'s output, and `past_key_0_out` consuming k_proj ->
+    # k_norm, i.e. TWO RMSNorms. RMSNorm is scale-invariant, so:
+    #
+    #   * a uniform gain on the residual is normalised away before it reaches
+    #     either tap. The scan therefore CANNOT tell us which layer a pure scale
+    #     enters at -- the first draft of this code claimed it could, and that
+    #     was wrong.
+    #   * what the taps do read is the residual DIRECTION at every layer, and
+    #     the correctness of each RMSNorm denominator.
+    #
+    # That second property is the sharp one. The leading mechanism for a row-0-
+    # only fault is fp16 saturation on this row's massive activations: c4=5244
+    # gives c4^2 = 2.75e7 against an fp16 max of 65504, a 420x overflow, and the
+    # first place a sum of squares is taken is precisely input_layernorm. If that
+    # denominator saturates, RMSNorm's output is wrong, and v_proj sees it -- so
+    # the taps WOULD be dirty, at the layer where it starts. Hence:
+    #
+    #   taps clean at all 18 layers  -> every RMSNorm denominator is intact; the
+    #                                   computation is fine and only the final
+    #                                   magnitude is wrong (output/residual path)
+    #   taps dirty from layer k      -> the fault is inside the block maths from
+    #                                   layer k, and the overflow story is live
+    #
+    # Both outcomes are informative, which is what makes the scan worth pulling.
+    scan_names = []
+    if layer_scan:
+        import onnx as _onnx
+        g = _onnx.load(str(onnx_split / g0 / f"{g0}.onnx"),
+                       load_external_data=False)
+        outs = {o.name for o in g.graph.output}
+        scan_names = sorted(
+            (n for n in outs
+             if n.startswith(("past_key_", "past_value_")) and n.endswith("_out")),
+            key=lambda n: (int(n.split("_")[2]), n.split("_")[1]))
+        del g
+
+    hidden, m0, f0, taps = run(onnx_split / g0 / f"{g0}.onnx", feeds0,
+                               "last_hidden_states", threads, scan_names)
+    real_rows = real_rows_box["r"]
 
     def feeds1(m):
-        mask, cos, sin = build_mask_rope(m, n_real)
+        mask, cos, sin, _ = build_mask_rope(m, case)
         return {"last_hidden_states": hidden.reshape(1, m["ar"], H),
                 "attention_mask": mask, "position_ids_cos": cos,
                 "position_ids_sin": sin, **zeros_past(m)}
 
-    logits, m1, f1 = run(onnx_split / g1 / f"{g1}.onnx", feeds1, "logits", threads)
+    logits, m1, f1, _ = run(onnx_split / g1 / f"{g1}.onnx", feeds1, "logits",
+                            threads)
 
     # ---- device inputs, in each tensor's DECLARED native encoding ---------
     written = {}
@@ -288,10 +432,34 @@ def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int,
 
     # ---- references. Only the real rows: padding rows are meaningless, and
     # full prefill logits would be 78 MB of mostly-padding per case. ---------
-    hid_r = hidden.reshape(m0["ar"], H)[:n_real]
-    lg_r = logits.reshape(m1["ar"], -1)[:n_real]
+    hid_r = hidden.reshape(m0["ar"], H)[real_rows]
+    lg_r = logits.reshape(m1["ar"], -1)[real_rows]
     np.save(cdir / "ref" / "last_hidden_states.npy", hid_r)
     np.save(cdir / "ref" / "logits.npy", lg_r)
+
+    # ---- layer-scan references: the real rows' slice of every per-layer KV
+    # tap. Slices only -- the full tensors would be ~320 MB per case, while the
+    # rows we care about are 300 KB. The position axis differs between key and
+    # value, which is exactly the kind of thing that is silently wrong if
+    # assumed: key is [1, n_kv, head_dim, TOTAL] and value [1, n_kv, TOTAL,
+    # head_dim], so the same token lives on different axes.
+    scan_meta = {}
+    if scan_names:
+        sdir = cdir / "ref" / "layerscan"
+        sdir.mkdir(parents=True, exist_ok=True)
+        past = m0["past"]
+        for n, t in taps.items():
+            if n.startswith("past_key_"):
+                sl = t[0, :, :, [past + r for r in real_rows]]      # [nkv,hd,n]
+                sl = np.transpose(sl, (2, 0, 1))                    # [n,nkv,hd]
+            else:
+                sl = t[0, :, [past + r for r in real_rows], :]      # [nkv,n,hd]
+                sl = np.transpose(sl, (1, 0, 2))                    # [n,nkv,hd]
+            np.save(sdir / f"{n}.npy", np.ascontiguousarray(sl))
+            scan_meta[n] = {"shape": list(t.shape), "slice_index_axis":
+                            3 if n.startswith("past_key_") else 2}
+        del taps
+        gc.collect()
 
     # ---- a spec the POSIX-sh runner can `.` source -------------------------
     # PAST_BYTES is per-case, not a constant: the past-KV prefill carries
@@ -303,6 +471,7 @@ def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int,
         "shards disagree on past-KV size"
     env = [f"KIND={kind}", f"G0={g0}", f"G1={g1}", f"GRAPH_IDX={graph_idx}",
            f"AR={m0['ar']}", f"N_REAL={n_real}",
+           f"REAL_ROWS='{' '.join(str(r) for r in real_rows)}'",
            f"LAYER_BASE_0={m0['layer_idx'][0]}", f"LAYER_N_0={len(m0['layer_idx'])}",
            f"LAYER_BASE_1={m1['layer_idx'][0]}", f"LAYER_N_1={len(m1['layer_idx'])}",
            f"DEEP='{' '.join(m0['deep'])}'",
@@ -311,21 +480,37 @@ def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int,
     (cdir / "case.env").write_text("\n".join(env) + "\n")
 
     top = np.argsort(-lg_r[-1])[:10]
+    # Per-row RMS of the host boundary. This is the case's OWN evidence that it
+    # achieved the condition it was built for: f1_row0ctx is only informative if
+    # giving row 0 real context actually collapses its magnitude, and that is an
+    # empirical question about this checkpoint, not something to assume. Printed
+    # at build time so a case that failed its premise is caught here rather than
+    # after a device session.
+    row_rms = [float(np.sqrt((hid_r[i].astype(np.float64) ** 2).mean()))
+               for i in range(hid_r.shape[0])]
     meta = {"case": name, "kind": kind, "n_real": n_real, "why": case["why"],
-            "tokens": TOKENS[:n_real], "graph_idx": graph_idx,
+            "asks": case.get("asks"), "tokens": [int(t) for t in toks],
+            "graph_idx": graph_idx, "mask": case.get("mask", "causal"),
+            "row_offset": case.get("row_offset", 0),
+            "real_rows": [int(r) for r in real_rows],
             "ar": m0["ar"], "hidden_rows": list(hid_r.shape),
             "logits_rows": list(lg_r.shape),
+            "ref_row_rms": row_rms,
             "last_row_top10_ids": [int(t) for t in top],
             "last_row_argmax": int(top[0]),
             "mask_value": MASK_VALUE, "rope_theta": ROPE_THETA,
-            "deep_names": m0["deep"],
+            "deep_names": m0["deep"], "past": m0["past"],
+            "n_kv": m0["n_kv"], "head_dim": m0["head_dim"],
+            "layerscan": scan_meta,
             # What the kit encoded each input AS. compare_text_probe.py checks
             # this against the bin it was actually run on and refuses to give a
             # verdict if they differ -- a stale kit must never look like a defect.
             "input_dtypes": written}
     (cdir / "ref" / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
-    print(f"  {name:12s} AR={m0['ar']:<4} rows={n_real}  last-row argmax="
-          f"{meta['last_row_argmax']}  top5={meta['last_row_top10_ids'][:5]}")
+    rms_s = " ".join(f"r{r}={v:.3f}" for r, v in zip(real_rows, row_rms))
+    print(f"  {name:12s} AR={m0['ar']:<4} rows={real_rows}  argmax="
+          f"{meta['last_row_argmax']:<7} host row RMS: {rms_s}"
+          f"{'  +layerscan' if scan_meta else ''}")
     gc.collect()
     return meta
 
@@ -340,6 +525,12 @@ def main():
                     help="info.json of the shard-0 ctx-bin that will execute")
     ap.add_argument("--ctxbin-info-1", required=True, type=Path,
                     help="info.json of the shard-1 ctx-bin that will execute")
+    ap.add_argument("--suite", default="v5", choices=sorted(SUITES),
+                    help="v5 = the original two cases; f = the Test F matrix")
+    ap.add_argument("--layer-scan", action="store_true",
+                    help="also save per-layer KV sink-row references, so the "
+                         "gain can be localised to a layer from outputs the "
+                         "device already writes (default on for --suite f)")
     args = ap.parse_args()
 
     for g in ("decode_0", "decode_1", "prefill_0", "prefill_1"):
@@ -355,15 +546,67 @@ def main():
             print(f"  shard0 {n}: {specs0[n][0]} scale={specs0[n][1]} offset={specs0[n][2]}")
     if "last_hidden_states" in specs1:
         print(f"  shard1 last_hidden_states: {specs1['last_hidden_states'][0]}")
+    cases = SUITES[args.suite]
+    scan = args.layer_scan or args.suite == "f"
     args.out.mkdir(parents=True, exist_ok=True)
-    print(f"building text probe -> {args.out}")
+    print(f"building text probe suite {args.suite!r} -> {args.out}")
     metas = [build_case(c, args.onnx_split, args.lut, args.out, args.threads,
-                        specs0, specs1)
-             for c in CASES]
+                        specs0, specs1, scan)
+             for c in cases]
     (args.out / "cases.json").write_text(json.dumps(metas, indent=1) + "\n")
     (args.out / "probe_cases.txt").write_text(
         "\n".join(m["case"] for m in metas) + "\n")
+    if args.suite == "f":
+        check_f_premises(metas, args.out)
     print(f"\nwrote {len(metas)} case(s) to {args.out}")
+
+
+def check_f_premises(metas, out: Path):
+    """Test F only means anything if its cases really are what they claim.
+
+    Both checks are host-side and free, and both have caught nothing so far --
+    which is the point: they are here so that a case whose premise silently
+    failed is rejected at build time instead of consuming a device session and
+    then being interpreted as a result.
+    """
+    by = {m["case"]: m for m in metas}
+    print("\n=== Test F premises (host side) ===")
+    ok = True
+
+    # 1. f2_shift4's row 4 must compute EXACTLY what fp_ctrl's row 0 computes.
+    #    Same token, same self-only mask, same rope position 0 -- only the row
+    #    index differs. If the host disagrees, the shift changed the computation
+    #    and the case cannot isolate the index.
+    a, b = by.get("fp_ctrl_pre"), by.get("f2_shift4")
+    if a and b:
+        ha = np.load(out / a["case"] / "ref" / "last_hidden_states.npy")[0]
+        hb = np.load(out / b["case"] / "ref" / "last_hidden_states.npy")[0]
+        d = float(np.abs(ha - hb).max())
+        rel = d / max(float(np.abs(ha).max()), 1e-9)
+        good = rel < 1e-4
+        ok &= good
+        print(f"  {'OK ' if good else 'FAIL'} f2_shift4 row4 == fp_ctrl row0 on "
+              f"the host: max|diff|={d:.3e} (rel {rel:.2e})")
+        if not good:
+            print("       -> the shift changed the computation; f2 cannot "
+                  "isolate the row index. Do not ship this case.")
+
+    # 2. f1_row0ctx must actually remove the sink, i.e. collapse row 0's
+    #    magnitude. If giving row 0 context leaves it at ~107 RMS, the case
+    #    tests nothing about massive activations and must be read accordingly.
+    c = by.get("f1_row0ctx")
+    if c and a:
+        r0_ctrl, r0_ctx = a["ref_row_rms"][0], c["ref_row_rms"][0]
+        drop = r0_ctx / r0_ctrl if r0_ctrl else float("nan")
+        good = drop < 0.5
+        print(f"  {'OK ' if good else 'WARN'} f1_row0ctx removes the sink: row-0 "
+              f"RMS {r0_ctrl:.2f} -> {r0_ctx:.2f} ({drop:.2f}x)")
+        if not good:
+            print("       -> context did NOT collapse row 0's magnitude on this "
+                  "checkpoint. The case still tests 'attends only to itself', "
+                  "but it is NOT a magnitude test. Say so when reporting.")
+    if not ok:
+        raise SystemExit("Test F premise check failed -- see above")
 
 
 if __name__ == "__main__":
