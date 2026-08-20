@@ -167,7 +167,7 @@ CASES_R = [
             "spliced in -- the actual production path",
      "asks": "does the boundary hold on a realistic image prompt?"},
     {"name": "r2_chunk0", "kind": "prefill", "mask": "window",
-     "match": "chunk0[0:128]", "prefer_split": "calib",
+     "match": "img0-chunk0[0:128]", "prefer_split": "calib",
      "why": "a FULL 128-row first chunk of a long image turn -- no padding at "
             "all, the densest realistic input available",
      "asks": "does the boundary hold with the AR window completely full?"},
