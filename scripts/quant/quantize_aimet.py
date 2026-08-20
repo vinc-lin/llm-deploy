@@ -4,9 +4,9 @@
 Reconstructed from docs/archive/SA8797P_Deployment_Status_Summary.md §2.2:
 - default_param_bw=8 (per-channel symmetric via config json), default_output_bw=16
 - quant_scheme = post_training_tf_enhanced (weights; and activations too unless
-  --act-range-scheme is given — see set_activation_range_scheme: tf_enhanced
-  discards outliers by design, which clips attention-sink activations and broke
-  the Qwen3-VL-4B text tower)
+  --act-range-scheme overrides just the activations — see
+  set_activation_range_scheme, and read its warning before assuming that flag
+  fixes anything)
 - calibration: ~10 mixed zh/en/code/math prompts
 - clip_weights_to_7f7f: avoid INT8 saturation (reconstructed: clamp weights so
   no value quantizes to -128; i.e. symmetric ±127 range)  [FLAGGED for review]
@@ -288,19 +288,23 @@ def set_activation_range_scheme(sim, scheme, percentile):
     """Replace the range estimator on ACTIVATION quantizers only.
 
     WHY THIS EXISTS (2026-08-20). `post_training_tf_enhanced` is an MSE-optimal
-    range search: it sweeps candidate ranges and keeps the one minimising
-    quantization error over the observed distribution, which means it
-    DELIBERATELY discards outliers -- sacrificing one extreme value to buy finer
-    resolution for the other 2559. That is the right trade almost everywhere and
-    exactly the wrong one on an attention-sink row, whose massive activations
-    sit orders of magnitude above the bulk.
+    range search, so it CAN discard outliers -- sacrificing one extreme value to
+    buy finer resolution for the rest. On an attention-sink row, whose massive
+    activations sit orders of magnitude above the bulk, that would be exactly the
+    wrong trade, and this flag exists to switch it off.
 
-    Measured on Qwen3-VL-4B: `layers.0/mlp/down_proj` was calibrated to 5.482
-    while the sink row actually reaches 9.00, and `layers.1/mlp/Mul_1` to 59.272
-    against 61.40. Clamping just those two in the host fp32 graph reproduces the
-    device's boundary defect -- gain 1.3914 vs 1.38959 measured, residual 0.416%
-    vs 0.447%, cosine 0.999991 vs 0.999990. See
-    `docs/ROOTCAUSE_qwen3vl_4b_boundary_gain.md`.
+    ⚠ IT IS NOT THE FIX FOR THE QWEN3-VL-4B TEXT TOWER, THOUGH IT WAS ADDED FOR
+    IT. Measurement showed tf_enhanced discarded nothing there: the calibrated
+    ranges sit ON the observed calibration maximum (`layers.0/mlp/down_proj`
+    5.4819 vs 5.4805 observed; `gate_proj` 3.0768 vs 3.0771), so minmax would
+    produce the same ranges. The requantize this flag was written for was
+    cancelled before it ran. See `docs/ROOTCAUSE_qwen3vl_4b_boundary_gain.md` §2.2
+    -- and check `scan_clipping_realistic.py` on a realistic input BEFORE
+    reaching for this flag, rather than after.
+
+    Kept because the lever is real and cheap, and because a future calibration
+    set that does contain sink extremes would need it so tf_enhanced cannot then
+    throw them away.
 
     ACTIVATIONS ONLY, on purpose. The sim-level `quant_scheme` applies to
     weights as well, and the weight path (per-channel symmetric INT8, plus
@@ -435,10 +439,10 @@ def main():
                     default="tf_enhanced",
                     help="range estimator for ACTIVATION quantizers only "
                          "(weights always keep tf_enhanced). Default reproduces "
-                         "every build before 2026-08-20 byte-for-byte. "
-                         "'minmax' fixes the attention-sink clipping that broke "
-                         "the Qwen3-VL-4B text tower — see "
-                         "docs/ROOTCAUSE_qwen3vl_4b_boundary_gain.md")
+                         "every build before 2026-08-20 byte-for-byte. NOTE: on "
+                         "Qwen3-VL-4B the calibrated ranges already sit on the "
+                         "observed max, so minmax changes nothing there — run "
+                         "scan_clipping_realistic.py first")
     ap.add_argument("--act-percentile", type=float, default=99.99,
                     help="with --act-range-scheme percentile")
     args = ap.parse_args()
