@@ -133,7 +133,47 @@ CASES_F = [
      "asks": "does the gain follow the sink to row 4, or stay at row 0?"},
 ]
 
-SUITES = {"v5": CASES_V5, "f": CASES_F}
+# --- realistic suite -------------------------------------------------------
+# WHY THIS SUITE EXISTS. Every probe before it fed BARE TOKEN IDS -- decode1tok
+# is token 3838 alone at position 0, prefill4tok is four content words. A
+# production prompt never looks like that: it is chat-templated and begins
+# <|im_start|>. Measured 2026-08-20, that difference is the whole result. The
+# Test F probe's row 0 lands 1.64x outside its calibrated activation range and
+# produces the 1.39x boundary gain the device measured; six realistic
+# chat-templated windows put row 0 at gain 0.9990, worst 0.035 over rows 0-3,
+# and the model's REAL attention sink turns out to sit at row 1 with RMS 220.3
+# -- larger than the probe's synthetic row-0 sink at 107.2 -- and comes through
+# at 1.0000. So the earlier probes reproduced a defect they had manufactured.
+#
+# These cases are built from the multimodal calibration/eval windows
+# (vl_calib_build.py), which are chat-templated turns with real ViT features
+# spliced onto the image-token positions -- i.e. exactly what qualla feeds. The
+# EVAL split is held out from calibration and is preferred for that reason.
+#
+# DEEPSTACK IS ZEROED, deliberately, even though the windows carry real values.
+# The shipped model runs with the deepstack inputs zero-filled
+# (initializeUnconnectedInputs; the tower is built HF-minus-deepstack), so
+# feeding the real features would make the probe LESS production-faithful, not
+# more -- the opposite of this suite's whole purpose.
+CASES_R = [
+    {"name": "r0_text", "kind": "prefill", "mask": "window",
+     "match": "The capital of France", "prefer_split": "eval",
+     "why": "held-out chat-templated TEXT turn: row 0 is <|im_start|>, not a "
+            "content word",
+     "asks": "does the boundary hold on a realistic text prompt?"},
+    {"name": "r1_image", "kind": "prefill", "mask": "window",
+     "match": "img100", "prefer_split": "eval",
+     "why": "held-out chat-templated IMAGE+text turn with real ViT features "
+            "spliced in -- the actual production path",
+     "asks": "does the boundary hold on a realistic image prompt?"},
+    {"name": "r2_chunk0", "kind": "prefill", "mask": "window",
+     "match": "chunk0[0:128]", "prefer_split": "calib",
+     "why": "a FULL 128-row first chunk of a long image turn -- no padding at "
+            "all, the densest realistic input available",
+     "asks": "does the boundary hold with the AR window completely full?"},
+]
+
+SUITES = {"v5": CASES_V5, "f": CASES_F, "r": CASES_R}
 
 
 def lut_row(lut_dir: Path, token: int) -> np.ndarray:
@@ -209,6 +249,19 @@ def build_mask_rope(m, case):
     """
     import torch
     ar, total, past, half = m["ar"], m["total"], m["past"], m["head_dim"] // 2
+    if case.get("mask") == "window":
+        # A prebuilt calibration/eval window. Its mask is the UNSPLIT causal
+        # [1, AR, AR] the quantizer calibrated against; this graph is the past-KV
+        # prefill and wants [1, AR, PAST+AR] with the past span fully masked.
+        # Re-laying it here rather than regenerating keeps the probe feeding
+        # exactly the window the encodings were fitted on.
+        w = case["_win"]
+        if ar != w["ar"]:
+            raise SystemExit(f"{case['name']}: window AR {w['ar']} != graph AR {ar}")
+        mask = np.full((1, ar, total), MASK_VALUE, dtype=np.float32)
+        mask[0, :, past:] = np.where(w["mask"][0] >= 0, 0.0, MASK_VALUE)
+        return (mask, w["cos"].astype(np.float32), w["sin"].astype(np.float32),
+                list(range(w["n_valid"])))
     n_real = case["n_real"]
     if ar == 1:
         if case.get("row_offset") or case.get("mask", "causal") != "causal":
@@ -336,24 +389,36 @@ def write_native(p: Path, a, name: str, specs: dict):
 
 def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int,
                specs0: dict, specs1: dict, layer_scan: bool = False):
-    name, kind, n_real = case["name"], case["kind"], case["n_real"]
+    name, kind = case["name"], case["kind"]
+    win = case.get("_win")
+    n_real = case["n_real"] = case.get("n_real", win["n_valid"] if win else None)
     g0, g1 = f"{kind}_0", f"{kind}_1"
     cdir = out / name
     for sub in (g0, g1, "ref"):
         (cdir / sub).mkdir(parents=True, exist_ok=True)
 
-    toks = case.get("tokens", TOKENS[:n_real])
-    rows = np.stack([lut_row(lut, t) for t in toks])              # [n, H]
-    H = rows.shape[1]
+    if win is None:
+        toks = case.get("tokens", TOKENS[:n_real])
+        rows = np.stack([lut_row(lut, t) for t in toks])           # [n, H]
+        H = rows.shape[1]
+    else:
+        toks, rows = [], None
+        H = win["embeds"].shape[-1]
     real_rows_box = {}
 
     def feeds0(m):
         mask, cos, sin, real_rows = build_mask_rope(m, case)
         real_rows_box["r"] = real_rows
-        emb = np.zeros((1, 1, m["ar"], H), dtype=np.float32)
-        emb[0, 0, real_rows] = rows
+        if win is None:
+            emb = np.zeros((1, 1, m["ar"], H), dtype=np.float32)
+            emb[0, 0, real_rows] = rows
+        else:
+            emb = win["embeds"].astype(np.float32).reshape(1, 1, m["ar"], H)
         f = {"inputs_embeds": emb, "attention_mask": mask,
              "position_ids_cos": cos, "position_ids_sin": sin, **zeros_past(m)}
+        # Zero on BOTH paths. The shipped tower runs deepstack zero-filled, so a
+        # realistic-input probe that fed the window's real deepstack features
+        # would be less production-faithful, not more.
         for dk in m["deep"]:
             f[dk] = np.zeros((1, 1, m["ar"], H), dtype=np.float32)
         return f
@@ -402,7 +467,16 @@ def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int,
 
     hidden, m0, f0, taps = run(onnx_split / g0 / f"{g0}.onnx", feeds0,
                                "last_hidden_states", threads, scan_names)
-    real_rows = real_rows_box["r"]
+    token_rows = real_rows_box["r"]
+    # Rows we keep REFERENCES for. Identical to the token rows for the small
+    # synthetic cases, but a realistic window carries up to 128 of them and full
+    # logits are 151936 wide -- 78 MB per case in fp32, for rows nobody reads.
+    # Keep the head (where the sink and the boundary defect live) and the last
+    # real row (the one that actually produces the next token).
+    if len(token_rows) <= 8:
+        real_rows = token_rows
+    else:
+        real_rows = sorted(set(token_rows[:4] + [token_rows[-1]]))
 
     def feeds1(m):
         mask, cos, sin, _ = build_mask_rope(m, case)
@@ -491,6 +565,7 @@ def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int,
     env = [f"KIND={kind}", f"G0={g0}", f"G1={g1}", f"GRAPH_IDX={graph_idx}",
            f"AR={m0['ar']}", f"N_REAL={n_real}",
            f"REAL_ROWS='{' '.join(str(r) for r in real_rows)}'",
+           f"TOKEN_ROWS={len(token_rows)}",
            f"LAYER_BASE_0={m0['layer_idx'][0]}", f"LAYER_N_0={len(m0['layer_idx'])}",
            f"LAYER_BASE_1={m1['layer_idx'][0]}", f"LAYER_N_1={len(m1['layer_idx'])}",
            f"DEEP='{' '.join(m0['deep'])}'",
@@ -512,6 +587,9 @@ def build_case(case, onnx_split: Path, lut: Path, out: Path, threads: int,
             "graph_idx": graph_idx, "mask": case.get("mask", "causal"),
             "row_offset": case.get("row_offset", 0),
             "real_rows": [int(r) for r in real_rows],
+            "n_token_rows": len(token_rows),
+            "window": (case.get("_win") or {}).get("desc"),
+            "window_split": (case.get("_win") or {}).get("split"),
             "ar": m0["ar"], "hidden_rows": list(hid_r.shape),
             "logits_rows": list(lg_r.shape),
             "ref_row_rms": row_rms,
@@ -546,6 +624,11 @@ def main():
                     help="info.json of the shard-1 ctx-bin that will execute")
     ap.add_argument("--suite", default="v5", choices=sorted(SUITES),
                     help="v5 = the original two cases; f = the Test F matrix")
+    ap.add_argument("--windows", type=Path,
+                    help="--suite r: the multimodal calibration/eval windows "
+                         "(vl_calib_build.py .npz). These are chat-templated "
+                         "turns with real ViT features, i.e. production-shaped "
+                         "input, unlike the bare token ids the other suites use")
     ap.add_argument("--layer-scan", action="store_true",
                     help="also save per-layer KV sink-row references, so the "
                          "gain can be localised to a layer from outputs the "
@@ -566,7 +649,11 @@ def main():
     if "last_hidden_states" in specs1:
         print(f"  shard1 last_hidden_states: {specs1['last_hidden_states'][0]}")
     cases = SUITES[args.suite]
-    scan = args.layer_scan or args.suite == "f"
+    if args.suite == "r":
+        if not args.windows:
+            raise SystemExit("--suite r needs --windows <calib .npz>")
+        cases = attach_windows(cases, args.windows)
+    scan = args.layer_scan or args.suite in ("f", "r")
     args.out.mkdir(parents=True, exist_ok=True)
     print(f"building text probe suite {args.suite!r} -> {args.out}")
     metas = [build_case(c, args.onnx_split, args.lut, args.out, args.threads,
@@ -578,6 +665,44 @@ def main():
     if args.suite == "f":
         check_f_premises(metas, args.out)
     print(f"\nwrote {len(metas)} case(s) to {args.out}")
+
+
+def attach_windows(cases, npz: Path):
+    """Bind each realistic case to one calibration/eval window.
+
+    Selection is by DESCRIPTOR SUBSTRING and is required to be unambiguous: a
+    silently different window would change what the probe measures without
+    changing anything visible, and this project has already lost days to a probe
+    that was not what it claimed to be.
+    """
+    with np.load(npz) as f:
+        d = {k: f[k] for k in f.files}
+    desc = [str(x) for x in d["desc"]]
+    split = [str(x) for x in d["split"]]
+    ar = int(d["ar"])
+    out = []
+    for c in cases:
+        hits = [i for i, s in enumerate(desc) if c["match"] in s]
+        pref = [i for i in hits if split[i] == c.get("prefer_split")]
+        chosen = pref or hits
+        if not chosen:
+            raise SystemExit(
+                f"{c['name']}: no window matching {c['match']!r} in {npz}. "
+                f"Available: {desc}")
+        if len(chosen) > 1:
+            raise SystemExit(
+                f"{c['name']}: {c['match']!r} matches {len(chosen)} windows "
+                f"{[desc[i] for i in chosen]} -- ambiguous, refuse to guess")
+        i = chosen[0]
+        c = dict(c)
+        c["_win"] = {"embeds": d["embeds"][i], "mask": d["mask"][i],
+                     "cos": d["cos"][i], "sin": d["sin"][i],
+                     "n_valid": int(d["n_valid"][i]), "ar": ar,
+                     "desc": desc[i], "split": split[i]}
+        out.append(c)
+        print(f"  {c['name']:12s} <- [{split[i]}] {desc[i]} "
+              f"({int(d['n_valid'][i])} real rows of {ar})")
+    return out
 
 
 def check_f_premises(metas, out: Path):
