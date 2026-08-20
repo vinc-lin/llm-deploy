@@ -140,9 +140,24 @@ feeds = {t: rd(t).reshape(shapes[t]) for t in
 for d in meta["deep_names"]:
     dn = d + "_p" if d + "_p" in shapes else d
     feeds[dn] = np.zeros([x if isinstance(x, int) else 1 for x in shapes[dn]], np.float32)
+# Past-KV: zeros for the empty-cache cases, but the decode-with-context case
+# ships REAL per-layer caches and zero-filling them would silently simulate a
+# different computation than the device runs.
+_g0 = meta["kind"] + "_0"
+_real_kv = 0
 for n, s in shapes.items():
-    if n.startswith("past_"):
+    if not n.startswith("past_"):
+        continue
+    _p = KIT / CASE / _g0 / f"{n}.raw"
+    if _p.is_file():
+        feeds[n] = np.frombuffer(_p.read_bytes(), "<f2").astype(np.float32).reshape(
+            [x if isinstance(x, int) else 1 for x in s])
+        _real_kv += 1
+    else:
         feeds[n] = np.zeros([x if isinstance(x, int) else 1 for x in s], np.float32)
+if _real_kv:
+    print(f"  fed {_real_kv} REAL past-KV tensors from the kit "
+          f"(cache_len={meta.get('cache_len')})")
 
 hid = sess.run(["last_hidden_states"], feeds)[0].reshape(-1, 2560)
 del sess
