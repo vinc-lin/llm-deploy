@@ -82,17 +82,17 @@ if ls "$OUT"/testh/c*/prefill_*/past_*.raw >/dev/null 2>&1; then
     ( cd "$OUT/testh" && tar czf past_kv.tar.gz c*/prefill_*/past_*.raw \
       && rm -f c*/prefill_*/past_*.raw )
     GZ=$(du -sm "$OUT/testh/past_kv.tar.gz" | cut -f1)
-    # SPLIT IT. Measured 2026-08-20: the proxy commits 231 small files in 105 s
-    # but drops a single 53 MB LFS stream every time (three consecutive
-    # failures at 520/290/224 s). Files the size of the rest of the kit go
-    # through fine, so the tarball ships as 8 MB parts and the operator
-    # reassembles. The md5 of the whole is recorded so a bad concatenation is
-    # caught rather than silently feeding a truncated cache.
+    # SPLIT IT SMALL. Measured 2026-08-20 against this proxy: the 231 kit files
+    # (LFS-tracked too -- `.gitattributes` has *.raw -- up to ~4 MB each) commit
+    # in 105 s, a single 53 MB stream fails every time, and 8 MB parts still
+    # fail. The working size is the one the rest of the kit already proves, so
+    # parts are 2 MB. The md5 of the whole is recorded because a silently
+    # truncated cache fed to the graph would read as a device defect.
     KVMD5=$(md5sum "$OUT/testh/past_kv.tar.gz" | cut -d" " -f1)
-    ( cd "$OUT/testh" && split -b 8M -d -a 2 past_kv.tar.gz past_kv.tar.gz.part- \
+    ( cd "$OUT/testh" && split -b 2M -d -a 3 past_kv.tar.gz past_kv.tar.gz.part- \
       && rm -f past_kv.tar.gz )
     NPART=$(ls "$OUT/testh"/past_kv.tar.gz.part-* | wc -l)
-    echo "   ${RAW} MB of KV -> ${GZ} MB compressed -> ${NPART} parts of 8 MB"
+    echo "   ${RAW} MB of KV -> ${GZ} MB compressed -> ${NPART} parts of 2 MB"
     echo "   assembled md5: $KVMD5"
     printf '%s  past_kv.tar.gz\n' "$KVMD5" > "$OUT/testh/past_kv.tar.gz.md5"
 fi

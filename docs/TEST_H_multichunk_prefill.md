@@ -103,12 +103,12 @@ None of those three lines is optional — `c1` and `c2` feed real caches, and th
 runner size-checks every file and stops with this hint if they are missing. `c0`
 needs none (its cache is all zeros, so it uses the runner's shared zero file).
 
-**Why it ships in parts.** Measured 2026-08-20: the HF proxy commits 231 small
-files in 105 s but drops a single 53 MB upload stream every time — three
-consecutive failures at 520 s, 290 s and 224 s. Files the size of the rest of
-the kit go through fine, so the tarball travels as 8 MB parts. `md5sum -c`
-catches a bad concatenation; without it a truncated cache would be fed to the
-graph and read as a device defect.
+**Why it ships in parts.** Measured against this proxy on 2026-08-20: the 231
+kit files commit in 105 s, a single 53 MB stream fails every time (520 s, 290 s,
+224 s), and even 8 MB parts fail. So the tarball travels at the size the rest of
+the kit already proves works — 2 MB parts. `md5sum -c` catches a bad
+concatenation; without it a truncated cache would be fed to the graph and read
+as a device defect.
 
 Expect ~2 minutes, a push of roughly **700 MB** and a pull of roughly **150 MB**.
 
