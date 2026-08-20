@@ -3,7 +3,10 @@
 
 Reconstructed from docs/archive/SA8797P_Deployment_Status_Summary.md §2.2:
 - default_param_bw=8 (per-channel symmetric via config json), default_output_bw=16
-- quant_scheme = post_training_tf_enhanced
+- quant_scheme = post_training_tf_enhanced (weights; and activations too unless
+  --act-range-scheme is given — see set_activation_range_scheme: tf_enhanced
+  discards outliers by design, which clips attention-sink activations and broke
+  the Qwen3-VL-4B text tower)
 - calibration: ~10 mixed zh/en/code/math prompts
 - clip_weights_to_7f7f: avoid INT8 saturation (reconstructed: clamp weights so
   no value quantizes to -128; i.e. symmetric ±127 range)  [FLAGGED for review]
@@ -281,6 +284,61 @@ def disable_quantizers(sim, fuse_gate_up, quant_head=False):
     print(f"disabled quantizers on: {disabled}")
 
 
+def set_activation_range_scheme(sim, scheme, percentile):
+    """Replace the range estimator on ACTIVATION quantizers only.
+
+    WHY THIS EXISTS (2026-08-20). `post_training_tf_enhanced` is an MSE-optimal
+    range search: it sweeps candidate ranges and keeps the one minimising
+    quantization error over the observed distribution, which means it
+    DELIBERATELY discards outliers -- sacrificing one extreme value to buy finer
+    resolution for the other 2559. That is the right trade almost everywhere and
+    exactly the wrong one on an attention-sink row, whose massive activations
+    sit orders of magnitude above the bulk.
+
+    Measured on Qwen3-VL-4B: `layers.0/mlp/down_proj` was calibrated to 5.482
+    while the sink row actually reaches 9.00, and `layers.1/mlp/Mul_1` to 59.272
+    against 61.40. Clamping just those two in the host fp32 graph reproduces the
+    device's boundary defect -- gain 1.3914 vs 1.38959 measured, residual 0.416%
+    vs 0.447%, cosine 0.999991 vs 0.999990. See
+    `docs/ROOTCAUSE_qwen3vl_4b_boundary_gain.md`.
+
+    ACTIVATIONS ONLY, on purpose. The sim-level `quant_scheme` applies to
+    weights as well, and the weight path (per-channel symmetric INT8, plus
+    clip_weights_to_7f7f) was tuned under tf_enhanced and is not implicated in
+    this defect. Swapping the whole scheme would change weights too and confound
+    the fix with a quality regression. So the sim keeps its scheme and only the
+    input/output quantizers -- never `param_quantizers` -- get a new analyzer.
+
+    Must run BEFORE compute_encodings: the analyzer is what observes the
+    calibration forward passes.
+    """
+    from aimet_torch.quantization.encoding_analyzer import (
+        MinMaxEncodingAnalyzer, PercentileEncodingAnalyzer)
+    n = 0
+    for _, m in _quantized_modules(sim):
+        for attr in ("output_quantizers", "input_quantizers"):
+            qs = getattr(m, attr, None)
+            if qs is None:
+                continue
+            for q in qs:
+                if q is None:            # disabled slot; v2 marks it with None
+                    continue
+                shape = tuple(getattr(q, "shape", ()) or ())
+                if scheme == "minmax":
+                    q.encoding_analyzer = MinMaxEncodingAnalyzer(shape)
+                else:
+                    q.encoding_analyzer = PercentileEncodingAnalyzer(
+                        shape, percentile=percentile)
+                n += 1
+    detail = f"minmax" if scheme == "minmax" else f"percentile={percentile}"
+    print(f"activation range scheme: {detail} on {n} quantizer(s); "
+          "weights keep the sim scheme")
+    if n == 0:
+        raise SystemExit("--act-range-scheme matched no activation quantizers "
+                         "-- the AIMET quantizer layout changed; fix this "
+                         "rather than silently calibrating with tf_enhanced")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=str(DATA / "models/Qwen3-0.6B"))
@@ -372,6 +430,17 @@ def main():
     ap.add_argument("--vl-calib",
                     help="--vl-text: .npz of multimodal calibration/eval windows "
                          "(scripts/quant/vl_calib_build.py)")
+    ap.add_argument("--act-range-scheme", choices=("tf_enhanced", "minmax",
+                                                   "percentile"),
+                    default="tf_enhanced",
+                    help="range estimator for ACTIVATION quantizers only "
+                         "(weights always keep tf_enhanced). Default reproduces "
+                         "every build before 2026-08-20 byte-for-byte. "
+                         "'minmax' fixes the attention-sink clipping that broke "
+                         "the Qwen3-VL-4B text tower — see "
+                         "docs/ROOTCAUSE_qwen3vl_4b_boundary_gain.md")
+    ap.add_argument("--act-percentile", type=float, default=99.99,
+                    help="with --act-range-scheme percentile")
     args = ap.parse_args()
     if args.vl_text and not args.vl_calib:
         # the windows are needed to calibrate, and (except on the decode path,
@@ -478,6 +547,11 @@ def main():
         config_file=args.config,
     )
     disable_quantizers(sim, args.fuse_gate_up, args.quant_head)
+    # After disabling, so we never install an analyzer on a slot that was just
+    # set to None; before compute_encodings, which is when analyzers observe.
+    if args.act_range_scheme != "tf_enhanced":
+        set_activation_range_scheme(sim, args.act_range_scheme,
+                                    args.act_percentile)
     if args.weight_bw < 8 and args.lpbq:
         # LPBQ (grouped blockwise, Qualcomm's W4A16 LLM recipe): int4 blocks of
         # 64 input channels, block scales grouped onto a per-channel int8 grid
