@@ -88,7 +88,9 @@ one that only appears on `c1`/`c2` and not on the `c0` anchor.
 The kit merges into the v5 folder you already have.
 
 ```sh
-tar xzf testh/past_kv.tar.gz -C testh/     # REQUIRED -- 55 MB -> 588 MB of KV
+cat testh/past_kv.tar.gz.part-* > testh/past_kv.tar.gz   # REQUIRED: reassemble
+md5sum -c testh/past_kv.tar.gz.md5                      # verify before trusting it
+tar xzf testh/past_kv.tar.gz -C testh/                  # 53 MB -> 594 MB of KV
 adb push testh/. /data/local/tmp/v5/
 adb shell
 cd /data/local/tmp/v5 && export LD_LIBRARY_PATH=. && chmod +x qnn-net-run
@@ -97,9 +99,16 @@ exit
 adb pull /data/local/tmp/v5/text_probe_out ./text_probe_out_h
 ```
 
-The `tar xzf` is not optional — `c1` and `c2` feed real caches and the runner
-size-checks every file and stops with this hint if they are missing. `c0` needs
-none (its cache is all zeros, so it uses the runner's shared zero file).
+None of those three lines is optional — `c1` and `c2` feed real caches, and the
+runner size-checks every file and stops with this hint if they are missing. `c0`
+needs none (its cache is all zeros, so it uses the runner's shared zero file).
+
+**Why it ships in parts.** Measured 2026-08-20: the HF proxy commits 231 small
+files in 105 s but drops a single 53 MB upload stream every time — three
+consecutive failures at 520 s, 290 s and 224 s. Files the size of the rest of
+the kit go through fine, so the tarball travels as 8 MB parts. `md5sum -c`
+catches a bad concatenation; without it a truncated cache would be fed to the
+graph and read as a device defect.
 
 Expect ~2 minutes, a push of roughly **700 MB** and a pull of roughly **150 MB**.
 

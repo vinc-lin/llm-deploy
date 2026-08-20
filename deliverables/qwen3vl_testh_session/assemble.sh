@@ -82,7 +82,19 @@ if ls "$OUT"/testh/c*/prefill_*/past_*.raw >/dev/null 2>&1; then
     ( cd "$OUT/testh" && tar czf past_kv.tar.gz c*/prefill_*/past_*.raw \
       && rm -f c*/prefill_*/past_*.raw )
     GZ=$(du -sm "$OUT/testh/past_kv.tar.gz" | cut -f1)
-    echo "   ${RAW} MB of KV -> ${GZ} MB compressed"
+    # SPLIT IT. Measured 2026-08-20: the proxy commits 231 small files in 105 s
+    # but drops a single 53 MB LFS stream every time (three consecutive
+    # failures at 520/290/224 s). Files the size of the rest of the kit go
+    # through fine, so the tarball ships as 8 MB parts and the operator
+    # reassembles. The md5 of the whole is recorded so a bad concatenation is
+    # caught rather than silently feeding a truncated cache.
+    KVMD5=$(md5sum "$OUT/testh/past_kv.tar.gz" | cut -d" " -f1)
+    ( cd "$OUT/testh" && split -b 8M -d -a 2 past_kv.tar.gz past_kv.tar.gz.part- \
+      && rm -f past_kv.tar.gz )
+    NPART=$(ls "$OUT/testh"/past_kv.tar.gz.part-* | wc -l)
+    echo "   ${RAW} MB of KV -> ${GZ} MB compressed -> ${NPART} parts of 8 MB"
+    echo "   assembled md5: $KVMD5"
+    printf '%s  past_kv.tar.gz\n' "$KVMD5" > "$OUT/testh/past_kv.tar.gz.md5"
 fi
 
 echo "== MANIFEST.md =="
@@ -126,7 +138,8 @@ PY
     echo
     echo "\`c1_chunk1\` (128 rows, 128-position cache) and \`c2_chunk2\` (21 rows,"
     echo "256-position cache, PARTIAL) ship real cross-chunk caches as"
-    echo "\`testh/past_kv.tar.gz\` — **expand it before pushing** (guide §4). The"
+    echo "\`testh/past_kv.tar.gz.part-*\` — **reassemble and expand before pushing**"
+    echo "(guide §4); the assembled md5 is in \`past_kv.tar.gz.md5\`. The"
     echo "runner size-checks every file and stops with that hint if you do not."
     echo "\`c2_chunk2\` is the \`variant > n_process\` condition the FLOAT_16"
     echo "padding bug fired on, and is the case this test exists for."
@@ -148,7 +161,9 @@ cat > "$OUT/README.md" <<'EOF'
 from the v5 session (md5s in `MANIFEST.md` — check them first).
 
 ```sh
-tar xzf testh/past_kv.tar.gz -C testh/     # FIRST. 55 MB -> 588 MB of KV
+cat testh/past_kv.tar.gz.part-* > testh/past_kv.tar.gz    # FIRST: reassemble
+md5sum -c testh/past_kv.tar.gz.md5                       # then verify
+tar xzf testh/past_kv.tar.gz -C testh/                   # 53 MB -> 594 MB of KV
 adb push testh/. /data/local/tmp/v5/
 adb shell
 cd /data/local/tmp/v5 && export LD_LIBRARY_PATH=. && chmod +x qnn-net-run
