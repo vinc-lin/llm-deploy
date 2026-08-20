@@ -102,14 +102,22 @@ def main():
     worst_all, seen, dirty = 0.0, 0, []
     for m in cases:
         case, rows = m["case"], m["real_rows"]
-        if m.get("cache_len") is not None:
-            print(f"  {case}  [{m.get('window_split')}] {m.get('window')}  "
-                  f"DECODE step, cache_len={m['cache_len']}, "
-                  f"token {m.get('next_token')} -- a real cache, not the "
-                  f"empty one every earlier decode probe used")
+        # Label by what the case IS, not by whether a key happens to be set:
+        # a chunk-0 case has cache_len 0, which is not None, and would print as
+        # a decode step under a truthiness-free check.
+        cl = m.get("cache_len")
+        head = f"  {case}  [{m.get('window_split')}] {m.get('window')}  "
+        if m["kind"] == "decode":
+            print(head + f"DECODE step, cache_len={cl}, token "
+                         f"{m.get('next_token')} -- a real cache, not the empty "
+                         f"one every earlier decode probe used")
+        elif m.get("mask") == "chunkseq":
+            kind = "PARTIAL " if m["n_token_rows"] < m["ar"] else ""
+            print(head + f"{kind}PREFILL chunk: {m['n_token_rows']} rows against "
+                         f"a {cl}-position cache"
+                         + ("  <-- cross-chunk" if cl else "  (anchor, empty cache)"))
         else:
-            print(f"  {case}  [{m.get('window_split')}] {m.get('window')}  "
-                  f"({m.get('n_token_rows')} real rows)")
+            print(head + f"({m.get('n_token_rows')} real rows)")
         ref = np.load(args.kit / case / "ref" / "last_hidden_states.npy")
         p = find_out(args.results / f"{case}_s0", "last_hidden_states")
         if p is None:
@@ -152,13 +160,19 @@ def main():
     if not seen:
         print("  INCONCLUSIVE: no shard-0 outputs found. Re-run the probe.")
         return 2
-    kinds = {m["kind"] for m in cases}
-    dec = [m["case"] for m in cases if m.get("cache_len") is not None]
-    print(f"  paths covered: {'prefill + decode-with-context' if dec else sorted(kinds)}"
-          + (f" ({', '.join(dec)})" if dec else ""))
-    if not dec:
-        print("  ⚠ no decode-with-context case in this kit -- generation's own "
-              "path is NOT covered by this run")
+    dec = [m["case"] for m in cases if m["kind"] == "decode" and m.get("cache_len")]
+    xch = [m["case"] for m in cases
+           if m.get("mask") == "chunkseq" and m.get("cache_len")]
+    cov = ["prefill (empty cache)"]
+    if xch:
+        cov.append(f"cross-chunk prefill ({', '.join(xch)})")
+    if dec:
+        cov.append(f"decode-with-context ({', '.join(dec)})")
+    print("  paths covered: " + "; ".join(cov))
+    if not dec and not xch:
+        print("  ⚠ this kit covers only single-chunk prefill against an empty "
+              "cache -- neither generation's own path nor the cross-chunk path "
+              "is exercised by this run")
     print(f"  worst |gain-1| over every reference row: {worst_all:.4f}")
     if not dirty:
         print("\n  BOUNDARY IS CLEAN ON REALISTIC INPUT.")
