@@ -183,7 +183,40 @@ CASES_R = [
      "asks": "does the boundary hold for a decode step with real context?"},
 ]
 
-SUITES = {"v5": CASES_V5, "f": CASES_F, "r": CASES_R}
+# --- chunk-sequence suite --------------------------------------------------
+# THE LAST UNPROBED PATH. A real prompt is longer than AR=128, so qualla feeds
+# it as several prefill calls, and chunks after the first run against a
+# PARTIALLY POPULATED cache. Every probe to date -- Tests B, C, E, F and G --
+# has run a single chunk against an EMPTY cache, so the cross-chunk path has
+# never executed on device at all.
+#
+# It is also exactly where the FLOAT_16 padding bug lived: `quantizeInput`
+# advances by bytes for FLOAT_16 and by elements otherwise, and
+# `setupInputEmbeddings` pads with an element count, firing only when
+# `variant > n_process` -- the last PARTIAL chunk. The dtype was fixed and
+# confirmed at 0.6B, but the chunking path itself was never independently
+# verified at 4B.
+#
+# The three cases walk one real image turn end to end:
+#   c0_chunk0   rows 0..127    nv=0    -- anchor, empty cache (== Test G's r2)
+#   c1_chunk1   rows 128..255  nv=128  -- first chunk with a real past
+#   c2_chunk2   rows 256..276  nv=256  -- the LAST, PARTIAL chunk: 21 real rows
+#                                         in a 128-wide window, i.e. the exact
+#                                         `variant > n_process` condition
+CHUNK_SUITE = {
+    "chunks": ["img0-chunk0[0:128]", "img0-chunk1[128:256]",
+               "img0-chunk2[256:"],
+    "names": ["c0_chunk0", "c1_chunk1", "c2_chunk2"],
+    "why": ["anchor: chunk 0 against an empty cache -- must reproduce Test G's "
+            "r2_chunk0, or the replay is not the same computation",
+            "chunk 1 against a real 128-position cache: the first cross-chunk "
+            "call, never before executed on device",
+            "chunk 2: the LAST and PARTIAL chunk, 21 real rows in a 128-wide "
+            "window against a 256-position cache -- the exact condition the "
+            "FLOAT_16 padding bug fired on"],
+}
+
+SUITES = {"v5": CASES_V5, "f": CASES_F, "r": CASES_R, "c": ["chunk-suite"]}
 
 
 def lut_row(lut_dir: Path, token: int) -> np.ndarray:
@@ -659,17 +692,21 @@ def main():
     if "last_hidden_states" in specs1:
         print(f"  shard1 last_hidden_states: {specs1['last_hidden_states'][0]}")
     cases = SUITES[args.suite]
+    if args.suite in ("r", "c") and not args.windows:
+        raise SystemExit(f"--suite {args.suite} needs --windows <calib .npz>")
     if args.suite == "r":
-        if not args.windows:
-            raise SystemExit("--suite r needs --windows <calib .npz>")
         cases = attach_windows(cases, args.windows)
-    scan = args.layer_scan or args.suite in ("f", "r")
+    scan = args.layer_scan or args.suite in ("f", "r", "c")
     args.out.mkdir(parents=True, exist_ok=True)
     print(f"building text probe suite {args.suite!r} -> {args.out}")
-    metas = [(build_decodectx_case if c.get("seed_from_prefill") else build_case)(
-                 c, args.onnx_split, args.lut, args.out, args.threads,
-                 specs0, specs1, scan)
-             for c in cases]
+    if args.suite == "c":
+        metas = build_chunk_suite(args.windows, args.onnx_split, args.out,
+                                  args.threads, specs0, specs1, scan)
+    else:
+        metas = [(build_decodectx_case if c.get("seed_from_prefill") else build_case)(
+                     c, args.onnx_split, args.lut, args.out, args.threads,
+                     specs0, specs1, scan)
+                 for c in cases]
     (args.out / "cases.json").write_text(json.dumps(metas, indent=1) + "\n")
     (args.out / "probe_cases.txt").write_text(
         "\n".join(m["case"] for m in metas) + "\n")
@@ -872,6 +909,201 @@ def build_decodectx_case(case, onnx_split: Path, lut: Path, out: Path,
     (cdir / "ref" / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
     print(f"  {name:12s} AR=1 cache_len={n}  argmax={meta['last_row_argmax']}  "
           f"host row RMS: r0={rms:.3f}{'  +layerscan' if scan_meta else ''}")
+    gc.collect()
+    return meta
+
+
+def build_chunk_suite(npz: Path, onnx_split: Path, out: Path, threads: int,
+                      specs0: dict, specs1: dict, layer_scan: bool):
+    """Replay one real multi-chunk turn, instrumenting every chunk.
+
+    ONE PASS, PERSISTENT SESSIONS. Each chunk's cache is the previous chunks'
+    committed KV, so the chunks cannot be built independently -- and reloading a
+    4B fp32 shard per chunk would cost more than the whole rest of the kit.
+
+    The feed is `parity_e2e_vl.PrefillKV.feeds`, not a re-derivation: row i sees
+    the valid past span [0, nv) plus the causal new span [PAST, PAST+i], padding
+    rows past n stay fully masked, and only n rows are ever committed.
+
+    A target chunk's device files carry the cache as it is BEFORE that chunk is
+    committed -- that is the cache the graph is fed.
+    """
+    import onnxruntime as ort
+    with np.load(npz) as f:
+        d = {k: f[k] for k in f.files}
+    desc = [str(x) for x in d["desc"]]
+
+    idxs = []
+    for pat in CHUNK_SUITE["chunks"]:
+        hits = [i for i, s in enumerate(desc) if s.startswith(pat)]
+        if len(hits) != 1:
+            raise SystemExit(f"chunk {pat!r} matched {len(hits)} windows "
+                             f"{[desc[i] for i in hits]} -- refuse to guess")
+        idxs.append(hits[0])
+    AR = int(d["ar"])
+    print("chunk sequence:")
+    for nm, i in zip(CHUNK_SUITE["names"], idxs):
+        print(f"  {nm:11s} <- {desc[i]} ({int(d['n_valid'][i])} real rows)")
+
+    so = ort.SessionOptions()
+    if threads:
+        so.intra_op_num_threads = threads
+    s0 = ort.InferenceSession(str(onnx_split / "prefill_0" / "prefill_0.onnx"),
+                              so, providers=["CPUExecutionProvider"])
+    s1 = ort.InferenceSession(str(onnx_split / "prefill_1" / "prefill_1.onnx"),
+                              so, providers=["CPUExecutionProvider"])
+    m0, m1 = meta_of(s0), meta_of(s1)
+    PAST, TOTAL, H = m0["past"], m0["total"], m0["shapes"]["inputs_embeds"][-1]
+    NKV, D = m0["n_kv"], m0["head_dim"]
+
+    def kvnames(sess, m):
+        have = {o.name for o in sess.get_outputs()}
+        return [f"past_{s}_{i}_out" for i in m["layer_idx"] for s in ("key", "value")
+                if f"past_{s}_{i}_out" in have]
+
+    kn0, kn1 = kvnames(s0, m0), kvnames(s1, m1)
+    cache = {t: {f"past_key_{i}_in": np.zeros((1, NKV, D, PAST), np.float32)
+                 for i in m["layer_idx"]}
+             for t, m in (("s0", m0), ("s1", m1))}
+    for t, m in (("s0", m0), ("s1", m1)):
+        cache[t].update({f"past_value_{i}_in": np.zeros((1, NKV, PAST, D), np.float32)
+                         for i in m["layer_idx"]})
+
+    nv, metas = 0, []
+    for k, (nm, wi) in enumerate(zip(CHUNK_SUITE["names"], idxs)):
+        n = int(d["n_valid"][wi])
+        mask = np.full((1, AR, TOTAL), MASK_VALUE, np.float32)
+        for i in range(n):
+            mask[0, i, :nv] = 0.0                       # valid past span
+            mask[0, i, PAST:PAST + i + 1] = 0.0         # causal new span
+        if nv == 0:
+            # Cross-check the authoritative construction against the window's
+            # own causal mask on the one chunk where they must agree. If these
+            # ever diverge, the replay is feeding a different computation from
+            # every other case in this file and the result would be meaningless.
+            wm = np.full((1, AR, TOTAL), MASK_VALUE, np.float32)
+            wm[0, :, PAST:] = np.where(d["mask"][wi][0] >= 0, 0.0, MASK_VALUE)
+            if not np.array_equal(wm[0, :n], mask[0, :n]):
+                raise SystemExit(
+                    f"{nm}: PrefillKV mask disagrees with the calibration "
+                    "window's own mask on the real rows -- the chunk feed is "
+                    "not what the r* cases used")
+        emb = d["embeds"][wi].astype(np.float32).reshape(1, 1, AR, H)
+        cos = d["cos"][wi].astype(np.float32).reshape(1, AR, -1)
+        sin = d["sin"][wi].astype(np.float32).reshape(1, AR, -1)
+        deep0 = {dk: np.zeros((1, 1, AR, H), np.float32) for dk in m0["deep"]}
+
+        f0 = {"inputs_embeds": emb, "attention_mask": mask,
+              "position_ids_cos": cos, "position_ids_sin": sin,
+              **deep0, **cache["s0"]}
+        r0 = dict(zip(["last_hidden_states"] + kn0,
+                      s0.run(["last_hidden_states"] + kn0, f0)))
+        hid = np.asarray(r0["last_hidden_states"], np.float32)
+        f1 = {"last_hidden_states": hid.reshape(1, AR, H),
+              "attention_mask": mask, "position_ids_cos": cos,
+              "position_ids_sin": sin, **cache["s1"]}
+        r1 = dict(zip(["logits"] + kn1, s1.run(["logits"] + kn1, f1)))
+        lg = np.asarray(r1["logits"], np.float32).reshape(AR, -1)
+
+        metas.append(_write_chunk_case(
+            nm, CHUNK_SUITE["why"][k], out, d, wi, n, nv, AR, H, hid, lg,
+            f0, f1, cache, m0, m1, specs0, specs1,
+            {x: r0[x] for x in kn0} if layer_scan else {}))
+
+        for t, m, r in (("s0", m0, r0), ("s1", m1, r1)):
+            for i in m["layer_idx"]:
+                cache[t][f"past_key_{i}_in"][:, :, :, nv:nv + n] = \
+                    r[f"past_key_{i}_out"][:, :, :, :n]
+                cache[t][f"past_value_{i}_in"][:, :, nv:nv + n, :] = \
+                    r[f"past_value_{i}_out"][:, :, :n, :]
+        nv += n
+        del r0, r1
+        gc.collect()
+    del s0, s1
+    gc.collect()
+    return metas
+
+
+def _write_chunk_case(name, why, out: Path, d, wi, n, nv, AR, H, hid, lg,
+                      f0, f1, cache, m0, m1, specs0, specs1, taps):
+    cdir = out / name
+    for sub in ("prefill_0", "prefill_1", "ref"):
+        (cdir / sub).mkdir(parents=True, exist_ok=True)
+    rows = list(range(n)) if n <= 8 else sorted(set(list(range(4)) + [n - 1]))
+
+    written = {}
+    for t in ("inputs_embeds", "attention_mask", "position_ids_cos",
+              "position_ids_sin"):
+        written[t] = write_native(cdir / "prefill_0" / f"{t}.raw", f0[t], t, specs0)
+    for dk in m0["deep"]:
+        written[dk] = write_native(cdir / "prefill_0" / f"{dk}.raw", f0[dk], dk, specs0)
+    for t in ("attention_mask", "position_ids_cos", "position_ids_sin"):
+        written[f"s1/{t}"] = write_native(cdir / "prefill_1" / f"{t}.raw", f1[t], t, specs1)
+    written["s1/last_hidden_states"] = write_native(
+        cdir / "prefill_1" / "last_hidden_states.raw", f1["last_hidden_states"],
+        "last_hidden_states", specs1)
+
+    # Chunk 0 is fed an all-zero cache, so it uses the runner's shared zero file
+    # and ships no KV at all -- 302 MB saved on a case where the bytes carry no
+    # information.
+    kv_bytes = 0
+    if nv:
+        for tag, m, key in (("prefill_0", m0, "s0"), ("prefill_1", m1, "s1")):
+            for i in m["layer_idx"]:
+                for s in ("key", "value"):
+                    nm2 = f"past_{s}_{i}_in"
+                    write_native(cdir / tag / f"{nm2}.raw", cache[key][nm2], nm2,
+                                 specs0 if key == "s0" else specs1)
+                    kv_bytes += (cdir / tag / f"{nm2}.raw").stat().st_size
+
+    hid_r = hid.reshape(AR, H)[rows]
+    lg_r = lg[rows]
+    np.save(cdir / "ref" / "last_hidden_states.npy", hid_r)
+    np.save(cdir / "ref" / "logits.npy", lg_r)
+    scan_meta = {}
+    if taps:
+        sdir = cdir / "ref" / "layerscan"
+        sdir.mkdir(parents=True, exist_ok=True)
+        for nm2, t in taps.items():
+            tt = np.asarray(t, np.float32)[0]
+            sl = (np.transpose(tt[:, :, rows], (2, 0, 1))
+                  if nm2.startswith("past_key_")
+                  else np.transpose(tt[:, rows, :], (1, 0, 2)))
+            np.save(sdir / f"{nm2}.npy", np.ascontiguousarray(sl))
+            scan_meta[nm2] = {"shape": list(np.asarray(t).shape),
+                              "ar_axis": 3 if nm2.startswith("past_key_") else 2}
+
+    past_bytes = m0["n_kv"] * m0["head_dim"] * m0["past"] * 2
+    (cdir / "case.env").write_text("\n".join([
+        "KIND=prefill", "G0=prefill_0", "G1=prefill_1", "GRAPH_IDX=0",
+        f"AR={AR}", f"N_REAL={n}",
+        f"REAL_ROWS='{' '.join(str(r) for r in rows)}'", f"TOKEN_ROWS={n}",
+        f"LAYER_BASE_0={m0['layer_idx'][0]}", f"LAYER_N_0={len(m0['layer_idx'])}",
+        f"LAYER_BASE_1={m1['layer_idx'][0]}", f"LAYER_N_1={len(m1['layer_idx'])}",
+        f"DEEP='{' '.join(m0['deep'])}'",
+        f"PAST_MODE={'files' if nv else 'zero'}",
+        f"PAST_BYTES={past_bytes}", f"HIDDEN_BYTES={AR * H * 2}"]) + "\n")
+
+    row_rms = [float(np.sqrt((hid_r[i].astype(np.float64) ** 2).mean()))
+               for i in range(hid_r.shape[0])]
+    meta = {"case": name, "kind": "prefill", "n_real": n, "why": why,
+            "asks": "does the boundary hold with a real cross-chunk cache?",
+            "tokens": [], "graph_idx": 0, "mask": "chunkseq", "row_offset": 0,
+            "real_rows": rows, "n_token_rows": n,
+            "window": str(d["desc"][wi]), "window_split": str(d["split"][wi]),
+            "cache_len": nv, "chunk_index": None,
+            "ar": AR, "hidden_rows": list(hid_r.shape),
+            "logits_rows": list(lg_r.shape), "ref_row_rms": row_rms,
+            "last_row_top10_ids": [int(t) for t in np.argsort(-lg_r[-1])[:10]],
+            "last_row_argmax": int(np.argmax(lg_r[-1])),
+            "mask_value": MASK_VALUE, "rope_theta": ROPE_THETA,
+            "deep_names": m0["deep"], "past": m0["past"],
+            "n_kv": m0["n_kv"], "head_dim": m0["head_dim"],
+            "layerscan": scan_meta, "input_dtypes": written}
+    (cdir / "ref" / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
+    rs = " ".join(f"r{r}={v:.3f}" for r, v in zip(rows, row_rms))
+    print(f"  {name:11s} n={n:<4} nv={nv:<4} argmax={meta['last_row_argmax']:<7} "
+          f"KV={kv_bytes / 1e6:6.1f} MB  RMS: {rs}")
     gc.collect()
     return meta
 
