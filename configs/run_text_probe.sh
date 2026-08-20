@@ -44,9 +44,34 @@ emit() {
     for d in $_deep; do
         _line="$_line ${d}:=${_c}/${_g}/${d}.raw"
     done
+    # PAST_MODE=zero  : empty cache -- all 72 inputs point at one shared zero
+    #                   file, because the cache is fully masked and its contents
+    #                   cannot affect the result.
+    # PAST_MODE=files : a REAL cache, seeded from a real prefill, one file per
+    #                   layer. This is the decode-with-context case; every
+    #                   earlier decode probe ran the zero path, which makes the
+    #                   token attend only to itself and is not what generation
+    #                   does.
     _i=$_base; _end=$((_base + _n))
     while [ "$_i" -lt "$_end" ]; do
-        _line="$_line past_key_${_i}_in:=${ZERO} past_value_${_i}_in:=${ZERO}"
+        if [ "${PAST_MODE:-zero}" = "files" ]; then
+            _k=${_c}/${_g}/past_key_${_i}_in.raw
+            _v=${_c}/${_g}/past_value_${_i}_in.raw
+            for _f in "$_k" "$_v"; do
+                if [ ! -f "$_f" ]; then
+                    echo "FATAL: PAST_MODE=files but $_f is missing." >&2
+                    echo "       Did you expand past_kv.tar.gz before pushing?" >&2
+                    exit 1
+                fi
+                if [ "$(wc -c < "$_f")" -ne "$PAST_BYTES" ]; then
+                    echo "FATAL: $_f is $(wc -c < "$_f") bytes, expected $PAST_BYTES." >&2
+                    exit 1
+                fi
+            done
+            _line="$_line past_key_${_i}_in:=${_k} past_value_${_i}_in:=${_v}"
+        else
+            _line="$_line past_key_${_i}_in:=${ZERO} past_value_${_i}_in:=${ZERO}"
+        fi
         _i=$((_i + 1))
     done
     echo "$_line"
@@ -80,6 +105,10 @@ run_one() {  # $1 label  $2 ctx-bin  $3 list file  $4 output dir
 for CASE in $(cat probe_cases.txt); do
     echo ""
     echo "===================== case $CASE ====================="
+    # Reset before sourcing: case.env files are sourced in a loop into the same
+    # shell, so a case that does not set PAST_MODE would silently inherit the
+    # previous case's value and feed a real cache where it meant an empty one.
+    PAST_MODE=zero
     # shellcheck disable=SC1090
     . "./$CASE/case.env"
     echo "   kind=$KIND AR=$AR rows=$N_REAL graphs=$G0/$G1 graph_idx=$GRAPH_IDX"
