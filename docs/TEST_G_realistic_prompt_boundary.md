@@ -1,7 +1,7 @@
 # Test G — does the boundary hold on a REALISTIC prompt?
 
 **Status:** ready to run · **Opened:** 2026-08-20 · **Needs:** no rebuild, no new
-ctx-bins, ~2 minutes of device time.
+ctx-bins, ~2 minutes of device time. Covers prefill AND decode-with-context.
 Audience: device team + build side. Self-contained; no prior thread needed.
 
 ---
@@ -39,18 +39,47 @@ Test G is the first probe with production-shaped input.
 
 ## 2. What Test G runs
 
-Three cases, built from the multimodal calibration/eval windows — chat-templated
+Four cases, built from the multimodal calibration/eval windows — chat-templated
 turns with **real ViT features** spliced onto the image-token positions, i.e.
 exactly what qualla feeds. Deepstack is zero-filled, matching the shipped tower.
 
-| case | window | real rows | what it adds |
-|---|---|---:|---|
-| `r0_text` | *held-out* `EVAL text 'The capital of France is'` | 13 | text-only, short + padded |
-| `r1_image` | *held-out* `EVAL img100 'What is happening in this image?'` | 113 | the real image+text path |
-| `r2_chunk0` | `img0-chunk0[0:128]` | 128 | a **completely full** AR window, no padding at all |
+| case | graph | window | rows | what it adds |
+|---|---|---|---:|---|
+| `r0_text` | prefill | *held-out* `EVAL text 'The capital of France is'` | 13 | text-only, short + padded |
+| `r1_image` | prefill | *held-out* `EVAL img100 'What is happening in this image?'` | 113 | the real image+text path |
+| `r2_chunk0` | prefill | `img0-chunk0[0:128]` | 128 | a **completely full** AR window, no padding at all |
+| `r3_decodectx` | **decode** | same prompt as `r0_text`, cache_len 13 | 1 | **generation's own path** — see §2b |
 
-Two of the three are from the **held-out eval split**, so they were never seen by
-calibration.
+Three of the four come from the **held-out eval split**, so they were never seen
+by calibration.
+
+### 2b. `r3_decodectx` — the path no probe has ever run
+
+Every decode probe so far (`decode1tok`, `f0_ctrl_dec`) fed an **empty,
+fully-masked KV cache**. That makes the token attend only to itself, which is the
+attention-sink condition — precisely the unrealistic state that manufactured the
+1.39× artifact. Real generation attends to a populated cache, so the path that
+actually produces tokens had never been instrumented at all.
+
+This case prefills the `r0_text` prompt on **both shards**, seeds each decode
+cache from that prefill's KV outputs (13 positions), and takes one greedy step —
+the model's own next token, `785`. The KV contract is copied from
+`parity_e2e_vl.Decoder`, not re-derived: left-aligned cache, mask open on
+`[0, cache_len)` plus the new token's slot at index `PAST`.
+
+The result is visible before the device even runs it: **its boundary RMS is
+0.936, not 107**. A decode step with real context is not a sink, which is exactly
+what Test F predicted and what no probe had yet demonstrated.
+
+**Its KV cache ships compressed.** 72 tensors × 4.45 MB = 320.7 MB, of which
+>99% is zero, compressing 128:1 to 2.5 MB. Expand it before pushing:
+
+```sh
+tar xzf testg/past_kv.tar.gz -C testg/
+```
+
+The runner checks every cache file's presence and size and stops with a clear
+error if you skip this.
 
 **Nothing is rebuilt.** The ctx-bins are the ones already on your device from the
 v5 session:
@@ -74,8 +103,14 @@ activation path):
 | `r0_text` | 1.0001 | 1.0002 | 1.0002 | **1.0347** | 0.9999 |
 | `r1_image` | 1.0001 | 1.0002 | 1.0002 | 1.0002 | 1.0002 |
 | `r2_chunk0` | 1.0001 | 1.0002 | 1.0002 | 1.0002 | 1.0000 |
+| `r3_decodectx` | **0.9999** *(cos 1.000000)* | — | — | — | — |
 
 **Prediction: every row within ±5%, worst 1.0347.** Cosine ≥ 0.9996 everywhere.
+
+`r3_decodectx` is worth noting separately: clamping every calibrated activation
+range changes its boundary by **nothing at all** (0.9999 clamped, 0.9999
+unclamped, cosine 1.000000). A decode step with real context has no exposure to
+this defect class whatsoever.
 
 If the device disagrees with this table, the disagreement is the finding.
 
@@ -87,6 +122,7 @@ The kit merges into the v5 folder you already have — it needs that folder's
 `qnn-net-run`, libraries, `netrun_htp_config.json` and the two ctx-bins.
 
 ```sh
+tar xzf testg/past_kv.tar.gz -C testg/     # REQUIRED -- 2.5 MB -> 320 MB of KV
 adb push testg/. /data/local/tmp/v5/
 adb shell
 cd /data/local/tmp/v5 && export LD_LIBRARY_PATH=. && chmod +x qnn-net-run
@@ -96,7 +132,8 @@ adb pull /data/local/tmp/v5/text_probe_out ./text_probe_out_g
 ```
 
 `testg/` ships its own `probe_cases.txt`, so this runs Test G and not the
-earlier cases. Expect ~2 minutes and a pull of roughly **120 MB**.
+earlier cases. Expect ~2 minutes, a push of roughly **450 MB** (the expanded KV
+cache is most of it) and a pull of roughly **120 MB**.
 
 The runner stops hard if shard 0's output is the wrong size or ambiguous. **If it
 stops, that message is the result** — send it.
@@ -136,11 +173,12 @@ at shard 1.
 
 ## 7. What Test G cannot tell us
 
-It tests the **prefill** path with an empty cache. A real decode step attends to
-a populated KV cache, and this kit does not exercise that — shipping real past-KV
-would add ~300 MB per case to express what is otherwise a zero file. If Test G
-comes back clean and the device still garbles real generation, the decode-with-
-context path is the next thing to instrument.
+It covers prefill (empty cache) and **one** decode step on a 13-position cache.
+It does not cover a long generation, where the cache grows to hundreds of
+positions and any per-step error would compound. If Test G is clean and the
+device still garbles real generation, a multi-step decode with a growing cache
+is the next thing to instrument — the machinery is now in place for it, since
+`r3_decodectx` already builds and feeds a real cache.
 
 It also says nothing about output quality. Every 4B run so far has been behind
 this defect, so how well a W8A16 Qwen3-VL-4B actually captions a photograph

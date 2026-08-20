@@ -33,7 +33,7 @@ KIT=${KIT:-$LLMDEPLOY_DATA/work/text_probe_r}
 # were computed against.
 VL_BINS=${VL_BINS:-$LLMDEPLOY_DATA/work/ctxbin/qwen3vl-4b-w8a16-gqa-splitkv-u16in}
 
-CASES="r0_text r1_image r2_chunk0"
+CASES="r0_text r1_image r2_chunk0 r3_decodectx"
 
 disk_guard 2
 [ -d "$KIT" ] || { echo "FATAL: no kit at $KIT -- build it on tank first:"; \
@@ -69,6 +69,22 @@ for c in $CASES; do
 done
 cp "$KIT/cases.json" "$OUT/host_refs/"
 find "$OUT/testg" -name 'ref' -type d -prune -exec rm -rf {} +
+
+# The decode-with-context case ships a REAL KV cache: 72 tensors of
+# NKV*D*PAST fp16 = 320.7 MB, of which >99% is zero because only cache_len
+# positions are populated. Ship it compressed (2.5 MB, 128:1) and have the
+# operator expand it host-side before pushing -- the device gets the full
+# files either way, but HF and the download do not.
+if ls "$OUT/testg"/r3_decodectx/decode_*/past_*.raw >/dev/null 2>&1; then
+    echo "== compressing the decode KV cache =="
+    RAW=$(du -sm "$OUT/testg"/r3_decodectx/decode_0 "$OUT/testg"/r3_decodectx/decode_1 \
+          | awk '{s+=$1} END {print s}')
+    ( cd "$OUT/testg" && tar czf past_kv.tar.gz \
+        r3_decodectx/decode_0/past_*.raw r3_decodectx/decode_1/past_*.raw \
+      && rm -f r3_decodectx/decode_0/past_*.raw r3_decodectx/decode_1/past_*.raw )
+    GZ=$(du -sm "$OUT/testg/past_kv.tar.gz" | cut -f1)
+    echo "   ${RAW} MB of KV -> ${GZ} MB compressed"
+fi
 
 echo "== MANIFEST.md =="
 {
@@ -107,6 +123,12 @@ PY
     echo "Row 1 carries the model's real attention sink (RMS 220.3). The host"
     echo "predicts it comes through at gain 1.0002 — see the guide §3."
     echo
+    echo "\`r3_decodectx\` is ONE DECODE STEP ON A REAL KV CACHE (cache_len 13,"
+    echo "seeded from a real prefill of the same prompt). Its 72 cache tensors"
+    echo "expand to 320.7 MB and ship as \`testg/past_kv.tar.gz\` — **expand it"
+    echo "before pushing** (see the guide §4). The runner fails loudly if you"
+    echo "do not."
+    echo
     echo "## testg/ contents"
     echo
     echo '| file | bytes | md5 |'
@@ -124,6 +146,7 @@ cat > "$OUT/README.md" <<'EOF'
 from the v5 session (md5s in `MANIFEST.md` — check them first).
 
 ```sh
+tar xzf testg/past_kv.tar.gz -C testg/      # <-- FIRST. 2.5 MB -> 320 MB of KV
 adb push testg/. /data/local/tmp/v5/
 adb shell
 cd /data/local/tmp/v5 && export LD_LIBRARY_PATH=. && chmod +x qnn-net-run
@@ -132,7 +155,9 @@ exit
 adb pull /data/local/tmp/v5/text_probe_out ./text_probe_out_g
 ```
 
-~2 minutes on device, ~120 MB pulled. Send back `text_probe_out_g/` and
+The `tar xzf` is not optional — `r3_decodectx` feeds a real KV cache and the
+runner stops with a clear error if the files are missing. ~2 minutes on device,
+~450 MB pushed, ~120 MB pulled. Send back `text_probe_out_g/` and
 `text_probe_g.log`.
 
 ## Why this test replaces the last four
@@ -148,6 +173,14 @@ So the production text garbage is **currently unexplained**, and this is the
 first probe shaped like production. Full account:
 `ROOTCAUSE_qwen3vl_4b_boundary_gain.md`.
 
+## Now covers generation's own path too
+
+`r3_decodectx` is **one decode step on a real KV cache** (13 positions, seeded
+from a real prefill of the same prompt). Every earlier decode probe fed an
+*empty, fully-masked* cache, which makes the token attend only to itself — the
+attention-sink condition, i.e. the very thing that was never production-like.
+Its boundary RMS is **0.936**, not 107: a real decode step is not a sink at all.
+
 ## The prediction — please check it against what you get
 
 The host says every row should land within ±5%, worst 1.0347:
@@ -157,6 +190,7 @@ The host says every row should land within ±5%, worst 1.0347:
 | `r0_text`   | 1.0001 | 1.0002 | 1.0002 | 1.0347 | 0.9999 |
 | `r1_image`  | 1.0001 | 1.0002 | 1.0002 | 1.0002 | 1.0002 |
 | `r2_chunk0` | 1.0001 | 1.0002 | 1.0002 | 1.0002 | 1.0000 |
+| `r3_decodectx` | **0.9999** (the single decode row) | — | — | — | — |
 
 **Clean** → shard 0 is fine on production input and the boundary enquiry closes;
 look downstream. **Dirty** → the fault is in the ctx-bin or the converter, the
