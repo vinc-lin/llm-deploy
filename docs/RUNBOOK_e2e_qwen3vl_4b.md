@@ -1,8 +1,20 @@
 # Runbook — the complete Qwen3-VL-4B on SA8797P, end to end
 
-**Image input → image analysis → text generation.** Run this **after Test I's
-templated prompt comes back coherent** (`docs/TEST_I_templated_prompt.md`). If
-Test I is garbage, stop: this runbook will not work and the failure is upstream.
+**Image input → image analysis → text generation.**
+
+> ⚠ **Not yet runnable as an acceptance test (status 2026-08-21).** Test I and
+> Test J both ran. Templated prefill is correct on device, but **Genie's
+> decode-step feed is defective**: the first token is right and generation then
+> degenerates. Everything below will reproduce that until the feed is fixed.
+>
+> The gate for this runbook is now **the decode-feed fix**, not Test I. The
+> experiment that localises it is `docs/DEVICE_TEST_qwen3_06b_lut.md`; the
+> evidence is `reports/qwen3vl-4b-testj-device-results-2026-08-21.md`.
+>
+> §3–§4 are still worth running before the fix **if** you first change
+> `prompt_seg2.txt` to force a one-word answer — the first token comes from
+> prefill and validates image → ViT → splice → prefill on its own. With the
+> shipped open-ended caption prompt it does not: every image answers `A`.
 
 **Board time ≈ 25 minutes.** No host toolchain, no rebuild.
 
@@ -73,8 +85,7 @@ Prove the tower before adding the image. **Templated**, per Test I:
 adb push qwen3vl_4b_testi_session/testi /data/local/tmp/testi     # host side, once
 
 P=$(cat /data/local/tmp/testi/prompt_2plus2_templated.txt; printf x); P=${P%x}
-./genie-t2t-run -c genie_dialog_qwen3vl_4b.json -p "$P" \
-    --max-num-tokens 64 --profile e2e_text.json
+./genie-t2t-run -c genie_dialog_qwen3vl_4b.json -p "$P" --profile e2e_text.json
 ```
 
 **Pass:** the answer is `4` (or a short sentence containing it), and the profile
@@ -84,9 +95,13 @@ If the token count is much larger, Genie's tokenizer split `<|im_start|>` instea
 of matching the added token — stop and report that; it is a tokenizer/config
 issue, not a model one.
 
-**Always pass `--max-num-tokens`.** `genie-t2t-run` only flushes its profile when
-a query completes cleanly; a run that hits `Context Size was exceeded` frees the
-handle and writes nothing. That cost 7 of 8 profiles in an earlier session.
+**Always cap generation — via the config, not a flag.** `genie-t2t-run` has **no
+`--max-num-tokens` option**; it is the dialog-config key `dialog.max-num-tokens`
+(now `64` in `configs/genie_dialog_qwen3vl_4b.json`). The cap matters because the
+profile is only flushed when a query completes cleanly — a run that hits `Context
+Size was exceeded` frees the handle and writes nothing. That cost 7 of 8 profiles
+in one session and all 4 in the Test J session. Also, **`--profile` refuses an
+output file that already exists**, so re-runs need a fresh name.
 
 ---
 
@@ -147,10 +162,11 @@ Run this whatever the captions look like: decode rate is the same compute whethe
 the tokens are right or wrong, and there is still no init/TTFT/decode number for
 a 4B two-shard W8A16 tower on this silicon.
 
+Set `"max-num-tokens": 128` in the dialog config for this run, then:
+
 ```sh
 P=$(cat /data/local/tmp/testi/prompt_weather_templated.txt; printf x); P=${P%x}
-./genie-t2t-run -c genie_dialog_qwen3vl_4b.json -p "$P" \
-    --max-num-tokens 128 --profile e2e_timing.json
+./genie-t2t-run -c genie_dialog_qwen3vl_4b.json -p "$P" --profile e2e_timing.json
 ```
 
 From the profile, report **init**, **TTFT**, and **decode tok/s**, plus the

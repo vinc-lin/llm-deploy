@@ -1,7 +1,25 @@
 # Test J — the final session: everything still standing between us and end-to-end
 
-**Status:** ready to run · **Opened:** 2026-08-21 · **Needs:** no rebuild, no new
-ctx-bins. **Board time ≈ 30 minutes**, in four stages.
+**Status: RUN AND CLOSED, 2026-08-21.** Results, corrections and the re-ranked
+suspect list are in
+**`reports/qwen3vl-4b-testj-device-results-2026-08-21.md`** — read that, not the
+predictions below.
+
+Outcome in one line: **Stage A1 landed on the predicted row — the decode graph is
+correct including the recurrence, so the fault is Genie's decode-step feed.** Of
+the three candidates this document named, **two are now dead** (§10 of the
+report), and the probe that separates the surviving two is
+`docs/DEVICE_TEST_qwen3_06b_lut.md`, already built and already on the Hub.
+
+What follows is the plan as written before the session, kept for provenance.
+Two things in it are known wrong: the Stage C first-word test could not
+discriminate with an open-ended caption prompt, and `--max-num-tokens` is a
+config key rather than a CLI flag.
+
+---
+
+**Opened:** 2026-08-21 · **Needs:** no rebuild, no new ctx-bins.
+**Board time ≈ 30 minutes**, in four stages.
 Execution and result-recording detail: **`DEVICE_SESSION_PROTOCOL.md`** (separate
 document — read it alongside this one).
 
@@ -146,7 +164,7 @@ for a 4B two-shard W8A16 tower on this silicon.
 
 | A1 j0/j1 | A1 j2 | meaning | next |
 |---|---|---|---|
-| **match** | **match** | the decode graph is right end to end, **including the recurrence**. The fault is entirely in **Genie's decode-step feed** | bisect inside Genie: (1) the prefill→decode KV handoff across the 2048→2175 width change, (2) the LUT lookup of a *generated* token, (3) the mask/position advance |
+| **match** ← *observed* | **match** ← *observed* | the decode graph is right end to end, **including the recurrence**. The fault is entirely in **Genie's decode-step feed** | ~~bisect inside Genie: (1) the prefill→decode KV handoff across the 2048→2175 width change, (2) the LUT lookup of a *generated* token, (3) the mask/position advance~~ — **(1) and (3) were eliminated device-free on 2026-08-21**; see below |
 | match | mismatch | the graph is right on a prefill-built cache and wrong on one it wrote itself | a **KV write-back/read-back** defect in the ctx-bin decode path |
 | mismatch | — | the decode ctx-bin is wrong on this cache although `r3_decodectx` passed on a 13-position one | bisect on cache length |
 
@@ -160,12 +178,23 @@ The first row is the expected outcome.
 
 ---
 
-## After this session
+## After this session — what actually happened
 
-If Stage A comes back as expected (graph fine, Genie at fault) and Stage C's
-first tokens are image-relevant, then **everything except one Genie-side bug is
-verified on hardware**, and the remaining work is a targeted fix in the feed
-path plus one confirmation run — not a rebuild.
+Stage A came back as expected: **graph fine, Genie at fault.** Stage C was
+inconclusive rather than negative, because the caption prompt let every image
+answer `A`.
 
-`RUNBOOK_e2e_qwen3vl_4b.md` is the procedure for that confirmation run once the
+**The candidate list is now two, not three:**
+
+| ✝ | prefill→decode KV width handoff | dead — the shipping 0.6B `gqafix-ladekv` makes the same 1024→1151 change with the same `[1,8,128,PAST]` key layout on the same runtime and generates correct text |
+|---|---|---|
+| ✝ | MRoPE decode advance | dead for text-only — `nsp-model.cpp:3803` gates the Qwen3-VL branch on `m_visionParam.size() > 0`, so Stage B was a plain-rope run |
+| **?** | **the external-LUT `inputs_embeds` feed** | live |
+| **?** | **the two-ctx-bin split** (shard 0 → shard 1 every decode step) | live |
+
+**Next test: `docs/DEVICE_TEST_qwen3_06b_lut.md`.** A 0.6B on the shipping ladekv
+recipe, **one** ctx-bin, LUT-fed — one variable — which separates the two
+survivors in ~10 minutes. Built 2026-08-18, on the Hub, never run.
+
+`RUNBOOK_e2e_qwen3vl_4b.md` is the procedure for the confirmation run once the
 decode fix lands.

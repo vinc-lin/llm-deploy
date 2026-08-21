@@ -4,6 +4,12 @@ Companion to **`TEST_J_decode_step.md`**, which says *what* the tests are and
 *why*. This document is the *how*: exact commands in order, what to capture from
 each, and how to write it down so it is usable.
 
+> **Revised 2026-08-21 after the Test J session.** Three things in the first
+> version were wrong and are fixed below: `--max-num-tokens` is not a CLI flag
+> (§3), `--profile` refuses an existing file (§3), and Stage C's first-word test
+> could not discriminate with the prompt it used (§4). Test J itself is complete
+> — results and analysis in `reports/qwen3vl-4b-testj-device-results-2026-08-21.md`.
+
 **Total ≈ 30 minutes.** Nothing here needs a host toolchain. Every command is
 copy-paste; every step names the artefact it produces.
 
@@ -103,23 +109,34 @@ same directory instead — just do not mix the outputs.
 
 ## 3. Stage B — Genie text
 
+**First, cap generation — it is a config key, not a flag.** Confirm the shipped
+config has it, and add it if not:
+
+```sh
+grep max-num-tokens genie_dialog_qwen3vl_4b.json    # want: "max-num-tokens": 64,
+```
+
+If missing, insert the line `"max-num-tokens": 64,` immediately after
+`"type": "basic",` inside the `"dialog"` block. No rebuild — Genie reads the JSON
+at load.
+
 ```sh
 cd /data/local/tmp/v5 && export LD_LIBRARY_PATH=.
 
 # B1 templated 2+2  -- the trailing newline matters, hence `printf x`
 P=$(cat /data/local/tmp/testi/prompt_2plus2_templated.txt; printf x); P=${P%x}
 ./genie-t2t-run -c genie_dialog_qwen3vl_4b.json -p "$P" \
-    --max-num-tokens 64 --profile b1_templated.json 2>&1 | tee b1_templated.txt
+    --profile b1_templated.json 2>&1 | tee b1_templated.txt
 
 # B2 templated weather
 P=$(cat /data/local/tmp/testi/prompt_weather_templated.txt; printf x); P=${P%x}
 ./genie-t2t-run -c genie_dialog_qwen3vl_4b.json -p "$P" \
-    --max-num-tokens 64 --profile b2_weather.json 2>&1 | tee b2_weather.txt
+    --profile b2_weather.json 2>&1 | tee b2_weather.txt
 
 # B3 raw control -- expected to be wrong from the first token
 ./genie-t2t-run -c genie_dialog_qwen3vl_4b.json \
     -p "What is 2+2? Answer with one number." \
-    --max-num-tokens 64 --profile b3_raw.json 2>&1 | tee b3_raw.txt
+    --profile b3_raw.json 2>&1 | tee b3_raw.txt
 ```
 
 **Capture:** the three `.txt` transcripts and three `.json` profiles.
@@ -131,10 +148,21 @@ P=$(cat /data/local/tmp/testi/prompt_weather_templated.txt; printf x); P=${P%x}
 * where the output first diverges from expected — for B1 the correct answer is
   `4` then stop; for B2 it is `Mountain weather changes quickly because …`.
 
-> **Always pass `--max-num-tokens`.** `genie-t2t-run` only flushes its profile
-> when a query completes cleanly; a run that hits `Context Size was exceeded`
-> frees the handle and writes nothing. That cost 7 of 8 profiles in an earlier
-> session.
+> **`--max-num-tokens` is NOT a flag.** An earlier version of this document said
+> to pass it; `genie-t2t-run` rejects it. It is the dialog-config key
+> `dialog.max-num-tokens` (`Dialog.cpp:2493`, read at `:2888`). Capping matters
+> because the profile is only flushed when a query completes cleanly — a run that
+> hits `Context Size was exceeded` frees the handle and writes nothing. That cost
+> 7 of 8 profiles in one session and all 4 in the Test J session.
+
+> **`--profile` refuses a file that already exists** (`main.cpp:528-533`) and
+> aborts with `Invalid --profile argument`. Use a fresh name on every re-run, or
+> delete the old one first.
+
+> **`-tok` / `--tokens_file` exists** and takes explicit token ids. Prefer it when
+> the question is *"did Genie tokenize this the way we think?"* — it removes the
+> tokenizer from the experiment instead of inferring its behaviour from a
+> prompt-token count.
 
 > **Do not paraphrase the garbage.** `ention ably ance` and `aged aged aged` are
 > different findings. The exact characters are the measurement.
@@ -168,6 +196,18 @@ defect is fixed. That does not make this useless: the first token comes from
 **prefill**, so a first word that matches the image proves the whole
 **image → ViT → splice → prefill** path. Open the `.png`/`.jpg` and judge.
 
+⚠ **The prompt must force a content word, or this test cannot discriminate.**
+In the Test J session all seven images answered `A` — a perfectly good caption
+opener that says nothing about any picture, so the run was uninterpretable either
+way. The segment file must ask for **one word**:
+
+> *Answer with one word: what is the dominant weather in this photo?*
+
+Then the first token is `Snow` / `Fog` / `Clear` / `Rain` and it either matches
+the photograph or it does not. Edit `prompt_seg2.txt` — prompt-file change only,
+no rebuild. Keep the real trailing newline (`node set textFile`, never
+`node set text`).
+
 Use three values, and nothing vaguer:
 
 | verdict | meaning |
@@ -176,16 +216,19 @@ Use three values, and nothing vaguer:
 | `WRONG` | it is a confident word about something not in the image |
 | `DEGENERATE` | it is not a word — punctuation, a fragment, or empty |
 
-`WRONG` and `DEGENERATE` are different diagnoses. Do not merge them.
+`WRONG` and `DEGENERATE` are different diagnoses. Do not merge them. And a
+generic word that fits any image (`A`, `The`, `This`) is **none of the three** —
+record it as `INCONCLUSIVE` and say the prompt needs fixing.
 
 ---
 
 ## 5. Stage D — timing
 
+Set `"max-num-tokens": 128` in the dialog config for this run (§3), then:
+
 ```sh
 P=$(cat /data/local/tmp/testi/prompt_weather_templated.txt; printf x); P=${P%x}
-./genie-t2t-run -c genie_dialog_qwen3vl_4b.json -p "$P" \
-    --max-num-tokens 128 --profile d1_timing.json
+./genie-t2t-run -c genie_dialog_qwen3vl_4b.json -p "$P" --profile d1_timing.json
 ```
 
 **Record:** init time, TTFT, decode tok/s, plus the wall-clock of C1 from its
