@@ -1,0 +1,45 @@
+{
+ "ladder": [
+  {
+   "file": "n1_2plus2_p20.tok",
+   "n_prompt": 20,
+   "expect_first_generated": 19,
+   "note": "'4'"
+  },
+  {
+   "file": "n1_2plus2_p21.tok",
+   "n_prompt": 21,
+   "expect_first_generated": 151645,
+   "note": "'<|im_end|>' -- THE decisive run"
+  },
+  {
+   "file": "n1_weather_p18.tok",
+   "n_prompt": 18,
+   "expect_first_generated": 91169,
+   "note": "'Mountain'"
+  },
+  {
+   "file": "n1_weather_p19.tok",
+   "n_prompt": 19,
+   "expect_first_generated": 9104,
+   "note": "' weather'"
+  },
+  {
+   "file": "n1_weather_p20.tok",
+   "n_prompt": 20,
+   "expect_first_generated": 4344,
+   "note": "' changes'"
+  },
+  {
+   "file": "n1_weather_p21.tok",
+   "n_prompt": 21,
+   "expect_first_generated": 6157,
+   "note": "' quickly'"
+  }
+ ],
+ "embedding_file": {
+  "file": "n1b_2plus2_p20_emb.raw",
+  "bytes": 204800,
+  "layout": "20 rows x 2560 float32, the P20 prompt's LUT rows"
+ }
+}

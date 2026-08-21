@@ -13,7 +13,7 @@ bundle is current and which is superseded**.
 
 | | |
 |---|---|
-| **Next test** | **Test L** (`TEST_L_ctxbin_vs_genie.md`, ~15 min, bundle `qwen3_06b_lutprobe/`, md5 `9720e46e…`) and **Test M** (`TEST_M_split_reproduction.md`, ~10 min, bundle `qwen3_06b_lutsplit/`). **Run both in one session** — one ctx-bin vs two, same board, same prompts, is much stronger than either alone |
+| **Next test** | **Test N** — `TEST_N_final_e2e.md` + `DEVICE_SESSION_PROTOCOL_N.md`. The complete remaining-work session (~60 min): **N1 probes the real 4B directly** (token ladder via `-tok`, `-e`, `--save` state dump — no build, runs on the bundle already on the board), with Tests **L** and **M** folded in as stages N2/N3, the image first-word grid as N4, timing completion as N5, and the post-fix e2e confirmation as N6. Kit: `qwen3vl_4b_testn_session/` (VL repo). If time is short: **N1a P21 is one command and the sharpest single measurement available** |
 | **The one open defect** | Genie's decode-step feed on the 4B: prefill right, decode step 1 wrong |
 | **Sole live suspect** | the two-ctx-bin split (shard 0 → shard 1, `[1,1,2560]`, every decode step). **Test M reproduces that structure at 0.6B** — same handoff tensor, dtype and rank — so it can be bisected on the host if it fires |
 | **What is already proven on hardware** | image input · ViT · splice · prefill numerics · decode graphs incl. recurrence · the image path end-to-end on 7/7 images |
@@ -35,6 +35,7 @@ bundle is current and which is superseded**.
 | **K** | 08-21 | LUT feed vs split · image one-word · 4B timing | ✅ **image path 7/7** · ⚠ **K1 VOID** (ran a FLOAT_16 bin) · ✅ first timing | `TEST_K_lut_vs_split.md` · `reports/…testk…md` |
 | **L** | **open** | does the ctx-bin reproduce its ONNX, or is it Genie? | — | `TEST_L_ctxbin_vs_genie.md` |
 | **M** | **open** | does the 2-ctx-bin **split** break decode at 0.6B? | — | `TEST_M_split_reproduction.md` |
+| **N** | **open** | the full remaining-work session: decode bisect **on the real 4B** (token ladder / `-e` / `--save`) + L + M + image grid + timing + the post-fix e2e gate | — | `TEST_N_final_e2e.md` · `DEVICE_SESSION_PROTOCOL_N.md` |
 
 ### Dead ends, so nobody re-runs them
 
@@ -66,6 +67,7 @@ in the repo's git history if a past artefact is ever needed.
 | `qwen3vl_4b_testi_session/` | ✅ **kept: still live.** Its `testi/prompt_*_templated.txt` are what `DEVICE_SESSION_PROTOCOL.md` §3/§5 and the runbook feed to `genie-t2t-run` |
 | `qwen3vl_4b_testk_session/` | ✅ current — the one-word `prompt_seg2_*` files |
 | `qwen3vl_4b_testl_session/` | ✅ current — Test L docs (kit lives with the bundle in the 0.6B repo) |
+| `qwen3vl_4b_testn_session/` | ✅ **current — the Test N package**: master plan, protocol, results template, collector, and the `testn/` kit (6 token-ladder files + the `-e` embedding blob). Merges into the v5 folder on device |
 | ~~`qwen3vl_4b_e2e_pipeline`, `_v2`, `_v3`, `_v4`~~ | **deleted** — superseded by `03_vl4b_v5` |
 | ~~`qwen3vl_4b_e2e_pipeline_v5`~~ | **deleted** — it shipped a stale shard 0 (`065056ba…`) and every doc that mentioned it did so to warn you off. Removing it removes the trap |
 | ~~`qwen3vl_4b_testf/g/h_session`~~ | **deleted** — F and G are settled and written up in `reports/`; H ships inside `testj_session/` |
