@@ -41,8 +41,12 @@ from modeling_export import MASK_VALUE, rope_tables
 D = Path(os.environ["LLMDEPLOY_DATA"])
 SPLIT = D / "work/onnx/qwen3vl-4b-gqa-aimet-splitkv"
 LUT = D / "work/lut/qwen3vl-4b"
-THETA, NSTEP = 5_000_000.0, int(sys.argv[1]) if len(sys.argv) > 1 else 12
-IDS = [151644,872,198,3838,374,220,17,10,17,30,21806,448,825,1372,13,151645,198,151644,77091,198]
+THETA = 5_000_000.0
+NSTEP = int(sys.argv[1]) if len(sys.argv) > 1 else 12
+# Default is the templated "What is 2+2? Answer with one number."; override with
+# a comma-separated id list so any prompt can be ground-truthed.
+IDS = ([int(x) for x in sys.argv[2].split(",")] if len(sys.argv) > 2 else
+       [151644,872,198,3838,374,220,17,10,17,30,21806,448,825,1372,13,151645,198,151644,77091,198])
 
 import json
 p = json.loads((LUT / "embedding_lut_params.json").read_text())
