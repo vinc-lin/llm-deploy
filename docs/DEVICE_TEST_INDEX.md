@@ -72,12 +72,22 @@ in the repo's git history if a past artefact is ever needed.
 
 ### Qwen3-0.6B — `vinccniv/sa8797p-qwen3-w8a16-bundles`
 
+**Cleaned 2026-08-22: 108 → 94 files, 34.6 GB → 20.6 GB.** Removed: the whole
+pre-GQA-fix bundle lineage (10 tarballs — their measurements live in `reports/`
+and `REFERENCE.md` §6, and the bundles are deterministic rebuilds from
+`BUILD_GUIDE.md`), the 1.7B baseline the repo's own README marks *"do not
+test — still carries the broken prefill"*, and the root `profiling/` folder,
+whose decode-only bin was the **pre-fix** one and whose profile inputs are
+duplicated in both dated drops.
+
 | folder | status |
 |---|---|
-| `qwen3_06b_lutprobe/` | ✅ **CURRENT, rebuilt 2026-08-22.** Bin **`9720e46e…`**. ⚠ The Test K version (`880a6abd…`) was **FLOAT_16** and fails `lint_embedding_dtype.py` |
-| `2026-08-14-gqafix/bundles/qwen3_06b_w8a16_gqafix_ladekv.tar.gz` | ✅ the 44.707 tok/s reference build (**CTX 1152**) |
-| `2026-08-16-regime/bundles/qwen3_06b_w8a16_gqafix_cl512_ladekv.tar.gz` | ✅ the **CTX-640** build — the shape-matched control for the LUT probe (correction #38) |
-| top-level `qwen3_06b_w8a16_*.tar.gz` | pre-GQA-fix lineage. Historical; **never quote their tok/s as current** |
+| `qwen3_06b_lutprobe/` | ✅ **CURRENT** (Test L). Bin **`9720e46e…`**. ⚠ The Test K version (`880a6abd…`) was **FLOAT_16** and fails `lint_embedding_dtype.py` |
+| `qwen3_06b_lutsplit/` | ✅ **CURRENT** (Test M). The 2-shard 0.6B. Shards **`1f4dcd44…`** / **`11cabce4…`**. ⚠ Holds only what is new — copy the LUT, tokenizer, runner and libs across from `qwen3_06b_lutprobe/` |
+| `2026-08-14-gqafix/bundles/qwen3_06b_w8a16_gqafix_ladekv.tar.gz` | ✅ **live** — the 44.707 tok/s reference build (**CTX 1152**) |
+| `2026-08-16-regime/bundles/qwen3_06b_w8a16_gqafix_cl512_ladekv.tar.gz` | ✅ **live** — the **CTX-640** build, the shape-matched control for the LUT probe (correction #38) |
+| the other 14 bundles in those two drops | the completed **post-fix perf sweep** (dlbc, hybrid, pastkv2g, qh, udma, hvx8, socmodel72, wpack, ctrl…). Spent: every number is recorded in `REFERENCE.md` §6/§8, and several bins are cited there by name (e.g. `gqafix_qh_ladekv` at 95% pooled). Kept deliberately — ~13 GB, and the only remaining bulk. Prune if a re-verification of §8.2 is never expected |
+| `docs/` | the device team's context copies. Tiny; some are dated snapshots |
 
 ---
 
