@@ -55,6 +55,22 @@ failure implicates **the runtime's handling of the split**, not the cut.
 
 ## 1. Run it
 
+> ⚠ **`qwen3_06b_lutsplit/` on the Hub holds only what is NEW** — the two shards,
+> their sidecars, the two configs and this doc (9 files, 768 MB). The LUT,
+> tokenizer, `genie-t2t-run` and the `libQnn*`/`libGenie` libraries are
+> **byte-identical to Test L's** and are not duplicated; re-sending 750 MB
+> through this proxy costs more than it is worth. Copy them across from the
+> Test L bundle, which you already need on the board:
+>
+> ```sh
+> # host: download both folders, then
+> cp qwen3_06b_lutprobe/{embedding_float32_lut.bin,tokenizer.json,genie-t2t-run} \
+>    qwen3_06b_lutprobe/lib*.so  qwen3_06b_lutsplit/
+> ```
+>
+> Using Test L's copies is not a shortcut — it is what makes the two runs
+> comparable. Same libs, same LUT, same runner; only the model differs.
+
 ```sh
 adb push qwen3_06b_lutsplit /data/local/tmp/lutsplit
 adb shell
