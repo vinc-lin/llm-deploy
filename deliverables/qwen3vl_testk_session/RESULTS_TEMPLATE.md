@@ -1,3 +1,10 @@
+> ⛔ **SUPERSEDED — use `qwen3vl_testl_session/RESULTS_TEMPLATE.md`.**
+> The lutprobe md5 below (`880a6abd…`) is the **FLOAT_16** bin, which is
+> why K1 is void. The corrected bin is `9720e46e62f59d08f56301418cccc8c1`.
+> The K2 (image) and K3 (timing) sections are still valid.
+
+---
+
 # Test K session — results
 
 **Date:** ____________  **Board / build:** ____________  **Operator:** ________

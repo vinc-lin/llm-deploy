@@ -5,11 +5,18 @@
 predictions below.
 
 Outcome in two lines: **K2 verified the image → ViT → splice → prefill path on
-7/7 images**, the multimodal capability question answered on hardware. **K1's
-on-device verdict inverts under a host reference** — the control is the correct
-one, the probe is wrong from token 0 while its graph and LUT pass 3/3 against HF
-on the host, so **Genie's LUT feed is newly implicated** rather than exonerated.
-Decision row K1c/3 ("wrong from token 0") is the row we landed on.
+7/7 images**, the multimodal capability question answered on hardware. **K1 is
+void** — it ran the wrong bin (below); its measurements stand but its conclusion,
+in either direction, does not. Decision row K1c/3 ("wrong from token 0") is the
+row we landed on, and its stated remedy — *check the LUT dtype* — is exactly what
+found the cause.
+
+> ⛔ **K1 IS VOID (2026-08-22).** It ran the **pre-graft FLOAT_16** ctx-bin
+> (`880a6abd…`), which fails `lint_embedding_dtype.py`. That dtype makes the
+> prefill pad write overwrite the back half of the prompt, which is the whole
+> symptom. **Genie's LUT feed was never tested.** The re-run is
+> `TEST_L_ctxbin_vs_genie.md` against bin `9720e46e…`. Correction #39.
+> K2 (image path 7/7) and K3 (timing) are unaffected.
 
 The plan below is kept for provenance, with §K1b corrected in place.
 
@@ -84,7 +91,8 @@ adb shell
 cd /data/local/tmp/lutprobe && chmod +x genie-t2t-run
 export LD_LIBRARY_PATH=.
 
-md5sum qwen3-0.6b-w8a16-lutprobe-ladekv_ctx.bin | cut -c1-32   # 880a6abdec4a64b67b275ec817c054ca
+md5sum qwen3-0.6b-w8a16-lutprobe-ladekv_ctx.bin | cut -c1-32   # 9720e46e62f59d08f56301418cccc8c1
+#   NOT 880a6abdec4a64b67b275ec817c054ca -- that is the FLOAT_16 bin K1 ran; see the banner
 md5sum embedding_float32_lut.bin | cut -c1-32                  # 2836420ce26c84f4ab7b217a22b2e125
 grep max-num-tokens genie_dialog_qwen3_0.6b_lutprobe.json      # "max-num-tokens": 64,
 
