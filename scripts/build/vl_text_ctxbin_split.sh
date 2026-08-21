@@ -248,10 +248,23 @@ echo "== verify both binaries =="
 $PY_DEPLOY - <<PYEOF
 import json, sys
 
-# Per-chunk floor for sharedWeightsSize. Chunk 0 is 18 layers at W8 (~1.7 GB);
-# chunk 1 adds the FP16 lm_head. Set below the expected value, not at it, so
-# the check flags a collapse rather than policing normal variation.
-MIN_SHARED_GB = {0: 1.4, 1: 2.0}
+# Gate on POOLED FRACTION -- shared / (shared + const) -- not on absolute GB.
+#
+# Absolute floors (this was {0: 1.4, 1: 2.0} GB) encode the 4B's weight set into
+# a script that is otherwise size-agnostic, and they reject a perfectly healthy
+# smaller tower: the 2-shard 0.6B pools 0.21 / 0.50 GB, which is its ENTIRE
+# weight set carried exactly once, and failed a 1.4 GB floor.
+#
+# The fraction is the real invariant. It still catches what the floor was for --
+# a build that shares only lm_head and duplicates every layer has a large
+# constSize, so its fraction collapses -- while staying correct at any scale.
+# Measured: gqafix_ladekv 100% (const 256 B), gqafix_qh_ladekv 95%, against
+# w8a16qh 29% and w8a16qh-lade 62%. REFERENCE.md 8.2.
+#
+# Raise MIN_POOLED only for a documented private-const exception (--quant-head
+# moves ~144 MB into a private decode block by design; a bertcache graph forces
+# a private copy). Both are legitimate and neither is a sharing failure.
+MIN_POOLED = float("${MIN_POOLED:-0.90}")
 
 errs = []
 for c in (0, 1):
@@ -276,20 +289,23 @@ for c in (0, 1):
             if blob.get(key) != wanted:
                 errs.append(f"{name}: {key} is {blob.get(key)!r}, expected {wanted!r}")
 
-    shared = 0
+    # sharedWeightsSize is the context's single pool and is printed identically
+    # on every graph -- take the max, never the sum. constSize is per-graph and
+    # private, so it does add up.
+    shared, const = 0, 0
     for info in graphs.values():
-        v2 = info.get("graphBlobInfoV2", {})
-        shared = max(shared, (v2.get("info", v2) or {}).get("sharedWeightsSize", 0) or 0)
-    # "> 0" is far too weak: a build that shares only lm_head reports ~0.7 GB
-    # and passes, while duplicating every layer. The two graphs in a chunk hold
-    # the SAME weights, so sharing must account for most of one DLC. Reference:
-    # the shipped 0.6B/1.7B two-graph builds share 0.99 GB and 1.16 GB, i.e.
-    # essentially their whole weight set.
-    floor = MIN_SHARED_GB[c] * 2**30
-    if shared < floor:
-        errs.append(f"{part}_of_2 sharedWeightsSize {shared/2**30:.3f} GB < {MIN_SHARED_GB[c]} GB "
-                    f"-- weight sharing barely engaged, so the binary carries both "
-                    f"graphs' weights separately")
+        v2 = (info.get("graphBlobInfoV2", {}) or {})
+        v2 = v2.get("info", v2) or {}
+        shared = max(shared, v2.get("sharedWeightsSize", 0) or 0)
+        const += v2.get("constSize", 0) or 0
+    total = shared + const
+    pooled = (shared / total) if total else 0.0
+    if shared == 0:
+        errs.append(f"{part}_of_2 sharedWeightsSize is 0 -- weight sharing did not engage")
+    elif pooled < MIN_POOLED:
+        errs.append(f"{part}_of_2 pooled fraction {pooled:.1%} < {MIN_POOLED:.0%} "
+                    f"(shared {shared/2**30:.3f} GB, private const {const/2**30:.3f} GB) "
+                    f"-- the binary carries most weights per-graph instead of once")
 
     for name, info in sorted(graphs.items()):
         idims = {t["info"]["name"]: t["info"]["dimensions"]
@@ -353,7 +369,8 @@ for c in (0, 1):
             if name.startswith("prefill") and list(outs["logits"][:2]) != [1, $CL]:
                 errs.append(f"{name}: logits {outs['logits']} not all-position [1, $CL, vocab]")
         print(f"  {name:10s} in={len(ins):3d} out={len(outs):3d}")
-    print(f"  sharedWeights={shared/2**30:.2f} GB")
+    print(f"  sharedWeights={shared/2**30:.2f} GB  privateConst={const/2**30:.3f} GB  "
+          f"pooled={pooled:.1%}")
 
 if errs:
     print("BUILD REJECTED:")

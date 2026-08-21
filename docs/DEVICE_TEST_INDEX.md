@@ -13,9 +13,9 @@ bundle is current and which is superseded**.
 
 | | |
 |---|---|
-| **Next test** | **Test L** — `TEST_L_ctxbin_vs_genie.md`. ~15 min. Bundle `qwen3_06b_lutprobe/` (0.6B repo), **md5 `9720e46e…`** |
+| **Next test** | **Test L** (`TEST_L_ctxbin_vs_genie.md`, ~15 min, bundle `qwen3_06b_lutprobe/`, md5 `9720e46e…`) and **Test M** (`TEST_M_split_reproduction.md`, ~10 min, bundle `qwen3_06b_lutsplit/`). **Run both in one session** — one ctx-bin vs two, same board, same prompts, is much stronger than either alone |
 | **The one open defect** | Genie's decode-step feed on the 4B: prefill right, decode step 1 wrong |
-| **Sole live suspect** | the two-ctx-bin split (shard 0 → shard 1, `[1,1,2560]`, every decode step) |
+| **Sole live suspect** | the two-ctx-bin split (shard 0 → shard 1, `[1,1,2560]`, every decode step). **Test M reproduces that structure at 0.6B** — same handoff tensor, dtype and rank — so it can be bisected on the host if it fires |
 | **What is already proven on hardware** | image input · ViT · splice · prefill numerics · decode graphs incl. recurrence · the image path end-to-end on 7/7 images |
 | **Current 4B bundle** | `qwen3vl_v5_session/03_vl4b_v5/` — shard 0 **`f031e3a7563bf16f2d5ca98a71b357f6`** |
 
@@ -34,6 +34,7 @@ bundle is current and which is superseded**.
 | **J** | 08-21 | is the decode *graph* right, incl. the recurrence? | ✅ **graphs cleared** (`j0`→151645, `j1`→9104, `j2`→4344) ⇒ the fault is **Genie's decode-step feed** | `TEST_J_decode_step.md` · `reports/…testj…md` |
 | **K** | 08-21 | LUT feed vs split · image one-word · 4B timing | ✅ **image path 7/7** · ⚠ **K1 VOID** (ran a FLOAT_16 bin) · ✅ first timing | `TEST_K_lut_vs_split.md` · `reports/…testk…md` |
 | **L** | **open** | does the ctx-bin reproduce its ONNX, or is it Genie? | — | `TEST_L_ctxbin_vs_genie.md` |
+| **M** | **open** | does the 2-ctx-bin **split** break decode at 0.6B? | — | `TEST_M_split_reproduction.md` |
 
 ### Dead ends, so nobody re-runs them
 
@@ -53,14 +54,21 @@ Check the md5 before anything else; a failed precondition is a result.
 
 ### Qwen3-VL-4B — `vinccniv/sa8797p-qwen3vl-4b-bundles`
 
+**Cleaned 2026-08-22: 1581 → 573 files, 36.6 GB → 9.8 GB.** Eight superseded
+folders removed, so what remains is what you should run. The removals are still
+in the repo's git history if a past artefact is ever needed.
+
 | folder | status |
 |---|---|
-| `qwen3vl_v5_session/03_vl4b_v5/` | ✅ **CURRENT.** Complete pipeline bundle. Shard 0 `f031e3a7…` |
-| `qwen3vl_4b_testj_session/` | ✅ current kit (Test J: `testj/` + `testh/`) |
-| `qwen3vl_4b_testk_session/` | ✅ current — incl. the one-word `prompt_seg2_*` files |
-| `qwen3vl_4b_e2e_pipeline_v5/` | ⚠ **shipped a stale shard 0** (`065056ba…`, pre-`uFxp_16`). Replaced on the Hub, but prefer `qwen3vl_v5_session/03_vl4b_v5/` |
-| `qwen3vl_4b_e2e_pipeline` … `_v4` | superseded — history only |
-| `qwen3vl_4b_testf/g/h/i_session` | superseded by J and K; kept for provenance |
+| `qwen3vl_v5_session/03_vl4b_v5/` | ✅ **CURRENT.** Complete standalone pipeline bundle — verified to carry both ctx-bins, `genie-app`, the LUT, tokenizer, image blobs and segment files. Shard 0 `f031e3a7…` |
+| `qwen3vl_v5_session/01_probe_06b_fp16in/`, `02_probe_06b_u16in/` | kept as **evidence for correction #39** — the two arms of the LUT-probe dtype A/B. `01_` is the FLOAT_16 arm that Test K accidentally ran |
+| `qwen3vl_4b_testj_session/` | ✅ current kit — carries `testj/` **and its own copy of `testh/`** (67 files) |
+| `qwen3vl_4b_testi_session/` | ✅ **kept: still live.** Its `testi/prompt_*_templated.txt` are what `DEVICE_SESSION_PROTOCOL.md` §3/§5 and the runbook feed to `genie-t2t-run` |
+| `qwen3vl_4b_testk_session/` | ✅ current — the one-word `prompt_seg2_*` files |
+| `qwen3vl_4b_testl_session/` | ✅ current — Test L docs (kit lives with the bundle in the 0.6B repo) |
+| ~~`qwen3vl_4b_e2e_pipeline`, `_v2`, `_v3`, `_v4`~~ | **deleted** — superseded by `03_vl4b_v5` |
+| ~~`qwen3vl_4b_e2e_pipeline_v5`~~ | **deleted** — it shipped a stale shard 0 (`065056ba…`) and every doc that mentioned it did so to warn you off. Removing it removes the trap |
+| ~~`qwen3vl_4b_testf/g/h_session`~~ | **deleted** — F and G are settled and written up in `reports/`; H ships inside `testj_session/` |
 
 ### Qwen3-0.6B — `vinccniv/sa8797p-qwen3-w8a16-bundles`
 
