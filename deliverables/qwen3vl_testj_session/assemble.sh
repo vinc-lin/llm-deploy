@@ -44,6 +44,9 @@ mkdir -p "$OUT/testj"
 
 echo "== docs =="
 cp "$LLMDEPLOY_ROOT/docs/TEST_J_decode_step.md" "$OUT/"
+cp "$LLMDEPLOY_ROOT/docs/DEVICE_SESSION_PROTOCOL.md" "$OUT/"
+cp "$LLMDEPLOY_ROOT/docs/RUNBOOK_e2e_qwen3vl_4b.md" "$OUT/"
+cp "$HERE/RESULTS_TEMPLATE.md" "$HERE/collect_j.sh" "$OUT/"
 cp "$LLMDEPLOY_ROOT/scripts/validate/analyze_realistic_probe.py" "$OUT/"
 # The retraction belongs with the test: it is why this test exists at all, and
 # an operator reading only the guide would not know the previous four results
@@ -95,6 +98,20 @@ if ls "$OUT"/testj/j*/decode_*/past_*.raw >/dev/null 2>&1; then
     echo "   ${RAW} MB of KV -> ${GZ} MB compressed -> ${NPART} parts of 2 MB"
     echo "   assembled md5: $KVMD5"
     printf '%s  past_kv.tar.gz\n' "$KVMD5" > "$OUT/testj/past_kv.tar.gz.md5"
+fi
+
+# Stage A2 uses the Test H kit. Ship it inside this package rather than making
+# the operator assemble a session from two downloads -- the whole point of a
+# session bundle is that it is one thing.
+TESTH=${TESTH:-$LLMDEPLOY_DATA/bundles/qwen3vl_testh_session}
+if [ -d "$TESTH/testh" ]; then
+    echo "== Stage A2 kit (Test H, cross-chunk prefill) =="
+    cp -r "$TESTH/testh" "$OUT/"
+    mkdir -p "$OUT/host_refs_testh"
+    cp -r "$TESTH/host_refs/." "$OUT/host_refs_testh/"
+    echo "   $(ls "$OUT/testh"/past_kv.tar.gz.part-* 2>/dev/null | wc -l) KV parts + $(ls "$OUT/testh" | wc -l) entries"
+else
+    echo "   WARNING: no Test H package at $TESTH -- Stage A2 will be missing"
 fi
 
 echo "== MANIFEST.md =="
@@ -160,59 +177,65 @@ PY
 } > "$OUT/MANIFEST.md"
 
 cat > "$OUT/README.md" <<'EOF'
-# Test J — 60-second version
+# Test J — the final session
 
-**No rebuild. No new ctx-bins.** ~2 minutes on device.
+**Everything still standing between us and end-to-end, in one package.**
+No rebuild, no new ctx-bins. **~30 minutes of board time**, four stages.
 
-```sh
-cat testj/past_kv.tar.gz.part-* > testj/past_kv.tar.gz   # FIRST: reassemble
-md5sum -c testj/past_kv.tar.gz.md5                       # then verify
-tar xzf testj/past_kv.tar.gz -C testj/                   # 10 MB -> 962 MB of KV
-adb push testj/. /data/local/tmp/v5/
-adb shell
-cd /data/local/tmp/v5 && export LD_LIBRARY_PATH=. && chmod +x qnn-net-run
-sh run_text_probe.sh 2>&1 | tee text_probe_j.log
-exit
-adb pull /data/local/tmp/v5/text_probe_out ./text_probe_out_j
-```
+## Read these two, in this order
 
-## The point
+| file | what it is |
+|---|---|
+| `TEST_J_decode_step.md` | **what** the tests are and **why** — the state of play, the one open defect, and what each outcome means |
+| `DEVICE_SESSION_PROTOCOL.md` | **how** to run each one, what to capture, and how to record it |
 
-Test I confirmed the prompt-form root cause **and** exposed a second defect. On
-a templated prompt Genie's first token is **correct** — but that token comes
-from **prefill**. The very first **decode** call is already wrong:
+Then fill in `RESULTS_TEMPLATE.md` and send it with the tarball from
+`collect_j.sh`.
 
-| prompt | correct | Genie gave |
+## Where we are
+
+Root cause found and confirmed: the 4B is calibrated on **chat-templated**
+prompts and every earlier test sent **raw** text. Templating flips the first
+generated token to **correct**.
+
+That left **one defect and three unrun paths**:
+
+| | |
+|---|---|
+| ❌ **decode step 1** | Genie's first decode call is wrong. `2+2` should give `4` then `<\|im_end\|>` — **two tokens** — and instead loops. The graphs are fine (host does it correctly; Test G ran a decode step through *both* shards on device at 1/1) |
+| ❓ cross-chunk prefill | never run on device, and the 273-token image prompt needs three chunks |
+| ❓ image pipeline post-fix | never run since the `uFxp_16` fix, because the old guide gated it behind a raw-prompt test |
+| ❓ timing | no init/TTFT/decode number exists for this tower |
+
+## The four stages
+
+| stage | what | time |
 |---|---|---|
-| 2+2 | **151645** `<\|im_end\|>` | 2939 `ention` |
-| weather | **9104** ` weather` | 3279 `aged` |
+| **A1** | decode-step probe (`testj/`) — expects argmax **151645 / 9104 / 4344** | 5 min |
+| **A2** | cross-chunk prefill (`testh/`) — unblocks the image path | 3 min |
+| **B** | Genie text, templated + raw control — verbatim output | 5 min |
+| **C** | image pipeline + six photographs — **judge the FIRST WORD only** | 12 min |
+| **D** | timing | 5 min |
 
-The correct answer to "What is 2+2?" is **two tokens** — `4` then `<|im_end|>`.
-The repetition loop is a defect, not greedy-without-EOS (eos-token *is*
-configured, and the graphs emit it immediately).
+**Stage C is worth running even though decode is broken**: the first generated
+token comes from *prefill*, so a first word that matches the picture validates
+the whole **image → ViT → splice → prefill** path independently of the decode
+defect.
 
-The graphs are not the suspect: the host does the whole recurrence correctly,
-`parity_e2e_vl` is 20/20 vs HF, and Test G already ran a decode step through
-**both** shards on device at 1/1 argmax. What has never been tested is who
-supplies the decode step's **inputs** — Genie's cache handoff, its LUT lookup of
-a generated token, its position advance.
+## Two traps that have already cost sessions
 
-## Expected
+1. **Check the shard-0 md5 first.** It must be
+   `f031e3a7563bf16f2d5ca98a71b357f6`. `qwen3vl_4b_e2e_pipeline_v5/` shipped a
+   stale pre-fix copy (`065056ba…`); it has been replaced, but check anyway.
+2. **Never feed a `*_u16.raw` image** — Genie stages the file as float32
+   regardless of dtype, so it over-reads and `SIGSEGV`s. Every image must be
+   `*_fp32.raw` at **6,295,552 bytes**.
 
-| case | step | expected argmax |
-|---|---:|---:|
-| `j0_2plus2_s1` | 1 | **151645** |
-| `j1_weather_s1` | 1 | **9104** |
-| `j2_weather_s2` | 2 (cache has a decode-written row) | **4344** |
+## If time runs short
 
-**All three matching** ⇒ the decode graph is fine including the recurrence, and
-the fault is entirely in Genie's feed. That is the expected outcome, and it is
-what moves the bisect inside Genie.
-
-Send back the analyzer output — the `logits chained` argmax per case is the
-measurement.
-
-Full detail: `TEST_J_decode_step.md`.
+Value order: **A1** (decides graph vs Genie) → **A2** (unblocks the image path)
+→ **B1** (one command, confirms A against Genie) → **C1** → the rest.
+Stopping after A1 + B1 is still a useful session.
 EOF
 
 echo
