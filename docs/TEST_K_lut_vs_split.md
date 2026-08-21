@@ -1,6 +1,21 @@
 # Test K — which of the two remaining suspects breaks decode
 
-**Status:** ready to run · **Opened:** 2026-08-21 · **Needs:** no rebuild, no new
+**Status: RUN 2026-08-21, results in
+`reports/qwen3vl-4b-testk-device-results-2026-08-21.md`** — read that, not the
+predictions below.
+
+Outcome in two lines: **K2 verified the image → ViT → splice → prefill path on
+7/7 images**, the multimodal capability question answered on hardware. **K1's
+on-device verdict inverts under a host reference** — the control is the correct
+one, the probe is wrong from token 0 while its graph and LUT pass 3/3 against HF
+on the host, so **Genie's LUT feed is newly implicated** rather than exonerated.
+Decision row K1c/3 ("wrong from token 0") is the row we landed on.
+
+The plan below is kept for provenance, with §K1b corrected in place.
+
+---
+
+**Opened:** 2026-08-21 · **Needs:** no rebuild, no new
 ctx-bins — every artefact is already on the Hub. **Board time ≈ 30 minutes.**
 
 Self-contained on purpose: what to run, why, and how to record it are all in this
@@ -84,12 +99,21 @@ grep max-num-tokens genie_dialog_qwen3_0.6b_lutprobe.json      # "max-num-tokens
 
 ### K1b — the control, same session, same board
 
-`2026-08-14-gqafix/bundles/qwen3_06b_w8a16_gqafix_ladekv.tar.gz` in the same
-repo. This is the device-proven 44.707 tok/s bundle.
+> ⚠ **Corrected 2026-08-22 — use the CTX-matched bundle.** The first version of
+> this file named `2026-08-14-gqafix/bundles/qwen3_06b_w8a16_gqafix_ladekv.tar.gz`
+> (the 44.707 tok/s build). That one is **CTX 1152**; the probe is **CTX 640**, so
+> it is not the one-variable control it was described as. Use
+> **`2026-08-16-regime/bundles/qwen3_06b_w8a16_gqafix_cl512_ladekv.tar.gz`**,
+> which matches the probe in every graph dimension with `input_ids` vs
+> `inputs_embeds` as the only difference. `REFERENCE.md` correction #38.
+
+`2026-08-16-regime/bundles/qwen3_06b_w8a16_gqafix_cl512_ladekv.tar.gz` in the
+same repo — same recipe as the device-proven 44.707 tok/s build, at the probe's
+context size.
 
 ```sh
-# host: tar xzf qwen3_06b_w8a16_gqafix_ladekv.tar.gz
-#       adb push qwen3_06b_w8a16_gqafix_ladekv /data/local/tmp/gqafix
+# host: tar xzf qwen3_06b_w8a16_gqafix_cl512_ladekv.tar.gz
+#       adb push qwen3_06b_w8a16_gqafix_cl512_ladekv /data/local/tmp/gqafix
 cd /data/local/tmp/gqafix && chmod +x genie-t2t-run && export LD_LIBRARY_PATH=.
 
 ./genie-t2t-run -c genie_dialog_basic.json \
