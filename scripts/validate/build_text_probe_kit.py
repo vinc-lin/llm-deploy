@@ -253,8 +253,56 @@ CASES_I = [
      "asks": "does the templated form of the same question stay inside range?"},
 ]
 
+# --- Test J: the decode step Genie gets wrong ------------------------------
+# Test I settled the prompt-form root cause AND exposed a second defect. On a
+# templated prompt the device's FIRST token is correct -- but that token comes
+# from PREFILL. The very first DECODE call is already wrong: for
+# "What is 2+2?" it should emit 151645 <|im_end|> and Genie emitted 2939
+# 'ention'; for the weather prompt it should emit 9104 ' weather' and Genie
+# emitted 3279 'aged'.
+#
+# The graphs are not the suspect. Ground truth from the real split fp32 graphs
+# with the full KV recurrence (scripts/validate/host_generate_check.py):
+#     2+2      -> [19, 151645]                      = "4<|im_end|>", two tokens
+#     weather  -> [91169, 9104, 4344, 6157, ...]    = "Mountain weather changes
+#                                                      quickly because ..."
+# and Test G's r3_decodectx already ran a decode step through BOTH shards on
+# device at 1/1 argmax. So the decode graphs are right and the KV contract is
+# right; what has never been tested is who supplies the decode step's inputs --
+# Genie's prefill->decode cache handoff, its LUT lookup of a GENERATED token,
+# and its mask/position advance.
+#
+# These three cases hand the graph a host-built version of exactly that state.
+#   j0/j1  step 1 -- cache is pure prefill KV
+#   j2     step 2 -- cache contains a row the DECODE graph wrote, which is the
+#                    recurrence itself and the only part still untested
+TOKENS_J_2PLUS2 = TOKENS_I_TEMPLATED
+TOKENS_J_WEATHER = [151644, 872, 198, 74785, 304, 2326, 22870, 3170, 16301,
+                    9104, 4344, 6157, 13, 151645, 198, 151644, 77091, 198]
+
+CASES_J = [
+    {"name": "j0_2plus2_s1", "kind": "decode", "tokens": TOKENS_J_2PLUS2,
+     "decode_steps": 1, "seed_from_prefill": True, "label": "templated 2+2",
+     "why": "decode step 1 after a 20-token templated prefill. Genie emitted "
+            "2939 'ention' here; the graphs say 151645 '<|im_end|>'",
+     "asks": "does the decode GRAPH get step 1 right when the cache is handed "
+             "to it directly?"},
+    {"name": "j1_weather_s1", "kind": "decode", "tokens": TOKENS_J_WEATHER,
+     "decode_steps": 1, "seed_from_prefill": True, "label": "templated weather",
+     "why": "the same question on a prompt whose correct continuation is long, "
+            "so a right answer here is not a one-in-a-few fluke. Genie emitted "
+            "3279 'aged'; the graphs say 9104 ' weather'",
+     "asks": "same, on a second prompt"},
+    {"name": "j2_weather_s2", "kind": "decode", "tokens": TOKENS_J_WEATHER,
+     "decode_steps": 2, "seed_from_prefill": True, "label": "templated weather",
+     "why": "decode step 2 -- its cache contains a row written by the DECODE "
+            "graph, not by prefill. This is the recurrence, and it is the one "
+            "part of the decode path that has never run on device",
+     "asks": "does the graph survive a cache it wrote itself?"},
+]
+
 SUITES = {"v5": CASES_V5, "f": CASES_F, "r": CASES_R, "c": ["chunk-suite"],
-          "i": CASES_I}
+          "i": CASES_I, "j": CASES_J}
 
 
 def lut_row(lut_dir: Path, token: int) -> np.ndarray:
@@ -734,7 +782,7 @@ def main():
         raise SystemExit(f"--suite {args.suite} needs --windows <calib .npz>")
     if args.suite == "r":
         cases = attach_windows(cases, args.windows)
-    scan = args.layer_scan or args.suite in ("f", "r", "c")
+    scan = args.layer_scan or args.suite in ("f", "r", "c", "j")
     args.out.mkdir(parents=True, exist_ok=True)
     print(f"building text probe suite {args.suite!r} -> {args.out}")
     if args.suite == "c":
@@ -756,59 +804,81 @@ def main():
 def build_decodectx_case(case, onnx_split: Path, lut: Path, out: Path,
                          threads: int, specs0: dict, specs1: dict,
                          layer_scan: bool):
-    """One decode step with a REAL KV cache, seeded by a real prefill.
+    """Decode step(s) with a REAL KV cache, seeded by a real prefill.
 
     WHY THIS IS SEPARATE. Every decode probe before it (`decode1tok`,
-    `f0_ctrl_dec`) fed an EMPTY, fully-masked cache. That makes the token attend
-    only to itself, which is the attention-sink condition -- exactly the
-    unrealistic state that produced the 1.39x artifact the whole investigation
-    chased. A real decode step attends to a populated cache and is not a sink at
-    all, so it had never actually been instrumented.
+    `f0_ctrl_dec`) fed an EMPTY, fully-masked cache, which makes the token attend
+    only to itself -- the attention-sink condition, i.e. exactly the unrealistic
+    state that manufactured the 1.39x artifact. Real generation attends to a
+    populated cache.
 
-    The KV contract is copied from parity_e2e_vl.Decoder, not re-derived:
-    the cache is LEFT-aligned with valid entries at [0, cache_len); the mask
-    opens [0, cache_len) plus the new token's own slot at index PAST (the concat
-    layout puts it at the end); key is [1,NKV,D,PAST] and value [1,NKV,PAST,D],
-    while the graphs EMIT only the new slice. Feeding this differently from the
-    parity harness would produce a mismatch that means nothing.
+    The prompt comes either from a calibration window (`_win`) or from an
+    explicit `tokens` list, and `decode_steps` selects WHICH step is
+    instrumented: steps before it are run and committed, so step 2's cache
+    contains a row the DECODE graph wrote rather than one prefill wrote. That
+    distinction is the point of Test J -- Genie's first decode call is where the
+    device diverges, and the recurrence is the only part never tested.
 
-    Both shards need their own cache: decode_0 takes layers 0-17 from prefill_0's
-    KV outputs, decode_1 layers 18-35 from prefill_1's.
+    The KV contract is copied from parity_e2e_vl.Decoder, not re-derived: cache
+    LEFT-aligned with valid entries at [0, cache_len); mask open on
+    [0, cache_len) plus the new token's own slot at index PAST; key
+    [1,NKV,D,PAST] and value [1,NKV,PAST,D] while the graphs emit only the new
+    slice. Both shards carry their own cache.
     """
+    import onnxruntime as ort
     import torch
     name = case["name"]
-    win = case["_win"]
+    win = case.get("_win")
+    toks = case.get("tokens")
+    if (win is None) == (toks is None):
+        raise SystemExit(f"{name}: give exactly one of _win / tokens")
+    n = win["n_valid"] if win else len(toks)
+    nsteps = case.get("decode_steps", 1)
     cdir = out / name
     for sub in ("decode_0", "decode_1", "ref"):
         (cdir / sub).mkdir(parents=True, exist_ok=True)
-    n = win["n_valid"]
 
-    # ---- stage 1: prefill the prompt, on BOTH shards, keeping the KV --------
-    pf_case = {"name": name + "/prefill", "kind": "prefill", "mask": "window",
-               "_win": win, "n_real": n}
+    def kvnames(sess, m):
+        have = {o.name for o in sess.get_outputs()}
+        return [f"past_{s}_{i}_out" for i in m["layer_idx"] for s in ("key", "value")
+                if f"past_{s}_{i}_out" in have]
 
-    def _kv_names(g):
-        import onnx as _onnx
-        gg = _onnx.load(str(onnx_split / g / f"{g}.onnx"), load_external_data=False)
-        outs = {o.name for o in gg.graph.output}
-        del gg
-        return sorted((x for x in outs
-                       if x.startswith(("past_key_", "past_value_"))
-                       and x.endswith("_out")),
-                      key=lambda x: (int(x.split("_")[2]), x.split("_")[1]))
+    so = ort.SessionOptions()
+    if threads:
+        so.intra_op_num_threads = threads
+
+    # ---- stage 1: prefill the prompt on BOTH shards, keeping the KV ---------
+    pf_case = ({"name": name + "/prefill", "kind": "prefill", "mask": "window",
+                "_win": win, "n_real": n} if win else
+               {"name": name + "/prefill", "kind": "prefill", "mask": "causal",
+                "n_real": n, "tokens": toks})
+    rows = None if win else np.stack([lut_row(lut, t) for t in toks])
 
     def feeds_p0(m):
-        mask, cos, sin, _ = build_mask_rope(m, pf_case)
+        mask, cos, sin, real_rows = build_mask_rope(m, pf_case)
         H = m["shapes"]["inputs_embeds"][-1]
-        f = {"inputs_embeds": win["embeds"].astype(np.float32).reshape(1, 1, m["ar"], H),
-             "attention_mask": mask, "position_ids_cos": cos,
+        if win:
+            emb = win["embeds"].astype(np.float32).reshape(1, 1, m["ar"], H)
+        else:
+            emb = np.zeros((1, 1, m["ar"], H), dtype=np.float32)
+            emb[0, 0, real_rows] = rows
+        f = {"inputs_embeds": emb, "attention_mask": mask, "position_ids_cos": cos,
              "position_ids_sin": sin, **zeros_past(m)}
         for dk in m["deep"]:
             f[dk] = np.zeros((1, 1, m["ar"], H), dtype=np.float32)
         return f
 
+    def _kv_of(g):
+        import onnx as _onnx
+        gg = _onnx.load(str(onnx_split / g / f"{g}.onnx"), load_external_data=False)
+        outs = {o.name for o in gg.graph.output}
+        del gg
+        return sorted((x for x in outs
+                       if x.startswith(("past_key_", "past_value_")) and x.endswith("_out")),
+                      key=lambda x: (int(x.split("_")[2]), x.split("_")[1]))
+
     hid_p, mp0, _, kv0 = run(onnx_split / "prefill_0" / "prefill_0.onnx", feeds_p0,
-                             "last_hidden_states", threads, _kv_names("prefill_0"))
+                             "last_hidden_states", threads, _kv_of("prefill_0"))
     H = hid_p.shape[-1]
 
     def feeds_p1(m):
@@ -818,70 +888,72 @@ def build_decodectx_case(case, onnx_split: Path, lut: Path, out: Path,
                 "position_ids_sin": sin, **zeros_past(m)}
 
     lg_p, mp1, _, kv1 = run(onnx_split / "prefill_1" / "prefill_1.onnx", feeds_p1,
-                            "logits", threads, _kv_names("prefill_1"))
+                            "logits", threads, _kv_of("prefill_1"))
     next_tok = int(np.argmax(lg_p.reshape(mp1["ar"], -1)[n - 1]))
-    print(f"  {name:12s} prefilled {n} rows; greedy next token = {next_tok}")
+    print(f"  {name:16s} prefilled {n} rows; first generated token = {next_tok}")
     del lg_p
     gc.collect()
 
-    # ---- stage 2: one decode step on that cache ----------------------------
-    emb_next = lut_row(lut, next_tok)
+    # ---- stage 2: decode, persistent sessions so the cache can be threaded --
+    d0 = ort.InferenceSession(str(onnx_split / "decode_0" / "decode_0.onnx"), so,
+                              providers=["CPUExecutionProvider"])
+    d1 = ort.InferenceSession(str(onnx_split / "decode_1" / "decode_1.onnx"), so,
+                              providers=["CPUExecutionProvider"])
+    md0, md1 = meta_of(d0), meta_of(d1)
+    dkv0, dkv1 = kvnames(d0, md0), kvnames(d1, md1)
+    PAST, TOTAL = md0["past"], md0["total"]
 
-    def make_cache(m, kv):
-        f = {}
+    cache = {}
+    for tag, m, kv in (("s0", md0, kv0), ("s1", md1, kv1)):
+        cache[tag] = {}
         for i in m["layer_idx"]:
-            k = np.zeros((1, m["n_kv"], m["head_dim"], m["past"]), np.float32)
-            v = np.zeros((1, m["n_kv"], m["past"], m["head_dim"]), np.float32)
+            k = np.zeros((1, m["n_kv"], m["head_dim"], PAST), np.float32)
+            v = np.zeros((1, m["n_kv"], PAST, m["head_dim"]), np.float32)
             k[:, :, :, :n] = kv[f"past_key_{i}_out"][:, :, :, :n]
             v[:, :, :n, :] = kv[f"past_value_{i}_out"][:, :, :n, :]
-            f[f"past_key_{i}_in"], f[f"past_value_{i}_in"] = k, v
-        return f
-
-    def dec_mask_rope(m):
-        mask = np.full((1, 1, m["total"]), MASK_VALUE, dtype=np.float32)
-        mask[0, 0, :n] = 0.0            # everything committed to the cache
-        mask[0, 0, m["past"]] = 0.0     # the new token itself (concat layout)
-        c, s = rope_tables(torch.arange(n, n + 1), m["head_dim"], ROPE_THETA)
-        return (mask, c.numpy().astype(np.float32), s.numpy().astype(np.float32))
-
-    cache0_box = {}
-
-    def feeds_d0(m):
-        mask, cos, sin = dec_mask_rope(m)
-        cache = make_cache(m, kv0)
-        cache0_box.update(cache)
-        f = {"inputs_embeds": emb_next.reshape(1, 1, 1, H),
-             "attention_mask": mask, "position_ids_cos": cos,
-             "position_ids_sin": sin, **cache}
-        for dk in m["deep"]:
-            f[dk] = np.zeros((1, 1, 1, H), dtype=np.float32)
-        return f
-
-    scan_names = _kv_names("decode_0") if layer_scan else []
-    hid_d, md0, f0, taps = run(onnx_split / "decode_0" / "decode_0.onnx", feeds_d0,
-                               "last_hidden_states", threads, scan_names)
-    del kv0
+            cache[tag][f"past_key_{i}_in"], cache[tag][f"past_value_{i}_in"] = k, v
+    del kv0, kv1
     gc.collect()
 
-    cache1_box = {}
-
-    def feeds_d1(m):
-        mask, cos, sin = dec_mask_rope(m)
-        cache = make_cache(m, kv1)
-        cache1_box.update(cache)
-        return {"last_hidden_states": hid_d.reshape(1, 1, H),
-                "attention_mask": mask, "position_ids_cos": cos,
-                "position_ids_sin": sin, **cache}
-
-    lg_d, md1, f1, _ = run(onnx_split / "decode_1" / "decode_1.onnx", feeds_d1,
-                           "logits", threads)
-    del kv1
+    tok, clen = next_tok, n
+    f0 = f1 = hid_d = lg_d = taps = None
+    for step in range(1, nsteps + 1):
+        emb = lut_row(lut, tok).reshape(1, 1, 1, H)
+        mask = np.full((1, 1, TOTAL), MASK_VALUE, np.float32)
+        mask[0, 0, :clen] = 0.0        # everything committed to the cache
+        mask[0, 0, PAST] = 0.0         # the new token itself (concat layout)
+        c, s = rope_tables(torch.arange(clen, clen + 1), md0["head_dim"], ROPE_THETA)
+        cos, sin = c.numpy().astype(np.float32), s.numpy().astype(np.float32)
+        f0 = {"inputs_embeds": emb, "attention_mask": mask, "position_ids_cos": cos,
+              "position_ids_sin": sin,
+              **{dk: np.zeros((1, 1, 1, H), np.float32) for dk in md0["deep"]},
+              **cache["s0"]}
+        want0 = ["last_hidden_states"] + (dkv0 if (layer_scan or step < nsteps) else [])
+        r0 = dict(zip(want0, d0.run(want0, f0)))
+        hid_d = np.asarray(r0["last_hidden_states"], np.float32)
+        f1 = {"last_hidden_states": hid_d.reshape(1, 1, H), "attention_mask": mask,
+              "position_ids_cos": cos, "position_ids_sin": sin, **cache["s1"]}
+        want1 = ["logits"] + (dkv1 if step < nsteps else [])
+        r1 = dict(zip(want1, d1.run(want1, f1)))
+        lg_d = np.asarray(r1["logits"], np.float32)
+        taps = {x: r0[x] for x in dkv0} if layer_scan else {}
+        nxt = int(np.argmax(lg_d.reshape(-1)))
+        print(f"  {name:16s} decode step {step}: cache_len={clen} in={tok} -> {nxt}")
+        if step < nsteps:      # commit and advance; the LAST step is the one we ship
+            for tag, m, r in (("s0", md0, r0), ("s1", md1, r1)):
+                for i in m["layer_idx"]:
+                    cache[tag][f"past_key_{i}_in"][:, :, :, clen:clen + 1] = r[f"past_key_{i}_out"]
+                    cache[tag][f"past_value_{i}_in"][:, :, clen:clen + 1, :] = r[f"past_value_{i}_out"]
+            clen += 1
+            tok = nxt
+        del r0, r1
+        gc.collect()
+    del d0, d1
     gc.collect()
 
     # ---- device inputs ------------------------------------------------------
     written = {}
-    for t in ("inputs_embeds", "attention_mask", "position_ids_cos",
-              "position_ids_sin"):
+    for t in ("inputs_embeds", "attention_mask", "position_ids_cos", "position_ids_sin"):
         written[t] = write_native(cdir / "decode_0" / f"{t}.raw", f0[t], t, specs0)
     for dk in md0["deep"]:
         written[dk] = write_native(cdir / "decode_0" / f"{dk}.raw", f0[dk], dk, specs0)
@@ -890,34 +962,28 @@ def build_decodectx_case(case, onnx_split: Path, lut: Path, out: Path,
     written["s1/last_hidden_states"] = write_native(
         cdir / "decode_1" / "last_hidden_states.raw", f1["last_hidden_states"],
         "last_hidden_states", specs1)
-    # The caches themselves. These are the bulk of the case -- 36 tensors per
-    # shard at NKV*D*PAST fp16 -- and they are >99% zero, which is why the
-    # package ships them tar.gz'd and the operator expands them host-side.
     nbytes = 0
-    for tag, m, cache in (("decode_0", md0, cache0_box), ("decode_1", md1, cache1_box)):
-        for k, v in cache.items():
-            p = cdir / tag / f"{k}.raw"
-            write_native(p, v, k, specs0 if tag == "decode_0" else specs1)
-            nbytes += p.stat().st_size
-    print(f"  {name:12s} past-KV: {len(cache0_box) + len(cache1_box)} tensors, "
+    for tag, m, key in (("decode_0", md0, "s0"), ("decode_1", md1, "s1")):
+        for k, v in cache[key].items():
+            pth = cdir / tag / f"{k}.raw"
+            write_native(pth, v, k, specs0 if key == "s0" else specs1)
+            nbytes += pth.stat().st_size
+    print(f"  {name:16s} past-KV: {len(cache['s0']) + len(cache['s1'])} tensors, "
           f"{nbytes / 1e6:.1f} MB (>99% zero; shipped compressed)")
 
     np.save(cdir / "ref" / "last_hidden_states.npy", hid_d.reshape(1, H))
     np.save(cdir / "ref" / "logits.npy", lg_d.reshape(1, -1))
     scan_meta = {}
-    if scan_names:
+    if taps:
         sdir = cdir / "ref" / "layerscan"
         sdir.mkdir(parents=True, exist_ok=True)
         for nm, t in taps.items():
-            tt = t[0]
-            sl = (np.transpose(tt[:, :, [0]], (2, 0, 1))
-                  if nm.startswith("past_key_")
+            tt = np.asarray(t, np.float32)[0]
+            sl = (np.transpose(tt[:, :, [0]], (2, 0, 1)) if nm.startswith("past_key_")
                   else np.transpose(tt[:, [0], :], (1, 0, 2)))
             np.save(sdir / f"{nm}.npy", np.ascontiguousarray(sl))
-            scan_meta[nm] = {"shape": list(t.shape),
+            scan_meta[nm] = {"shape": list(np.asarray(t).shape),
                              "ar_axis": 3 if nm.startswith("past_key_") else 2}
-        del taps
-        gc.collect()
 
     past_bytes = md0["n_kv"] * md0["head_dim"] * md0["past"] * 2
     (cdir / "case.env").write_text("\n".join([
@@ -925,30 +991,31 @@ def build_decodectx_case(case, onnx_split: Path, lut: Path, out: Path,
         f"AR={md0['ar']}", "N_REAL=1", "REAL_ROWS='0'", "TOKEN_ROWS=1",
         f"LAYER_BASE_0={md0['layer_idx'][0]}", f"LAYER_N_0={len(md0['layer_idx'])}",
         f"LAYER_BASE_1={md1['layer_idx'][0]}", f"LAYER_N_1={len(md1['layer_idx'])}",
-        f"DEEP='{' '.join(md0['deep'])}'",
-        "PAST_MODE=files",          # real per-layer caches, not the shared zero
-        f"PAST_BYTES={past_bytes}",
-        f"HIDDEN_BYTES={md0['ar'] * H * 2}"]) + "\n")
+        f"DEEP='{' '.join(md0['deep'])}'", "PAST_MODE=files",
+        f"PAST_BYTES={past_bytes}", f"HIDDEN_BYTES={md0['ar'] * H * 2}"]) + "\n")
 
     rms = float(np.sqrt((hid_d.astype(np.float64) ** 2).mean()))
+    argmax = int(np.argmax(lg_d.reshape(-1)))
     meta = {"case": name, "kind": "decode", "n_real": 1, "why": case["why"],
-            "asks": case.get("asks"), "tokens": [next_tok], "graph_idx": 1,
+            "asks": case.get("asks"), "tokens": [tok], "graph_idx": 1,
             "mask": "window_decode", "row_offset": 0, "real_rows": [0],
-            "n_token_rows": 1, "window": win["desc"], "window_split": win["split"],
-            "cache_len": n, "next_token": next_tok,
+            "n_token_rows": 1, "window": (win or {}).get("desc", case.get("label")),
+            "window_split": (win or {}).get("split", "explicit"),
+            "cache_len": clen, "next_token": tok, "decode_step": nsteps,
+            "prompt_tokens": n, "expected_argmax": argmax,
             "ar": md0["ar"], "hidden_rows": [1, H], "logits_rows": [1, lg_d.size],
             "ref_row_rms": [rms],
             "last_row_top10_ids": [int(t) for t in np.argsort(-lg_d.reshape(-1))[:10]],
-            "last_row_argmax": int(np.argmax(lg_d.reshape(-1))),
-            "mask_value": MASK_VALUE, "rope_theta": ROPE_THETA,
-            "deep_names": md0["deep"], "past": md0["past"],
+            "last_row_argmax": argmax, "mask_value": MASK_VALUE,
+            "rope_theta": ROPE_THETA, "deep_names": md0["deep"], "past": md0["past"],
             "n_kv": md0["n_kv"], "head_dim": md0["head_dim"],
             "layerscan": scan_meta, "input_dtypes": written}
     (cdir / "ref" / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
-    print(f"  {name:12s} AR=1 cache_len={n}  argmax={meta['last_row_argmax']}  "
-          f"host row RMS: r0={rms:.3f}{'  +layerscan' if scan_meta else ''}")
+    print(f"  {name:16s} SHIPPED step {nsteps}: cache_len={clen} in={tok} "
+          f"expect argmax={argmax}  rms={rms:.3f}")
     gc.collect()
     return meta
+
 
 
 def build_chunk_suite(npz: Path, onnx_split: Path, out: Path, threads: int,
