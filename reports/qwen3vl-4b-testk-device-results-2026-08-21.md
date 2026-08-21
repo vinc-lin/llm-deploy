@@ -8,6 +8,33 @@
 > exonerated. K2's result improves sharply: the image path is right on **6–7 of 7**
 > first tokens, not 3.
 
+> ## ⛔ §5 IS VOID — corrected 2026-08-22
+>
+> **K1 measured our own packaging bug, not Genie.** The bundle published for
+> Test K shipped the **pre-graft ctx-bin**, whose `inputs_embeds` is
+> `QNN_DATATYPE_FLOAT_16`. It fails `lint_embedding_dtype.py`. The corrected
+> build (`9720e46e…`, `UFIXED_POINT_16`) passes.
+>
+> FLOAT_16 is the dtype for which `quantizeInput` advances by `tensorOffset`
+> **bytes** while `setupInputEmbeddings` passes **elements**
+> (`nsp-model.cpp:3144` vs `:1813`), so the pad write for a partially-filled
+> prefill chunk **overwrites the back half of the real prompt**. It fires
+> whenever `variant > n_process` — and the probe's prompts are 12/5/6 tokens in
+> an **AR=128** graph, so it fired on every one. That is why the front of `2+2`
+> survived, the long prompt lost its topic, and decode (AR=1, `variant ==
+> n_process`) was untouched.
+>
+> ⇒ **Genie's LUT feed is neither exonerated nor implicated** — it was never
+> tested. §5.7's "unified hypothesis" is withdrawn. §5.1–5.6's *measurements*
+> stand (the control does match HF; the probe did diverge at token 0); only the
+> attribution was wrong. §5.4's line "fp16 `inputs_embeds` — ✝ eliminated" is the
+> specific error: it was read from `work/ctxbin/…/info.json`, the **rebuilt** bin,
+> while the device ran the **staged** copy.
+>
+> **§6 (image path 7/7), §7 (timing) and §5.5 (correction #38) are unaffected.**
+> Re-run as **Test L** (`docs/TEST_L_ctxbin_vs_genie.md`). `REFERENCE.md`
+> correction #39.
+
 ---
 
 ## 1. Preconditions — all pass
