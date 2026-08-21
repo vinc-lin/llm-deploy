@@ -216,7 +216,45 @@ CHUNK_SUITE = {
             "FLOAT_16 padding bug fired on"],
 }
 
-SUITES = {"v5": CASES_V5, "f": CASES_F, "r": CASES_R, "c": ["chunk-suite"]}
+# --- Test I: raw vs chat-templated, same question --------------------------
+# THE CONTROLLED PAIR THAT SETTLES IT. Both cases ask "What is 2+2? Answer with
+# one number."; the only difference is whether the ChatML template is applied.
+#
+#   raw        row 0 = 3838 'What'          <- what genie-t2t-run -p actually feeds
+#   templated  row 0 = 151644 '<|im_start|>'  <- what the calibration set contains
+#
+# This matters because `vl_calib_build.py` builds EVERY window with
+# `apply_chat_template(..., add_generation_prompt=True)`, so the 4B activation
+# ranges are fitted to a distribution whose position 0 is always a special
+# token and whose attention sink sits at row 1. The v5 guide's Test 3a --
+# the run behind the only post-fix "4B text is garbage" evidence -- is
+# `genie-t2t-run -p "What is 2+2? Answer with one number."`, raw, and
+# `genie_dialog_qwen3vl_4b.json` sets `bos-token: -1` and carries no prompt
+# template, so nothing prepends anything. The 4B has therefore never been asked
+# a question in the form it was calibrated for.
+#
+# The 0.6B is coherent on the same raw prompts because ITS calibration used raw
+# prompts (`CALIB_PROMPTS` in quantize_aimet.py). Same code, opposite input
+# contract -- which is why the working 0.6B never pointed at this.
+TOKENS_I_RAW = [3838, 374, 220, 17, 10, 17, 30, 21806, 448, 825, 1372, 13]
+TOKENS_I_TEMPLATED = [151644, 872, 198, 3838, 374, 220, 17, 10, 17, 30, 21806,
+                      448, 825, 1372, 13, 151645, 198, 151644, 77091, 198]
+
+CASES_I = [
+    {"name": "i0_raw", "kind": "prefill", "mask": "causal",
+     "n_real": len(TOKENS_I_RAW), "tokens": TOKENS_I_RAW,
+     "why": "'What is 2+2? Answer with one number.' RAW -- exactly what the v5 "
+            "guide's Test 3a feeds genie-t2t-run. Row 0 is a bare content word",
+     "asks": "does an untemplated prompt clip?"},
+    {"name": "i1_templated", "kind": "prefill", "mask": "causal",
+     "n_real": len(TOKENS_I_TEMPLATED), "tokens": TOKENS_I_TEMPLATED,
+     "why": "the SAME question with the ChatML template applied -- what "
+            "vl_calib_build.py calibrated on. Row 0 is <|im_start|>",
+     "asks": "does the templated form of the same question stay inside range?"},
+]
+
+SUITES = {"v5": CASES_V5, "f": CASES_F, "r": CASES_R, "c": ["chunk-suite"],
+          "i": CASES_I}
 
 
 def lut_row(lut_dir: Path, token: int) -> np.ndarray:
