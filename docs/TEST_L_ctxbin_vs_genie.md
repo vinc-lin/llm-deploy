@@ -117,11 +117,10 @@ chains all the way back to HF.
 and the only part of a decode path a single step never exercises.
 
 ```sh
-# host, once: the decode cases carry a real KV cache
-cd testl
-md5sum -c past_kv.tar.gz.md5
-tar xzf past_kv.tar.gz
-cd .. && adb push testl /data/local/tmp/lutprobe/testl
+# host, once. Two tarballs: the kit itself, then the decode cases' KV cache.
+md5sum -c testl.tar.gz.md5 && tar xzf testl.tar.gz
+cd testl && md5sum -c past_kv.tar.gz.md5 && tar xzf past_kv.tar.gz && cd ..
+adb push testl /data/local/tmp/lutprobe/testl
 
 # device
 cd /data/local/tmp/lutprobe/testl && export LD_LIBRARY_PATH=/data/local/tmp/lutprobe
