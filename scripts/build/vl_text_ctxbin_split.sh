@@ -119,12 +119,68 @@ convert() {
         --float_bitwidth 16 --target_backend HTP "${args[@]}"
 }
 
+# Shard 0 owns inputs_embeds, which Genie fills from the float32 LUT (and, for a
+# VL tower, from spliced image features). With no encoding on that tensor the
+# converter types it FLOAT_16, and quantizeInput's FLOAT_16 case advances its
+# destination by tensorOffset BYTES while setupInputEmbeddings passes ELEMENTS --
+# so padding a partially-filled prefill chunk overwrites the back half of the real
+# prompt. Grafting a 16-bit INT activation encoding types it uFxp_16 instead,
+# which is the correct element-offset branch and is HTP-native. This is the same
+# mechanism that gives the ViT its UFIXED_16 I/O; see vit_build_quant.sh's header,
+# which also explains why --preserve_io_datatype is NOT the way (it pins I/O to
+# float32 and the converter then emits a QNN_Convert the backend cannot create).
+#
+# deepstack_* are deliberately NOT grafted, and this is load-bearing rather than
+# an omission. They are zero-filled (deepstack-by-zeros; nsp-model.cpp:1481), and
+# a memset-0 buffer only MEANS zero for a float type. On an asymmetric uFxp_16
+# grid with offset -32927 the raw zero decodes to (0 + -32927) * scale = -11.65,
+# i.e. grafting them would silently feed the tower a large negative constant
+# where it currently gets a clean zero. inputs_embeds has no such hazard: its pad
+# region is explicitly quantized from the pad/EOS embedding, never memset.
+#
+# RANGE: inputs_embeds carries BOTH text-LUT rows and spliced image features, so
+# the encoding must cover both. VIT_INFO defaults to the built vision bin's
+# info.json, whose image_features encoding is unioned in -- covering only the LUT
+# would clip every image feature outside the text range (the 4B text LUT spans
+# +-0.24 while image features span +-11.6, a 48x difference). Matching the ViT
+# encoding exactly is the goal, not a compromise: the splice then copies rather
+# than rescales. Override with EMBED_MIN/EMBED_MAX if a future ViT changes.
+if [ -z "${EMBEDS_FP16_IN:-}" ]; then
+    echo "== graft the inputs_embeds activation encoding into chunk0 (uFxp_16 I/O) =="
+    GRAFT=("$LLMDEPLOY_ROOT/scripts/quant/graft_input_encoding.py"
+           --encodings "$ENCDIR/chunk0.encodings" --tensor inputs_embeds)
+    [ -n "${EMBED_LUT_DIR:-$LLMDEPLOY_DATA/work/lut/qwen3vl-4b}" ] &&
+        GRAFT+=(--lut "${EMBED_LUT_DIR:-$LLMDEPLOY_DATA/work/lut/qwen3vl-4b}")
+    VIT_INFO=${VIT_INFO:-$LLMDEPLOY_DATA/work/ctxbin/qwen3vl-4b-vit-w8a16/info.json}
+    [ -f "$VIT_INFO" ] && GRAFT+=(--cover-ctxbin-info "$VIT_INFO"
+                                  --cover-ctxbin-tensor "${VIT_OUT:-image_features}")
+    [ -n "${EMBED_MIN:-}" ] && GRAFT+=(--min "$EMBED_MIN")
+    [ -n "${EMBED_MAX:-}" ] && GRAFT+=(--max "$EMBED_MAX")
+    "$PY_DEPLOY" "${GRAFT[@]}"
+fi
+
 echo "== prefill flavour: past=$PREFILL_PAST, mask total=$P_TOTAL, deepstack suffix='${DSP_SUFFIX:-<none>}' =="
 convert prefill_0 "$CL" "$PREFILL_PAST" 1 0       "$SPLIT" 0 "$P_TOTAL"
 convert decode_0  1     "$PAST"         1 0       "$SPLIT" 0 "$TOTAL"
 convert prefill_1 "$CL" "$PREFILL_PAST" 0 "$SPLIT" "$LAYERS" 1 "$P_TOTAL"
 convert decode_1  1     "$PAST"         0 "$SPLIT" "$LAYERS" 1 "$TOTAL"
 ls -lh "$DLC"
+
+# GQA topology gate. The v2 tower shipped with 36 KV-replication ops per shard
+# (4:1 head ratio) because --grouped-gqa could not reach the VL exporters at
+# all; nothing downstream notices -- the build succeeds, parity passes (the two
+# forms are numerically identical) and the ctx-bin loads. The only symptom is a
+# slow device. Assert it here, on the DLCs just converted.
+#
+# --layers is PER SHARD (each holds half of $LAYERS), and the lint's own default
+# is 28 (the 0.6B tower): omitting it demands 56 MatMuls and fails a correct
+# shard. GQA_EXPECT=replicating deliberately builds the old topology.
+echo "== GQA topology gate (grouped attention, per-shard) =="
+GQA_FLAGS=(--layers $((LAYERS / 2)) --n-kv "$NKV")
+[ "${GQA_EXPECT:-grouped}" = "replicating" ] && GQA_FLAGS+=(--expect-replicating)
+PATH="$(dirname "$PY_QAIRT"):$PATH" \
+$PY_DEPLOY "$LLMDEPLOY_ROOT/scripts/validate/lint_gqa_ops.py" "${GQA_FLAGS[@]}" \
+    "$DLC"/prefill_0.dlc "$DLC"/decode_0.dlc "$DLC"/prefill_1.dlc "$DLC"/decode_1.dlc
 
 # One ctx-bin per chunk, holding that chunk's two AR variants so its weights are
 # shared between them. Splitting prefill/decode into SEPARATE binaries instead
@@ -192,10 +248,23 @@ echo "== verify both binaries =="
 $PY_DEPLOY - <<PYEOF
 import json, sys
 
-# Per-chunk floor for sharedWeightsSize. Chunk 0 is 18 layers at W8 (~1.7 GB);
-# chunk 1 adds the FP16 lm_head. Set below the expected value, not at it, so
-# the check flags a collapse rather than policing normal variation.
-MIN_SHARED_GB = {0: 1.4, 1: 2.0}
+# Gate on POOLED FRACTION -- shared / (shared + const) -- not on absolute GB.
+#
+# Absolute floors (this was {0: 1.4, 1: 2.0} GB) encode the 4B's weight set into
+# a script that is otherwise size-agnostic, and they reject a perfectly healthy
+# smaller tower: the 2-shard 0.6B pools 0.21 / 0.50 GB, which is its ENTIRE
+# weight set carried exactly once, and failed a 1.4 GB floor.
+#
+# The fraction is the real invariant. It still catches what the floor was for --
+# a build that shares only lm_head and duplicates every layer has a large
+# constSize, so its fraction collapses -- while staying correct at any scale.
+# Measured: gqafix_ladekv 100% (const 256 B), gqafix_qh_ladekv 95%, against
+# w8a16qh 29% and w8a16qh-lade 62%. REFERENCE.md 8.2.
+#
+# Raise MIN_POOLED only for a documented private-const exception (--quant-head
+# moves ~144 MB into a private decode block by design; a bertcache graph forces
+# a private copy). Both are legitimate and neither is a sharing failure.
+MIN_POOLED = float("${MIN_POOLED:-0.90}")
 
 errs = []
 for c in (0, 1):
@@ -220,20 +289,23 @@ for c in (0, 1):
             if blob.get(key) != wanted:
                 errs.append(f"{name}: {key} is {blob.get(key)!r}, expected {wanted!r}")
 
-    shared = 0
+    # sharedWeightsSize is the context's single pool and is printed identically
+    # on every graph -- take the max, never the sum. constSize is per-graph and
+    # private, so it does add up.
+    shared, const = 0, 0
     for info in graphs.values():
-        v2 = info.get("graphBlobInfoV2", {})
-        shared = max(shared, (v2.get("info", v2) or {}).get("sharedWeightsSize", 0) or 0)
-    # "> 0" is far too weak: a build that shares only lm_head reports ~0.7 GB
-    # and passes, while duplicating every layer. The two graphs in a chunk hold
-    # the SAME weights, so sharing must account for most of one DLC. Reference:
-    # the shipped 0.6B/1.7B two-graph builds share 0.99 GB and 1.16 GB, i.e.
-    # essentially their whole weight set.
-    floor = MIN_SHARED_GB[c] * 2**30
-    if shared < floor:
-        errs.append(f"{part}_of_2 sharedWeightsSize {shared/2**30:.3f} GB < {MIN_SHARED_GB[c]} GB "
-                    f"-- weight sharing barely engaged, so the binary carries both "
-                    f"graphs' weights separately")
+        v2 = (info.get("graphBlobInfoV2", {}) or {})
+        v2 = v2.get("info", v2) or {}
+        shared = max(shared, v2.get("sharedWeightsSize", 0) or 0)
+        const += v2.get("constSize", 0) or 0
+    total = shared + const
+    pooled = (shared / total) if total else 0.0
+    if shared == 0:
+        errs.append(f"{part}_of_2 sharedWeightsSize is 0 -- weight sharing did not engage")
+    elif pooled < MIN_POOLED:
+        errs.append(f"{part}_of_2 pooled fraction {pooled:.1%} < {MIN_POOLED:.0%} "
+                    f"(shared {shared/2**30:.3f} GB, private const {const/2**30:.3f} GB) "
+                    f"-- the binary carries most weights per-graph instead of once")
 
     for name, info in sorted(graphs.items()):
         idims = {t["info"]["name"]: t["info"]["dimensions"]
@@ -297,7 +369,8 @@ for c in (0, 1):
             if name.startswith("prefill") and list(outs["logits"][:2]) != [1, $CL]:
                 errs.append(f"{name}: logits {outs['logits']} not all-position [1, $CL, vocab]")
         print(f"  {name:10s} in={len(ins):3d} out={len(outs):3d}")
-    print(f"  sharedWeights={shared/2**30:.2f} GB")
+    print(f"  sharedWeights={shared/2**30:.2f} GB  privateConst={const/2**30:.3f} GB  "
+          f"pooled={pooled:.1%}")
 
 if errs:
     print("BUILD REJECTED:")

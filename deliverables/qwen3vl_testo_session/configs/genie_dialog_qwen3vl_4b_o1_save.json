@@ -1,0 +1,83 @@
+{
+  "dialog": {
+    "version": 1,
+    "type": "basic",
+    "max-num-tokens": 1,
+    "context": {
+      "version": 1,
+      "size": 2048,
+      "n-vocab": 151936,
+      "n-embd": 2560,
+      "bos-token": -1,
+      "pad-token": 151643,
+      "eos-token": [
+        151645,
+        151643
+      ]
+    },
+    "sampler": {
+      "version": 1,
+      "seed": 42,
+      "temp": 0.0,
+      "top-k": 1,
+      "top-p": 1.0,
+      "greedy": true
+    },
+    "tokenizer": {
+      "version": 1,
+      "path": "tokenizer.json"
+    },
+    "embedding": {
+      "version": 1,
+      "type": "lut",
+      "lut-path": "embedding_float32_lut.bin",
+      "size": 2560,
+      "datatype": "float32"
+    },
+    "engine": {
+      "version": 1,
+      "n-threads": 3,
+      "backend": {
+        "version": 1,
+        "type": "QnnHtp",
+        "QnnHtp": {
+          "version": 1,
+          "spill-fill-bufsize": 0,
+          "use-mmap": true,
+          "mmap-budget": 0,
+          "poll": false,
+          "cpu-mask": "0xe0",
+          "kv-dim": 128,
+          "allow-async-init": false
+        },
+        "extensions": "htp_backend_ext_config_vltext.json"
+      },
+      "model": {
+        "version": 1,
+        "type": "binary",
+        "binary": {
+          "version": 1,
+          "ctx-bins": [
+            "qwen3vl-4b-w8a16_1_of_2.bin",
+            "qwen3vl-4b-w8a16_2_of_2.bin"
+          ]
+        },
+        "positional-encoding": {
+          "type": "rope",
+          "rope-dim": 64,
+          "rope-theta": 5000000.0,
+          "rope-scaling": {
+            "rope-type": "qwen3vl-mrope",
+            "mrope-section": [
+              24,
+              20,
+              20
+            ],
+            "spatial-merge-size": 2,
+            "time-step": 2
+          }
+        }
+      }
+    }
+  }
+}

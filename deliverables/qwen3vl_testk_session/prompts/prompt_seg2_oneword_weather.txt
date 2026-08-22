@@ -1,0 +1,2 @@
+<|vision_end|>Answer with one word: what is the weather in this photo?<|im_end|>
+<|im_start|>assistant

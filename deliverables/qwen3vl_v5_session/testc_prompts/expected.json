@@ -1,0 +1,240 @@
+[
+ {
+  "n": 1,
+  "expected_id": 374,
+  "expected_str": " is",
+  "top1_top2_gap": 1.5387,
+  "decisive": true,
+  "top5": [
+   {
+    "id": 374,
+    "logit": 22.8858,
+    "str": " is"
+   },
+   {
+    "id": 1558,
+    "logit": 21.3471,
+    "str": " does"
+   },
+   {
+    "id": 525,
+    "logit": 21.1046,
+    "str": " are"
+   },
+   {
+    "id": 572,
+    "logit": 20.7231,
+    "str": " was"
+   },
+   {
+    "id": 1033,
+    "logit": 20.3383,
+    "str": " were"
+   }
+  ]
+ },
+ {
+  "n": 4,
+  "expected_id": 315,
+  "expected_str": " of",
+  "top1_top2_gap": 0.1905,
+  "decisive": false,
+  "top5": [
+   {
+    "id": 315,
+    "logit": 22.1503,
+    "str": " of"
+   },
+   {
+    "id": 42489,
+    "logit": 21.9598,
+    "str": " statistic"
+   },
+   {
+    "id": 480,
+    "logit": 21.6721,
+    "str": "able"
+   },
+   {
+    "id": 369,
+    "logit": 21.5281,
+    "str": " for"
+   },
+   {
+    "id": 23632,
+    "logit": 21.2997,
+    "str": "icular"
+   }
+  ]
+ },
+ {
+  "n": 16,
+  "expected_id": 16301,
+  "expected_str": " mountain",
+  "top1_top2_gap": 5.2921,
+  "decisive": true,
+  "top5": [
+   {
+    "id": 16301,
+    "logit": 26.4807,
+    "str": " mountain"
+   },
+   {
+    "id": 22103,
+    "logit": 21.1886,
+    "str": " barrier"
+   },
+   {
+    "id": 32671,
+    "logit": 21.0293,
+    "str": " ______"
+   },
+   {
+    "id": 23501,
+    "logit": 20.9296,
+    "str": " mountains"
+   },
+   {
+    "id": 57833,
+    "logit": 20.7995,
+    "str": " ridge"
+   }
+  ]
+ },
+ {
+  "n": 64,
+  "expected_id": 9956,
+  "expected_str": " wind",
+  "top1_top2_gap": 0.464,
+  "decisive": false,
+  "top5": [
+   {
+    "id": 9956,
+    "logit": 21.3157,
+    "str": " wind"
+   },
+   {
+    "id": 512,
+    "logit": 20.8517,
+    "str": " le"
+   },
+   {
+    "id": 3720,
+    "logit": 20.2509,
+    "str": " air"
+   },
+   {
+    "id": 5114,
+    "logit": 19.5905,
+    "str": " statement"
+   },
+   {
+    "id": 4396,
+    "logit": 19.4982,
+    "str": " correct"
+   }
+  ]
+ },
+ {
+  "n": 127,
+  "expected_id": 2608,
+  "expected_str": " height",
+  "top1_top2_gap": 10.8354,
+  "decisive": true,
+  "top5": [
+   {
+    "id": 2608,
+    "logit": 32.8717,
+    "str": " height"
+   },
+   {
+    "id": 9956,
+    "logit": 22.0363,
+    "str": " wind"
+   },
+   {
+    "id": 14401,
+    "logit": 21.1803,
+    "str": " wet"
+   },
+   {
+    "id": 2563,
+    "logit": 21.1396,
+    "str": "height"
+   },
+   {
+    "id": 279,
+    "logit": 20.7885,
+    "str": " the"
+   }
+  ]
+ },
+ {
+  "n": 128,
+  "expected_id": 3403,
+  "expected_str": " above",
+  "top1_top2_gap": 12.8608,
+  "decisive": true,
+  "top5": [
+   {
+    "id": 3403,
+    "logit": 33.9067,
+    "str": " above"
+   },
+   {
+    "id": 271,
+    "logit": 21.0459,
+    "str": "\n\n"
+   },
+   {
+    "id": 48432,
+    "logit": 20.7512,
+    "str": "above"
+   },
+   {
+    "id": 198,
+    "logit": 20.0224,
+    "str": "\n"
+   },
+   {
+    "id": 382,
+    "logit": 19.2702,
+    "str": ".\n\n"
+   }
+  ]
+ },
+ {
+  "n": 129,
+  "expected_id": 279,
+  "expected_str": " the",
+  "top1_top2_gap": 12.0292,
+  "decisive": true,
+  "top5": [
+   {
+    "id": 279,
+    "logit": 33.4094,
+    "str": " the"
+   },
+   {
+    "id": 271,
+    "logit": 21.3802,
+    "str": "\n\n"
+   },
+   {
+    "id": 198,
+    "logit": 20.0512,
+    "str": "\n"
+   },
+   {
+    "id": 33581,
+    "logit": 18.8693,
+    "str": " valley"
+   },
+   {
+    "id": 220,
+    "logit": 18.4366,
+    "str": " "
+   }
+  ]
+ }
+]

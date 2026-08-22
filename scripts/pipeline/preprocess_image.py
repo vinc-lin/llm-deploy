@@ -1,22 +1,41 @@
 #!/usr/bin/env python
-"""Image file -> the raw UFixed16 pixel_values blob genie-app feeds the ViT.
+"""Image file -> the raw FLOAT32 pixel_values blob genie-app feeds the ViT.
 
-Genie does NO image preprocessing. `node set image` reads the file as an opaque
-blob straight into GenieNode_setData (genie-app/main.cpp:1162-1184; the size is
-never checked against the tensor), so these bytes must ALREADY be exactly what
-the graph's input tensor expects: [1024, 1536] QNN_DATATYPE_UFIXED_POINT_16 =
-3,145,728 bytes.
+Genie does NO image preprocessing -- `node set image` reads the file as an
+opaque blob straight into GenieNode_setData (genie-app/main.cpp:1162-1184) --
+but it does NOT feed those bytes to the graph verbatim. QnnNspImageModel::
+setupInput (nsp-image-model.cpp:501-524) branches on the qualla context's
+`embedding-datatype`, which DEFAULTS to "QNN_DATATYPE_FLOAT_32"
+(qualla/context.cpp:31), and no key in an image-encoder node config routes to
+it (Embedding::translateEmbeddingConfig maps a datatype only inside a `lut`
+block). So the shipped runtime unconditionally takes the float32 branch:
 
-UFixed16, not fp16, and that is not a style choice: this SDK build cannot drive
-an fp16 image encoder at all. QnnNspImageModel::setupInputFP16 is an empty stub
-that discards the data and returns success (nsp-image-model.cpp:526-530), while
-UFIXED_POINT_16 dispatches to a real setupInput<uint16_t> copy (:541-543).
-See docs/NOTES-genie-pipeline.md section D.
+    float* src = reinterpret_cast<float*>(inputs.data());
+    quantizeInput(src, name, 0, numElements);      // reads numElements * 4 B
 
-The quantization parameters are READ FROM THE GRAPH, never hardcoded -- host
-and device must agree bit-for-bit, and the only way to guarantee that is to use
-the graph's own encoding. Accepts either the ctx-bin's info.json (preferred:
-that is the actual shipped artifact) or AIMET's model.encodings.
+It interprets the file as float32 and quantizes ON DEVICE with the tensor's
+own scale/offset (nsp-image-model.cpp:633-657). Feeding the tensor-native
+UFixed16 blob -- what v2/v3 shipped -- makes that branch read
+1,572,864 * 4 = 6,291,456 bytes from a 3,145,728-byte buffer: a 3 MB
+over-read, SIGSEGV (SEGV_ACCERR) at the page-rounded buffer end, unmoved by
+any few-KB padding. That is the 2026-08-15 device crash, mechanism confirmed
+against every probe result (fault tracked buffer end across file sizes; mmap
+made no difference; qnn-net-run consumed the same UFixed16 blob natively and
+ran fine).
+
+THE SHIPPED BLOB IS THEREFORE FLOAT32: [1024, 1536] fp32 = 6,291,456 bytes of
+the pre-quantization normalized pixel values. The fp32 branch then reads
+exactly the payload and performs on device the same quantization this script
+previously did on host.
+
+The UFixed16 quantized blob is still written alongside (`<out stem>_u16.raw`,
+exact tensor bytes, no padding) -- it is what `qnn-net-run` wants for
+graph-level triage, the flow that vindicated the ViT on device (T5).
+
+The quantization parameters are READ FROM THE GRAPH, never hardcoded: the
+device will quantize with the ctx-bin's own encoding, and the clip gate below
+must judge the image against exactly that range. Accepts either the ctx-bin's
+info.json (preferred: the actual shipped artifact) or AIMET's model.encodings.
 
 The graph is static: 1024 patches = a 32x32 patch grid = a 512x512 image;
 merge 2 -> 256 embedding rows. Every image is resized (aspect-distorting, on
@@ -27,7 +46,7 @@ exactly.
 Run:
   $PY_DEPLOY scripts/pipeline/preprocess_image.py \
       --model $LLMDEPLOY_DATA/models/Qwen3-VL-4B-Instruct \
-      --image photo.jpg --out sample_image.raw \
+      --image photo.jpg --out sample_image_fp32.raw \
       --encodings $LLMDEPLOY_DATA/work/ctxbin/qwen3vl-4b-vit-w8a16/info.json
 """
 import argparse
@@ -38,7 +57,13 @@ import numpy as np
 
 EDGE = 512
 N_PATCH, N_FEAT = 1024, 1536
-RAW_BYTES = N_PATCH * N_FEAT * 2          # uint16
+RAW_BYTES = N_PATCH * N_FEAT * 4          # float32 -- what ships and is fed
+U16_BYTES = N_PATCH * N_FEAT * 2          # uint16 -- qnn-net-run debug blob
+# 4 KB of zero padding on the shipped blob. The fp32 read is exact
+# (numElements * 4 bytes), so this is no longer load-bearing -- it stays as
+# cheap insurance against any other exact-size consumer and to keep one blob
+# convention across the kit. The runtime consumes only the payload.
+PAD_BYTES = 4096
 TENSOR = "pixel_values"
 # Gate on how FAR values fall outside the calibrated range, in LSBs -- never on
 # how MANY do. Those are very different failures and only one matters.
@@ -52,7 +77,9 @@ TENSOR = "pixel_values"
 # teaches you to ignore it.
 #
 # Real miscalibration -- an image whose statistics the ViT never saw -- shows up
-# as values many LSBs outside the range, which is what this bounds.
+# as values many LSBs outside the range, which is what this bounds. The gate
+# stays meaningful with the fp32 blob: the DEVICE now does this quantization,
+# clamping to the same range.
 CLIP_EXCESS_LSB_MAX = 8.0
 
 
@@ -110,7 +137,12 @@ def preprocess(model_dir, image_path):
 
 
 def quantize(pv, scale, offset, bw):
-    """real -> stored, per the QNN/AIMET convention real = (q + offset) * scale."""
+    """real -> stored, per the QNN/AIMET convention real = (q + offset) * scale.
+
+    With the fp32 shipped blob this runs ON DEVICE (QnnUtils::quantizeTensorPtr
+    with the tensor's own scale/offset); this host copy exists to (a) gate the
+    image against the calibrated range and (b) emit the qnn-net-run debug blob.
+    """
     qmax = (1 << bw) - 1
     raw = np.rint(pv.astype(np.float64) / scale) - offset
     q = np.clip(raw, 0, qmax).astype(np.uint16)
@@ -125,11 +157,26 @@ def quantize(pv, scale, offset, bw):
     return q, clipped, excess, float(np.abs(deq - pv).max())
 
 
+def write_blobs(out_path, pv, q):
+    """Write the shipped fp32 blob (+pad) and the u16 qnn-net-run blob.
+    Returns (fp32_size, u16_name)."""
+    out = Path(out_path)
+    out.write_bytes(pv.astype("<f4").tobytes() + b"\x00" * PAD_BYTES)
+    got = out.stat().st_size
+    assert got == RAW_BYTES + PAD_BYTES, f"{got} bytes != {RAW_BYTES}+{PAD_BYTES}"
+    u16 = out.with_name(out.name.replace("_fp32", "").replace(".raw", "") + "_u16.raw")
+    u16.write_bytes(q.astype("<u2").tobytes())
+    assert u16.stat().st_size == U16_BYTES, u16.stat().st_size
+    return got, u16.name
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--image", required=True)
-    ap.add_argument("--out", required=True, help="output .raw path")
+    ap.add_argument("--out", required=True,
+                    help="output .raw path (fp32 shipped blob; name it *_fp32.raw "
+                         "so a stale UFixed16 blob can never be mistaken for it)")
     ap.add_argument("--encodings", required=True,
                     help="ctx-bin info.json (preferred) or AIMET model.encodings")
     args = ap.parse_args()
@@ -153,17 +200,17 @@ def main():
         "outside what the ViT was calibrated on, and the device would clamp "
         "them. Recalibrate with images like this one.")
 
-    out = Path(args.out)
-    out.write_bytes(q.tobytes())
-    got = out.stat().st_size
-    assert got == RAW_BYTES, f"{got} bytes != {RAW_BYTES}"
-    out.with_suffix(".json").write_text(json.dumps(
-        {"shape": [N_PATCH, N_FEAT], "dtype": "uint16", "bytes": RAW_BYTES,
+    got, u16_name = write_blobs(args.out, pv, q)
+    Path(args.out).with_suffix(".json").write_text(json.dumps(
+        {"shape": [N_PATCH, N_FEAT], "dtype": "float32", "bytes": RAW_BYTES,
+         "pad_bytes": PAD_BYTES,
+         "u16_file": u16_name, "u16_bytes": U16_BYTES,
          "grid_thw": grid.tolist(), "edge": EDGE,
          "encoding": {"scale": scale, "offset": offset, "bitwidth": bw},
          "clipped": clipped, "clip_excess_lsb": excess,
          "max_roundtrip_err": err}, indent=1) + "\n")
-    print(f"{args.out}: {got} bytes, grid {grid.tolist()}")
+    print(f"{args.out}: {got} bytes fp32 (+{u16_name}: {U16_BYTES} bytes u16), "
+          f"grid {grid.tolist()}")
 
 
 if __name__ == "__main__":

@@ -7,7 +7,9 @@
       "version": 1,
       "size": 2048,
       "n-vocab": 151936,
-      "bos-token": 151643,
+      "n-embd": 2560,
+      "bos-token": -1,
+      "pad-token": 151643,
       "eos-token": [
         151645,
         151643

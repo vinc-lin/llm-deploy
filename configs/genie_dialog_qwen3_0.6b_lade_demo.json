@@ -1,5 +1,4 @@
 {
-  "_comment": "DEMO/interactive config: lade fast path + sampling. MUST NOT contain 'max-num-tokens' — 'type: lade' + 'max-num-tokens' SIGSEGVs on device (exit 139; device report 2026-08-13 §6.1). Generation is bounded by context.size (1024) and by EOS, which sampling reaches normally; the greedy PARITY dialogs in this bundle (temp 0) are the ones that can run to 'Context Size was exceeded' (HTP doc 8.2). Prompts must still be the full Qwen3 chat template WITH an empty <think>\n\n</think> block in the assistant prefix (bos-token is -1 because the template supplies <|im_start|> itself; do not set both).",
   "dialog": {
     "version": 1,
     "type": "lade",

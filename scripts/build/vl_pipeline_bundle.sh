@@ -33,11 +33,13 @@
 #     the character after an escape verbatim (main.cpp:655-658) and nothing
 #     unescapes later (main.cpp:1140-1142), so "\n" becomes the two characters
 #     '\' and 'n'.
-#   * sample_image.{png,raw,json}. The scene is the red circle + blue square
-#     the E2E parity gate used (parity_e2e_vl.py:make_image), so the device's
-#     caption is directly comparable to that gate's recorded Tier-A text. The
-#     raw blob is quantized against the SHIPPED ctx-bin's own info.json, not
-#     against model.encodings: Genie does no preprocessing, it feeds the file
+#   * sample_image.png + sample_image_fp32.{raw,json} + sample_image_u16.raw.
+#     The scene is the red circle + blue square the E2E parity gate used
+#     (parity_e2e_vl.py:make_image), so the device's caption is directly
+#     comparable to that gate's recorded Tier-A text. The SHIPPED blob is
+#     FLOAT32 -- Genie's image staging interprets the file as float32 and
+#     quantizes on device against the ctx-bin's own encoding
+#     (nsp-image-model.cpp:501-524); the u16 blob is for qnn-net-run triage
 #     as an opaque blob, so those bytes must already be exactly what this
 #     graph's pixel_values tensor expects.
 #
@@ -87,6 +89,10 @@ CONFIGS=(
   # from the primary by exactly the two select-graphs keys.
   genie_text_generator_qwen3vl_4b_decodeonly.json
   genie_pipeline_qwen3vl_decodeonly.script
+  # genie-t2t-run dialog config for the text tower alone: the 4B two-shard
+  # tower has never had its tok/s or TTFT measured, and this makes that
+  # measurement possible in the same device session, no second download.
+  genie_dialog_qwen3vl_4b.json
 )
 
 # Weather/road test kit: per-image blob + sidecar + jpg + its own script, all
@@ -145,7 +151,20 @@ for f in "${CONFIGS[@]}"; do cp "$LLMDEPLOY_ROOT/configs/$f" "$OUT/"; done
 # note itself can become visible. Licence/base-model tags belong in the root
 # README (docs/HF_HUB_README_qwen3vl.md), which is where they are.
 cp "$LLMDEPLOY_ROOT/docs/BUNDLE_README_qwen3vl_4b_e2e.md" "$OUT/README.md"
-cp "$LLMDEPLOY_ROOT/docs/DEVICE_TEST_qwen3vl_e2e.md" "$OUT/DEVICE_TEST.md"
+# The v4 doc set, three files with non-overlapping roles. Overlap is not a
+# style question here: v3 shipped five documents that each restated the image
+# blob contract, and the device team followed a stale copy. Entry point ->
+# procedure -> reference, each stating a fact exactly once.
+#   V4_CHANGES     why v4 differs from v3 (the fp32 mechanism), what to read next
+#   SESSION_RUNBOOK the ordered procedure V1..V5, outcomes, what to collect
+#   OPERATOR_GUIDE  reference: manifest, install, metrics, pass/fail, triage
+# DEVICE_TEST.md and IMAGE_PROBE.md are deliberately NOT shipped in v4 -- the
+# first is superseded by the runbook, the second probes a theory correction #35
+# disproves, and shipping it invites running dead experiments. Both remain in
+# the repo as the diagnostic record; V4_CHANGES §5 tells the operator that.
+cp "$LLMDEPLOY_ROOT/docs/BUNDLE_V4_CHANGES_qwen3vl.md" "$OUT/V4_CHANGES.md"
+cp "$LLMDEPLOY_ROOT/docs/DEVICE_SESSION_RUNBOOK_qwen3vl_v4.md" "$OUT/SESSION_RUNBOOK.md"
+cp "$LLMDEPLOY_ROOT/docs/BUNDLE_OPERATOR_GUIDE_qwen3vl_4b_v4.md" "$OUT/OPERATOR_GUIDE.md"
 if [ -d "$KIT" ] && compgen -G "$KIT/wx_*.raw" >/dev/null; then
     cp "$KIT"/wx_*.{raw,json,jpg,script} "$KIT/TEST_IMAGES.md" "$OUT/"
     echo "   test kit: $(ls "$KIT"/wx_*.raw | wc -l) image(s) from $KIT"
@@ -207,7 +226,7 @@ img.save(os.path.join(os.environ["OUT"], "sample_image.png"))
 PYEOF
 $PY_DEPLOY "$LLMDEPLOY_ROOT/scripts/pipeline/preprocess_image.py" \
     --model "$MODEL" --image "$OUT/sample_image.png" \
-    --out "$OUT/sample_image.raw" \
+    --out "$OUT/sample_image_fp32.raw" \
     --encodings "$OUT/${VIT_BIN%.bin}.info.json"
 
 echo "== [5/5] Gate 2: static contract lint =="

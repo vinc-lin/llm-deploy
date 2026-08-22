@@ -1,0 +1,2 @@
+<|vision_end|>Answer with one word: what colour is the largest shape in this image?<|im_end|>
+<|im_start|>assistant

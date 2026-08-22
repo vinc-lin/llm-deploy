@@ -1,5 +1,13 @@
 # Device test — ImageEncoder SIGSEGV bisect (Qwen3-VL-4B v2, SA8797P)
 
+> **SUPERSEDED IN PART (v4).** The crash this document investigates is
+> resolved: Genie's image staging interprets the input file as float32
+> (nsp-image-model.cpp:501-524, `embedding-datatype` default), so the
+> UFixed16 blobs v2/v3 shipped were read at 2x their size — a ~3 MB
+> over-read, which is why padding and page-alignment probes could not
+> help. v4 ships float32 blobs. Kept as the diagnostic record; do not
+> run its probes. Current instructions: `V4_CHANGES.md`.
+
 **Goal: two short runs that decide, between three possible causes, why
 `node set image` dies — and capture the one tombstone line that lets us
 disassemble the exact faulting instruction off-device.**
@@ -293,12 +301,23 @@ dump usually still carries the signal line and backtrace, which covers items
 
 ## 6. Decision tree
 
-| | Run 1 | Run 2 | Meaning | Next action |
+> **Status as of bundle v3 (2026-08-17): the fix in branch C below has already
+> been applied to the shipped bundle.** Every `.raw` in v3 is payload + 4096
+> zero bytes (3,149,824 B, was 3,145,728), generated that way by
+> `preprocess_image.py` / `build_test_kit.py` and enforced by
+> `lint_pipeline_bundle.py`. So on v3 you do **not** start from Run 1 — you
+> just run the pipeline. This section is now the *diagnostic to reach for only
+> if v3 still crashes on `node set image`*, and in that case Run 1's
+> exact-size blob is recreated from the padded one with
+> `head -c 3145728 sample_image.raw > nopad.raw` rather than shipped
+> separately.
+
+| | Run 1 (unpadded) | Run 2 (padded) | Meaning | Next action |
 |---|---|---|---|---|
 | **A** | no crash | — | Exact-size blobs were never the problem (H-untested) | Run the full `genie_pipeline_qwen3vl.script`, then the `wx_*.script` kit — captions expected. Report per the bundle README's test plan |
 | **B** | error msg | — | Shipped binary validates input size (diverges from example source) | Send the message verbatim; we resize/repack to what it demands |
-| **C** | crash | no crash | **H-src**: source overread, guard page | We re-cut the bundle with +4 KB padded blobs same day; meanwhile `sed` the remaining `wx_*.script`s onto padded copies and continue the test plan |
-| **D** | crash | crash | **H-dst**: overrun past the DMA/rpcmem destination | Not host-fixable. We assemble the Qualcomm escalation package (both tombstones, `imgonly.script`, blob MD5s, ViT `info.json`, QAIRT/Genie versions). Text-only deployment continues in parallel |
+| **C** | crash | no crash | **H-src**: source overread, guard page — **confirmed hypothesis** | Nothing to re-cut: v3 already ships padded blobs and every `wx_*.script` already points at one. Continue straight into the kit and the test plan |
+| **D** | crash | crash | **H-dst**: overrun past the DMA/rpcmem destination | Not host-fixable. We assemble the Qualcomm escalation package (both tombstones, `imgonly.script`, blob MD5s, ViT `info.json`, QAIRT/Genie versions). Text-only deployment continues in parallel — and on v3 that path is in-bundle (`genie-t2t-run` + `genie_dialog_qwen3vl_4b.json`) |
 
 In every branch, the text-only performance test (`genie-t2t-run`, per your
 report "ready to run") is **unblocked and worth doing now** — the first tok/s

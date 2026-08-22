@@ -39,6 +39,28 @@ from pathlib import Path
 REPO_CONFIGS = Path(__file__).resolve().parents[2] / "configs"
 
 
+# The whitelist libGenie 1.19 enforces on the TOP level of a config document.
+# Anything else -- including an authoring comment -- is a hard load failure:
+#     Unknown dialog config key: _comment / Failed to create the dialog config
+# This is not theoretical. `_comment` shipped at the top level of both 0.6B
+# probe configs in the v5 session bundle and the device operator had to strip it
+# by hand before either probe would load (device report 2026-08-15 §13.1). JSON
+# has no comment syntax; notes belong in a sibling <name>.notes.md.
+TOP_LEVEL_KEYS = {"dialog", "text-generator", "text-encoder", "image-encoder"}
+
+
+def check_top_level(path: Path, doc) -> list:
+    """Reject any top-level key Genie's whitelist does not know."""
+    if not isinstance(doc, dict):
+        return [f"top level is {type(doc).__name__}, expected an object"]
+    unknown = sorted(k for k in doc if k not in TOP_LEVEL_KEYS)
+    if not unknown:
+        return []
+    return [f"unknown top-level key(s) {unknown}: libGenie rejects the whole "
+            f"document (\"Unknown dialog config key\"). Allowed: "
+            f"{sorted(TOP_LEVEL_KEYS)}. Put prose in {path.stem}.notes.md."]
+
+
 def is_assembled_bundle(d: Path) -> bool:
     """An assembled bundle has the runner and a ctx-bin next to the dialogs.
 
@@ -130,6 +152,25 @@ def main():
             continue
         bundle_dir = (target if target.is_dir() and is_assembled_bundle(target)
                       else None)
+        # Top-level whitelist applies to every config document, including the
+        # text-generator/encoder ones that find_dialogs() deliberately skips.
+        # Only Genie NODE configs. htp_config.json / htp_backend_ext_config*.json
+        # are a different schema entirely -- they go to the backend, not to Genie's
+        # config parser, and legitimately carry backend_extensions/devices/graphs.
+        cfgs = (sorted(target.glob("genie_*.json")) if target.is_dir()
+                else ([target] if target.name.startswith("genie_") else []))
+        for cp in cfgs:
+            try:
+                doc = json.loads(cp.read_text())
+            except json.JSONDecodeError:
+                continue          # reported below by find_dialogs
+            tl = check_top_level(cp, doc)
+            if tl:
+                total_fail += 1
+                print(f"FAIL {cp}  (top-level keys)")
+                for f in tl:
+                    print(f"       {f}")
+
         dialogs = find_dialogs(target)
         if not dialogs:
             print(f"     {target}: no dialog JSONs found")

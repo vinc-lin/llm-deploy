@@ -271,7 +271,41 @@ tower executes on an uninitialized buffer.** No error, correct-looking exit
 code. Right size, wrong size and garbage all behave identically.
 
 (The templated `setupInput<DType>` path used for UFixed8/UFixed16/INT32,
-`:500-524`, does copy real data.)
+`:500-524`, does copy real data — **but see D1b: what it copies is not the
+file's bytes.**)
+
+### D1b. The fixed-point setupInput expects a FLOAT32 file (v3's SIGSEGV)
+
+Established 2026-08-18, after v3's device crash; this is the correction to the
+parenthetical above, which read as "UFixed16 IO ⇒ feed UFixed16 bytes" and
+shipped exactly that in v2/v3. `setupInput<DType>` branches on the qualla
+context's `embedding-datatype`:
+
+```cpp
+size_t bufferSize = d_inputs[name].bw() * numElements;
+if (embedding_datatype == "QNN_DATATYPE_FLOAT_32") {
+  float* embeddingSrc = reinterpret_cast<float*>(inputs.data());
+  quantizeInput(embeddingSrc, name, 0, numElements);   // numElements * 4 bytes
+} else {  // native: raw copy of bufferSize bytes
+```
+
+`embedding-datatype` **defaults to `QNN_DATATYPE_FLOAT_32`**
+(`qualla/context.cpp:31`), and for an image-encoder node **no config key routes
+to it**: `Embedding::translateEmbeddingConfig` maps a `datatype` only inside a
+`lut` block (`Embedding.cpp:1171-1192`), which an image-encoder config cannot
+carry. So the shipped runtime always takes the float32 branch: it reinterprets
+the blob as fp32 and quantizes on device with the tensor's own scale/offset
+(`nsp-image-model.cpp:633-657`, real UFixed8/16 cases).
+
+Consequences, both measured on device (2026-08-15..17, `V4_CHANGES.md` §1):
+
+* Feeding the tensor-native UFixed16 blob = reading `numElements * 4` bytes
+  from a `numElements * 2`-byte buffer — a ~3 MB over-read, `SIGSEGV
+  (SEGV_ACCERR)` at the page-rounded buffer end, immune to padding and mmap.
+* Feeding **float32 pixel values** (`[1024,1536]` fp32, 6,291,456 B) makes the
+  same branch read exactly the payload and produce the same uint16 the host
+  quantizer did. This is the v4 blob contract (`*_fp32.raw`); the u16 blobs
+  remain only for `qnn-net-run`, which *does* copy the file verbatim.
 
 ### D2. The requantize dispatch table has no `Float16` entries at all
 

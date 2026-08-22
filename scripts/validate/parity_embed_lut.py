@@ -66,8 +66,21 @@ def main():
         "disagree, which is exactly the mismatch the atomic write exists to prevent")
     print(f"size   : {size:,} bytes == {n_vocab} x {stride} OK")
 
-    idx = json.loads((args.model / "model.safetensors.index.json").read_text())
-    shard = args.model / idx["weight_map"][EMBED_KEY]
+    # The key and the shard both come from the params file the extractor wrote,
+    # so this gate checks the LUT against the SAME tensor it claims to be, and
+    # follows a checkpoint whose naming differs (plain Qwen3 vs Qwen3-VL) or
+    # which ships unsharded with no index at all (0.6B).
+    embed_key = params.get("source-key", EMBED_KEY)
+    index_path = args.model / "model.safetensors.index.json"
+    if index_path.is_file():
+        idx = json.loads(index_path.read_text())
+        assert embed_key in idx["weight_map"], (
+            f"{embed_key!r} (from the LUT params) not in {index_path}")
+        shard = args.model / idx["weight_map"][embed_key]
+    else:
+        shard = args.model / "model.safetensors"
+        assert shard.is_file(), f"neither {index_path} nor {shard}"
+    print(f"tensor : {embed_key} in {shard.name}")
 
     rng = np.random.default_rng(args.seed)
     ids = sorted(set(list(NAMED) + [n_vocab - 1, n_vocab - 2]
@@ -76,7 +89,7 @@ def main():
     blob = np.memmap(lut_path, dtype=np.uint8, mode="r")
     worst, worst_tok = 0.0, -1
     with safe_open(str(shard), framework="pt") as f:
-        sl = f.get_slice(EMBED_KEY)
+        sl = f.get_slice(embed_key)
         for tok in ids:
             # read exactly the bytes the runtime would memcpy for this token
             raw = np.asarray(blob[tok * stride:(tok + 1) * stride])

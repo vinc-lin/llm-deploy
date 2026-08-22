@@ -77,6 +77,84 @@ coord_guard() {
     fi
 }
 
+# Wait for a long build to finish. Builds run far past any agent tool timeout,
+# so the wait lives in a background shell -- and the obvious form of that wait
+# is broken:
+#
+#   until ! pgrep -f "full_build.sh foo"; do sleep 20; done      # NEVER EXITS
+#
+# pgrep -f matches whole COMMAND LINES, and the pattern is sitting in the
+# waiter's own command line, so the waiter matches itself and loops forever. It
+# omits its own pid but not the shell that invoked it, and never the *other*
+# waiter watching the same build. Measured 2026-08-19: three such shells were
+# still spinning 1h36m-2h26m after their builds had completed. The bracket trick
+# ([f]ull_build) does not fix it -- that only works when the BRACKETED text is
+# what sits in the command line, which stops being true the moment the pattern
+# is passed as an argument. So exclude by pid instead: self, every ancestor of
+# self, and any other build_wait.
+#
+#   build_wait <pid>                          exact -- prefer this
+#   build_wait <pattern> [poll_s] [max_min]
+#
+# 0 = the process is gone, 1 = timed out (default 4h -- an unbounded wait is how
+# the zombies above happened), 2 = nothing matched at the START. 2 is loud on
+# purpose: a typo'd pattern otherwise returns instantly and reads as success.
+_build_wait_pids() {
+    local pat=$1 pid p cl self_cl skip=" "
+    p=$$
+    while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ]; do
+        skip="$skip$p "
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -dc 0-9)
+    done
+    self_cl=$(tr '\0' ' ' < "/proc/$$/cmdline" 2>/dev/null)
+    for pid in $(pgrep -f -- "$pat" 2>/dev/null); do
+        case "$skip" in *" $pid "*) continue ;; esac          # self + ancestors
+        # Read the cmdline ONCE and treat "cannot read" as "already exited".
+        # Checking /proc per-candidate instead fails OPEN on that race: every
+        # $( ) below forks a subshell that inherits this shell's command line --
+        # pattern included -- and dies within microseconds, so pgrep lists a pid
+        # whose /proc entry is gone by the time the filter looks. Measured: that
+        # phantom alone kept the loop alive indefinitely.
+        # Braces + one 2>/dev/null on the group: a failed REDIRECTION is
+        # reported by this shell, not by tr, so tr's own 2>/dev/null is silent
+        # about exactly the case that happens most.
+        cl=$( { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null ) || continue
+        [ -n "$cl" ] || continue                              # exited, or a kernel thread
+        case "$cl" in *build_wait*) continue ;; esac          # another waiter, incl. siblings
+        [ "$cl" = "$self_cl" ] && continue                    # a fork of this very shell
+        echo "$pid"
+    done
+}
+
+build_wait() {
+    local target=${1:?pid or pattern} poll=${2:-20} max_min=${3:-240}
+    local t0=$SECONDS deadline=$(( max_min * 60 )) pids el
+
+    if [ -z "${target//[0-9]/}" ]; then                        # all digits -> pid mode
+        kill -0 "$target" 2>/dev/null || {
+            echo "build_wait: pid $target is not running -- NOT a success signal" >&2; return 2; }
+        echo "build_wait: waiting on pid $target"
+        while kill -0 "$target" 2>/dev/null; do
+            (( SECONDS - t0 > deadline )) && {
+                echo "build_wait: TIMEOUT after ${max_min}min; pid $target still alive" >&2; return 1; }
+            sleep "$poll"
+        done
+    else
+        pids=$(_build_wait_pids "$target")
+        [ -n "$pids" ] || {
+            echo "build_wait: nothing matches '$target' -- already finished, or the" >&2
+            echo "            pattern is wrong. NOT a success signal." >&2; return 2; }
+        echo "build_wait: waiting on [$(echo $pids)] matching '$target'"
+        while pids=$(_build_wait_pids "$target"); [ -n "$pids" ]; do
+            (( SECONDS - t0 > deadline )) && {
+                echo "build_wait: TIMEOUT after ${max_min}min; still running: $(echo $pids)" >&2; return 1; }
+            sleep "$poll"
+        done
+    fi
+    el=$(( SECONDS - t0 ))
+    echo "build_wait: done after $(( el / 60 ))m$(( el % 60 ))s"
+}
+
 # Record the finished artifact and drop the claim. Call at the end of a build.
 coord_done() {
     local name=${1:?name} path=${2:-} kind=${3:-ctxbin} note=${4:-}

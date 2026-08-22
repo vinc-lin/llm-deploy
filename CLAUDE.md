@@ -57,6 +57,12 @@ from here with `git push ssh://tank/home/vinc/llm-deploy main` — it has
 `ctxbin_variant.sh` readback gate, which is exactly the check that catches a knob
 silently failing to bind — an unbound knob looks like a measurement, not an error.
 
+**Scripts are not executable on tank.** This repo lives on a Windows-backed
+mount where every file reads `0777`, so the exec bit never enters git; on tank
+the same files land `0664` and `scripts/build/foo.sh` fails `Permission
+denied` (exit 126). Always invoke build scripts there as `bash
+scripts/build/foo.sh`. Verified, not theoretical — it bit this session.
+
 ### What lives where
 
 Tank holds the canonical `work/` for **Qwen3-VL-4B** (its export does not fit
@@ -92,6 +98,12 @@ are a fatal Genie load error (KV quant params must be byte-identical).
 `export_qwen3vl_vit.py` → `quantize_vit_aimet.py` → `vit_build_quant.sh` (vision)
 and `vl_text_build.sh` → `vl_text_ctxbin_split.sh` (text, 2-split ctx-bin),
 joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
+**`--grouped-gqa` is mandatory here too**: `vl_text_build.sh <name> <cl> <ctx>
+--grouped-gqa` passes it through, but it must ALSO reach the separate past-KV
+prefill export (`quantize_aimet.py --export-decode ... --grouped-gqa`) and
+`export_qwen3vl_text.py --grouped-gqa` for the fp32 gate exports — a graph
+that misses it silently ships old attention while the others look correct.
+v2 shipped exactly that: 36 replication ops per shard at a 4:1 head ratio.
 
 ## Hard contracts (violations = silent device garbage or SIGSEGV)
 
@@ -129,6 +141,25 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
   ship W8A16 with `UFIXED_POINT_16` IO.
 - `pos-id-dim` (backend block) alongside `positional-encoding` is a **hard
   load-time schema error**, not a warning. Declare one. Same for `rope-theta`.
+- **An embeddings-fed `inputs_embeds` must never be `FLOAT_16`.** `quantizeInput`
+  advances its destination by `tensorOffset` **elements** for UFIXED_8/16 and
+  FLOAT_32 but by **bytes** for FLOAT_16 (`nsp-model.cpp:3144`), while
+  `setupInputEmbeddings` passes an element count when padding a partially-filled
+  prefill chunk (`:1813`) — so the pad write lands halfway into the real prompt
+  and overwrites its back half. Fires only when `variant > n_process`, i.e. the
+  last partial chunk, so decode looks fine and host parity (20/20) never sees it.
+  This is the 2026-08-15 Qwen3-VL text-garbage defect. AIMET writes no encoding
+  for that tensor (it quantizes module *outputs*; this is a graph *input*), so
+  the converter defaults it to fp16 — graft one with
+  `scripts/quant/graft_input_encoding.py` to get `uFxp_16`, and gate with
+  `lint_embedding_dtype.py`. ⚠ **Not `--preserve_io_datatype`** — it pins the
+  input to fp32 and graph-prepare then dies with `could not create op:
+  q::QNN_Convert` (`vit_build_quant.sh`'s header says so; it was ignored once).
+  ⚠ For a VL tower cover the ViT's `image_features` range too
+  (`--cover-ctxbin-info`), not just the LUT: text spans ±0.24, image ±11.6.
+  ⚠ **Do NOT graft `deepstack_*`** — they are zero-filled, and a memset-0 buffer
+  only means zero for a float type; on that uFxp_16 grid raw zero decodes to
+  −11.65.
 - A prefill graph whose `attention_mask` is `[1,AR,AR]` registers `ctx_size ==
   AR` (bertcache) and is **never selected** for prompts longer than AR — the
   whole prompt goes through the AR=1 decode graph, silently and slowly.
@@ -141,6 +172,17 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
   the 0.6B pattern does not transfer. See `docs/REFERENCE.md` §3.6.
 - Image-encoder configs need `vision-param: {height, width}` in **patch units**
   (pre-merge), or MRoPE never engages and image rows fall back to plain rope.
+- **The shipped image blob is FLOAT32 (`*_fp32.raw`), never tensor-native
+  UFixed16.** Genie's image staging reinterprets the file as float32 and
+  quantizes on device (`nsp-image-model.cpp:501-524`; `embedding-datatype`
+  defaults to FLOAT_32 and no image-encoder config key routes to it), so a
+  UFixed16 blob is read at 2× its size — a ~3 MB over-read, the `SIGSEGV
+  (SEGV_ACCERR)` that blocked the device 2026-08-15..17. Padding cannot fix it
+  (correction #35 — the earlier 1-byte/guard-page theory here was wrong).
+  fp32 payload 1024×1536×4 = 6,291,456 B + 4096 B inert pad = 6,295,552 B;
+  `preprocess_image.py` / `build_test_kit.py` emit it plus a `*_u16.raw`
+  (exact tensor bytes, **qnn-net-run triage only**); `lint_pipeline_bundle.py`
+  enforces sizes and fp32↔u16 agreement. `docs/NOTES-genie-pipeline.md` D1b.
 
 ## Validation gates (run before shipping any bundle)
 
@@ -153,13 +195,38 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
 - Qwen3-VL: `scripts/validate/parity_e2e_vl.py` — full path (image → ViT →
   splice → text tower) vs `hf.generate`, token-for-token. `lint_pipeline_bundle.py`
   for bundle contracts. Run the gate with no `--chains` filter; a subset skips
-  the mutation checks.
+  the mutation checks. Also `lint_gqa_ops.py` on all four text DLCs with
+  **`--layers 18`** (the per-shard count) — the flag defaults to 28 (the 0.6B
+  tower), and since the lint's pass criterion is `len(matmuls) == 2 * layers`,
+  the default reports FAIL on a perfectly correct shard.
+  `vl_text_ctxbin_split.sh` now runs this automatically (commit `0db9643`) —
+  don't add a manual duplicate.
 
 ## Gotchas — environment & infrastructure
 
-- HF: proxy `http://127.0.0.1:17890` required, but it drops long upload streams —
-  use `scripts/util/hf_upload_watchdog.sh` (set `SOCKET_CHECKS=999999`; the
-  socket detector false-positives through the proxy).
+- HF: proxy `http://127.0.0.1:17890` required (export `https_proxy`/`http_proxy`
+  yourself — neither `env.sh` nor the watchdog sets them), but it drops long
+  upload streams — use `scripts/util/hf_upload_watchdog.sh`.
+  ⚠ **`upload-large-folder` transfers the bytes fine and then hangs at the
+  COMMIT.** Measured 2026-08-17 on the VL v3 bundle: five watchdog attempts,
+  each ending with every socket CLOSE-WAIT and `/proc/PID/io` flat, `Files:`
+  stuck at `pre-uploaded: 8/26, committed: 0/60`. It looks like a transfer
+  failure and is not: a later per-file `upload_file` of each 1.85 GB / 2.63 GB
+  ctx-bin reported **`New Data Upload: 0.00B`** and committed in 9–11 s,
+  i.e. the 4.5 GB was already server-side the whole time. Do not diagnose this
+  from the progress bars — they reach 99–100% and keep redrawing forever, which
+  also defeats the watchdog's progress-freeze detector, and `SOCKET_CHECKS=999999`
+  disables the socket detector, so the watchdog waits indefinitely.
+  **Working recipe when it stalls:** `HfApi().upload_folder(..., ignore_patterns=[<big files>])`
+  for the bulk (58 files, one commit, 9 s) then one `upload_file` per file
+  ≳1 GB. Four commits total, well inside the 128/h limit. Confirm a suspected
+  stall with `/proc/PID/io` (zero delta) before killing anything.
+- **Nothing is visible in the repo until the commit phase.** `upload-large-folder`
+  pre-uploads every blob first and commits at the end, so `list_repo_files`
+  returning 0 mid-run is normal, not a failure.
+- Verify an upload against the **re-downloaded** bytes, never the local ones:
+  `hf_hub_download` the `info.json`s + node config and re-run
+  `scripts/validate/genie_load_check.py` on them.
 - Hub limit: 128 repo commits/hour. "Hung" commit phase with all blobs
   pre-uploaded = 429; diagnose with one foreground `HfApi().upload_file`,
   recover with spaced single-file commits after ~1h.
@@ -173,6 +240,17 @@ joined by `vl_pipeline_bundle.sh` into one `genie-app` pipeline bundle.
   call it before any multi-GB step, sized to that step: 6 GB is the converter
   floor, a 4B export writes 8.6 GB and asks 20. A flat 6 GB check passes and then
   still runs C: dry mid-step.
+- **Waiting on a build: `build_wait` (in `scripts/env.sh`), never a bare `pgrep`
+  loop.** `until ! pgrep -f "full_build.sh foo"; do sleep 20; done` **never
+  exits** — `pgrep -f` matches whole command lines and the pattern sits in the
+  waiter's own, so it matches itself, and it never notices the *other* waiter on
+  the same build. Three such shells were still spinning 2h26m after their builds
+  finished (2026-08-19). Bracketing (`[f]ull_build`) does **not** fix it once the
+  pattern is an argument. `build_wait <pid>` (exact, preferred) or `build_wait
+  <pattern> [poll_s] [max_min]`; it excludes self/ancestors/other waiters, caps
+  the wait at 4 h, and returns **2** — not 0 — when nothing matched at the start,
+  so a typo'd pattern cannot read as "the build finished". Same trap in cleanup:
+  `pkill -f <pattern>` will kill your own shell.
 - The vhdx is sparse and `/` is mounted `discard`, so deleting in-guest reclaims C:
   with no compaction step (asynchronously — free space does not jump immediately).
   `ls` reports the ~448 GB virtual size and always will; `du -h <vhdx>` (no
