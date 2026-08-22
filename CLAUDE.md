@@ -66,7 +66,11 @@ scripts/build/foo.sh`. Verified, not theoretical — it bit this session.
 ### What lives where
 
 Tank holds the canonical `work/` for **Qwen3-VL-4B** (its export does not fit
-locally) and now the **Qwen3-0.6B** lineage. Retain **encodings + `.onnx` graphs
+locally). ⚠ It does **not** hold a usable 0.6B lineage — measured 2026-08-22:
+8 already-stripped quant dirs (~1 GB) and no 0.6B DLCs or ctx-bins at all,
+except the set parked under `work/{dlc,ctxbin}/kit-keystone/` for a
+rebuild-determinism check. **A tank-side 0.6B rebuild needs the ship DLCs copied
+from the WSL box first.** Retain **encodings + `.onnx` graphs
 + calib `.npz`** and let the heavy tensors be regenerable: one 0.6B quant dir is
 8.6 GB of which ~135 MB is irreplaceable, so the whole 0.6B lineage is 1.1 GB
 against 69 GB of source dirs. Same logic for ctx-bins — generation is
@@ -221,6 +225,12 @@ v2 shipped exactly that: 36 replication ops per shard at a 4:1 head ratio.
   for the bulk (58 files, one commit, 9 s) then one `upload_file` per file
   ≳1 GB. Four commits total, well inside the 128/h limit. Confirm a suspected
   stall with `/proc/PID/io` (zero delta) before killing anything.
+  ⚠ **It is file COUNT, not size.** A single 768 MB `upload_file` commits fine
+  while 41 small files hang at the commit — socket CLOSE-WAIT, `/proc/PID/io`
+  flat, nothing in `list_repo_files`. Ship probe kits as **one tarball** (a 145 MB
+  kit of mostly-zero KV gzips to 3 MB), and give every attempt a **hard timeout**:
+  a stall then costs minutes instead of half an hour, and the retry usually
+  commits in seconds because the blob is already server-side.
 - **Nothing is visible in the repo until the commit phase.** `upload-large-folder`
   pre-uploads every blob first and commits at the end, so `list_repo_files`
   returning 0 mid-run is normal, not a failure.
@@ -325,8 +335,37 @@ v2 shipped exactly that: 36 replication ops per shard at a 4:1 head ratio.
   reusing it as a current number has now put two documents wrong. The converter's
   `====== DDR bandwidth summary ======` block is the source, and it is emitted
   even for builds that cannot run on device.
+- **`--max-num-tokens` is a config key, not a flag** — `dialog.max-num-tokens`
+  (`Dialog.cpp:2493`, read at `:2888`). Passing it as a flag aborts the run;
+  omitting the cap ends at `Context Size was exceeded`, which frees the handle and
+  **writes no profile** (cost 7 of 8 profiles in one session, then 4 of 4 in
+  another). **`--profile` refuses an output file that already exists**
+  (`main.cpp:528`) — fresh name per run. **`-tok`/`--tokens_file`** takes
+  whitespace-separated ids and takes the tokenizer out of an experiment;
+  **`-e`/`--embedding_file`** takes `file[,dtype,scale,offset]` and bypasses the
+  LUT lookup.
+- **Verify the artifact you SHIPPED, not one that shares its name.** A rebuilt bin
+  and the staged/uploaded copy can differ silently; reading `info.json` from the
+  wrong one made a FLOAT_16 `inputs_embeds` look grafted and voided a whole device
+  session (`REFERENCE.md` #39). Gate the file you are about to upload, and quote
+  its md5 in the test doc.
+- **Score device output against a reference, never against intuition.** Twice a
+  correct result was recorded as a failure: greedy repetition on a *raw* 0.6B
+  prompt is exactly what HF fp32 does, and `S` + garbage is the **correct** first
+  token of `Sunny` (`['S','unny']`) plus the known decode bug. If a test doc
+  prints expected token ids, score on ids.
+- **A GQA model's KV cache is sized by `n_kv`, not query heads.**
+  36 × 2 × **8** × 128 × 2 = 147,456 B/position for the 4B; using 28 query heads
+  gives 516,096 and invents a "must be compressed" that is not there
+  (`REFERENCE.md` #40). Same instinct for weight-sharing gates: key on **pooled
+  fraction**, not absolute GB — 4B-derived floors reject a healthy 0.6B split.
 
 ## Docs
+
+**`docs/DEVICE_TEST_INDEX.md` before any device work** — the registry: what each
+session asked and settled, the dead ends nobody should re-run, and **which HF
+folder is current vs superseded** (three sessions have been damaged by running a
+stale artefact).
 
 **`docs/REFERENCE.md` first** (consolidated current truth: contracts, measured
 numbers, dead ends, open questions) · `docs/PLAN_0.6B_max_tps.md` (the current
