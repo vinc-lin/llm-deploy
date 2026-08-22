@@ -117,7 +117,8 @@ def diff(pa: Path, pb: Path, layers: int):
     shared = min(na, nb)
     print(f"comparing the {shared} positions both dumps hold "
           f"({pa.name}: {na}, {pb.name}: {nb})\n")
-    hdr = f"{'position':>9s}  {'tensors differing':>18s}  {'first differing tensor':>22s}"
+    hdr = (f"{'position':>9s}  {'tensors differing':>18s}  {'K diff':>7s} {'V diff':>7s}"
+           f"  {'max|Δ| fp16':>12s}  {'first differing tensor':>22s}")
     print(hdr); print("-" * len(hdr))
     first_div = None
     for p in range(shared):
@@ -125,9 +126,24 @@ def diff(pa: Path, pb: Path, layers: int):
         n = int(d.sum())
         if n and first_div is None:
             first_div = p
+        # K tensors are even indices, V odd (layer i -> tensors 2i, 2i+1). The
+        # cache dtype is FLOAT_16 (read back from the shipped bin), so a
+        # magnitude tells quantization jitter (~1e-3) apart from a wrong input
+        # (O(1)). The K/V split is the signature: V = v_proj(x) carries no rope,
+        # so V-identical + K-different isolates position/rope; V-different means
+        # the INPUT x (embedding/norm) already differed.
+        nk, nv = int(d[0::2].sum()), int(d[1::2].sum())
+        if n:
+            fa = a[:, p, :].view("<f2").astype(np.float32)
+            fb = b[:, p, :].view("<f2").astype(np.float32)
+            m = np.isfinite(fa) & np.isfinite(fb)
+            mx = float(np.abs(np.where(m, fa - fb, 0)).max())
+            mxs = f"{mx:12.4g}"
+        else:
+            mxs = f"{'--':>12s}"
         which = int(np.argmax(d)) if n else -1
         lay = f"layer {which // 2} {'K' if which % 2 == 0 else 'V'}" if n else "--"
-        print(f"{p:9d}  {n:18d}  {lay:>22s}")
+        print(f"{p:9d}  {n:18d}  {nk:7d} {nv:7d}  {mxs}  {lay:>22s}")
     print()
     if first_div is None:
         print(f"IDENTICAL across all {shared} shared positions.")
