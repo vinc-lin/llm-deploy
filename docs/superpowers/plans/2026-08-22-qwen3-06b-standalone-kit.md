@@ -66,6 +66,75 @@ both silently reads `None` and passes. Key spellings are exact: `vtcmSize` (not
 
 ---
 
+## Execution environment: all builds run on `tank`
+
+*Added 2026-08-23. Every build stage and every byte of intermediate data lives on
+tank; the WSL box holds only kit source, which is version-controlled.*
+
+| | tank |
+|---|---|
+| CPU / RAM | 44 cores / 125 GB |
+| GPU | **none** — `torch.cuda.is_available()` is False, so `QUANT_DEVICE=cpu` always |
+| Disk | 937 GB, **380 GB free (58% used)** as of 2026-08-23 |
+| SDK · model · envs | 2.48.40.260702 ✓ · Qwen3-0.6B ✓ · both uv envs ✓ |
+| Hugging Face | ✗ unreachable. **PyPI and GitHub are reachable** — only HF is blocked |
+| Tooling | `python3` 3.12.3; **no** pytest / shellcheck / bats / uv preinstalled |
+
+**Sync before every build** (a hard rule — a stale tank copy once predated the
+`ctxbin_variant.sh` readback gate, the exact check that catches a knob silently
+failing to bind):
+
+```bash
+git merge main            # tank tracks main; pushing a branch behind it rolls tank BACK
+git push ssh://tank/home/vinc/llm-deploy HEAD:main
+```
+
+`receive.denyCurrentBranch=updateInstead` refuses the push if tank's working tree
+is dirty. Inspect what is dirty before clearing it — do not discard blind.
+
+### ✅ Cross-host determinism is verified, not assumed
+
+Two independent measurements, both 2026-08-22:
+
+1. **Calibration.** tank (CPU, 08-13) and the WSL box (CUDA-capable, 08-14)
+   independently produced `qwen3-0.6b-w8a16-gqafix-prefill` with **identical**
+   md5s: `model.encodings` `f4ff518b…`, `model_filtered_renamed.encodings`
+   `3e54eded…`, `model_renamed.onnx` `f588152…`.
+2. **Ctx-bin (the keystone itself).** Rebuilt on tank from the three reference
+   DLCs via `ctxbin_variant.sh` + `COORD_FORCE=1` → **`9c6024ad5b141137fbe22f3a4972eb96`,
+   1,086,570,496 B**, decode `read_total_bytes` 961,130,496 / `write_total_bytes`
+   419,840. Byte-identical to the WSL-built reference.
+
+So `QUANT_DEVICE=cpu` does not perturb numerics and **the md5 gate survives the
+host move**. Scope: measured for 0.6B; not measured for Qwen3-VL-4B.
+
+### Three adaptations from the 55 GB era
+
+The plan was drafted when tank had 55 GB free. It now has 380 GB, so:
+
+- **No strip-as-you-go.** Keep whole quant dirs. This is closer to the verified
+  path — fewer deviations to explain if the md5 gate fails — and leaves every
+  intermediate inspectable.
+- **All three Class B arms are buildable** (~40 GB each, ~120 GB total).
+  Previously they had to run one at a time with cleanup between.
+- **`disk_guard` sizing stays generous** (20 GB per export) with no abort risk.
+
+### Two traps already hit here — do not repeat them
+
+- **`~` does not expand mid-word.** A comma-separated DLC CSV built as
+  `~/a.dlc,~/b.dlc` reaches the generator **literally**, and it fails with
+  `Failed to load DLC ... code 1002`. Use absolute paths or `$HOME` in CSVs.
+- **Never wait on a build with `pgrep -f <pattern>`.** The pattern sits in the
+  waiter's own command line, so it matches itself and loops forever — `env.sh`
+  documents three such shells still spinning 1h36m–2h26m after their builds
+  finished. Wait on the **PID** (`kill -0 "$pid"`), which is what `build_wait`
+  does.
+- **Inode identity is point-in-time.** Inodes are reused after deletion, so a
+  dedup scan spanning a deletion can report a hard link that never existed.
+  Confirm with `stat -c %h` (link count) before calling a file free to keep.
+
+---
+
 ## File Structure
 
 ```
@@ -2465,13 +2534,24 @@ Create `kit-06b/README.md` covering, in this order:
    `hvx_threads` in the device-side config (build-time only, measured −0.1%),
    quoting a `read_total_bytes` without its log name and date.
 
-- [ ] **Step 2: Full end-to-end run**
+- [ ] **Step 2: Full end-to-end run — ON TANK**
 
-This is the real acceptance test. ~1–2 h, needs ~20 GB free.
+The real acceptance test. Runs on tank, CPU-only, so budget well over the ~1–2 h
+a CUDA box would take. Sync first, then launch detached and wait on the **PID**:
 
 ```bash
-cd kit-06b && ./build.sh ship 2>&1 | tee /tmp/kit-ship.log
+git merge main && git push ssh://tank/home/vinc/llm-deploy HEAD:main
+ssh tank 'cd ~/llm-deploy/kit-06b && nohup ./build.sh ship \
+    > /home/vinc/llm-local/kit-ship.log 2>&1 & echo "PID=$!"'
+# then: ssh tank 'until ! kill -0 <PID> 2>/dev/null; do sleep 30; done'
 ```
+
+⚠ **`quantize_aimet.py` has changed since the 2026-08-14 reference build** — it
+gained `--input-embeds`, `--act-range-scheme`, `--act-percentile` and
+`--lean-export`. Check `--act-range-scheme`'s default **before** running: if it
+altered calibration, this build will produce different encodings and the md5 gate
+will fail for an environmental reason, not because the restructuring is wrong.
+Establish that attribution first so a failure is diagnosable.
 
 Expected, all of:
 - `SDK CHECK PASSED`
