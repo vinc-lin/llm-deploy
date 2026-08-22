@@ -13,9 +13,9 @@ bundle is current and which is superseded**.
 
 | | |
 |---|---|
-| **Next test** | **Test N** — `TEST_N_final_e2e.md` + `DEVICE_SESSION_PROTOCOL_N.md`. The complete remaining-work session (~60 min): **N1 probes the real 4B directly** (token ladder via `-tok`, `-e`, `--save` state dump — no build, runs on the bundle already on the board), with Tests **L** and **M** folded in as stages N2/N3, the image first-word grid as N4, timing completion as N5, and the post-fix e2e confirmation as N6. Kit: `qwen3vl_4b_testn_session/` (VL repo). If time is short: **N1a P21 is one command and the sharpest single measurement available** |
-| **The one open defect** | Genie's decode-step feed on the 4B: prefill right, decode step 1 wrong |
-| **Sole live suspect** | the two-ctx-bin split (shard 0 → shard 1, `[1,1,2560]`, every decode step). **Test M reproduces that structure at 0.6B** — same handoff tensor, dtype and rank — so it can be bisected on the host if it fires |
+| **Next test** | **(1) send the two `state_p*.bin` KV dumps** — `parse_genie_kv_dump.py --diff` measures the decode step's KV write directly, no device time. **(2) re-run Test M with the 4B's `QnnHtp` block** — config-only; Test M's config differs in 4 knobs incl. `enable-graph-switching: true` on a 2-bin model. Prior plan: **Test N** — `TEST_N_final_e2e.md` + `DEVICE_SESSION_PROTOCOL_N.md`. The complete remaining-work session (~60 min): **N1 probes the real 4B directly** (token ladder via `-tok`, `-e`, `--save` state dump — no build, runs on the bundle already on the board), with Tests **L** and **M** folded in as stages N2/N3, the image first-word grid as N4, timing completion as N5, and the post-fix e2e confirmation as N6. Kit: `qwen3vl_4b_testn_session/` (VL repo). If time is short: **N1a P21 is one command and the sharpest single measurement available** |
+| **The one open defect** | Genie's decode-step machinery on the 4B. **Device-verified content-independent** (Test N N1a: prefill correct at 6/6 rungs, 2 prompts × 4 lengths, incl. EOS) |
+| **Leading suspect** | the two-ctx-bin split **at decode specifically** (`decode_0 → [1,1,2560] → decode_1`). ⚠ Not established: N1a proves the *prefill* handoff across the same split is correct on the 4B, and Test M's 0.6B failure is at token 0 — a different signature, and confounded by 4 engine knobs (correction #41) |
 | **What is already proven on hardware** | image input · ViT · splice · prefill numerics · decode graphs incl. recurrence · the image path end-to-end on 7/7 images |
 | **Current 4B bundle** | `qwen3vl_v5_session/03_vl4b_v5/` — shard 0 **`f031e3a7563bf16f2d5ca98a71b357f6`** |
 
@@ -35,7 +35,7 @@ bundle is current and which is superseded**.
 | **K** | 08-21 | LUT feed vs split · image one-word · 4B timing | ✅ **image path 7/7** · ⚠ **K1 VOID** (ran a FLOAT_16 bin) · ✅ first timing | `TEST_K_lut_vs_split.md` · `reports/…testk…md` |
 | **L** | **open** | does the ctx-bin reproduce its ONNX, or is it Genie? | — | `TEST_L_ctxbin_vs_genie.md` |
 | **M** | **open** | does the 2-ctx-bin **split** break decode at 0.6B? | — | `TEST_M_split_reproduction.md` |
-| **N** | **open** | the full remaining-work session: decode bisect **on the real 4B** (token ladder / `-e` / `--save`) + L + M + image grid + timing + the post-fix e2e gate | — | `TEST_N_final_e2e.md` · `DEVICE_SESSION_PROTOCOL_N.md` |
+| **N** | 08-22 | the full remaining-work session: decode bisect **on the real 4B** + L + M + image grid + timing | ✅ **N1a 6/6 on the real 4B** ⇒ the defect is decode-step machinery, **content-independent**; N1b exonerates the prefill feed; N1c's KV dump is **complete raw KV** (147,456 B/pos, GQA — correction #40). ⚠ Its "split is the root cause" verdict is **not supported** — it contradicts N1a (correction #41) | `reports/qwen3vl-4b-testn-device-results-2026-08-22.md` · `TEST_N_final_e2e.md` · `DEVICE_SESSION_PROTOCOL_N.md` |
 
 ### Dead ends, so nobody re-runs them
 
